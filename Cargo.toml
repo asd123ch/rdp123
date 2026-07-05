@@ -1,0 +1,100 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rdp123-core",
+    "crates/rdp123-app",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.5.0"
+edition = "2021"
+rust-version = "1.89"
+license = "GPL-3.0-only"
+
+[workspace.dependencies]
+# --- RDP protocol (IronRDP) ---
+ironrdp = { version = "0.16", features = [
+    "connector",
+    "session",
+    "graphics",
+    "input",
+    "svc",
+    "dvc",
+    "cliprdr",
+    "displaycontrol",
+    "rdpsnd",
+    "rdpdr",
+    "pdu",
+    "core",
+] }
+ironrdp-tokio = "0.9"
+# Graphics Pipeline (EGFX): AVC420 via bundled OpenH264 (compiled from source,
+# so end users need no binary downloads).
+ironrdp-egfx = { version = "0.2", features = ["openh264-bundled"] }
+
+# --- async / networking ---
+tokio = { version = "1.52", features = [
+    "rt-multi-thread",
+    "net",
+    "sync",
+    "time",
+    "macros",
+    "io-util",
+] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "logging", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "logging", "tls12"] }
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+
+# --- macOS platform ---
+# objc2 framework crates activate ~all classes via default features; the
+# inter-crate bridges (CoreFoundation/QuartzCore/CoreGraphics) must be opted in.
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = { version = "0.3", features = [
+    "objc2-core-foundation",
+    "objc2-quartz-core",
+    "objc2-core-graphics",
+] }
+objc2-core-foundation = "0.3"
+objc2-quartz-core = "0.3"
+objc2-core-graphics = "0.3"
+objc2-io-surface = { version = "0.3", features = ["libc"] }
+objc2-service-management = "0.3"
+dispatch2 = "0.3"
+security-framework = "3"
+
+# --- serialization / storage ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "6"
+
+# --- utilities ---
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+zeroize = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+
+# internal
+rdp123-core = { path = "crates/rdp123-core" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# ironrdp-connector with one addition: a `support_gfx` Config flag that
+# advertises RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL (required for the server to
+# offer the EGFX graphics pipeline; upstream has no way to set it yet).
+[patch.crates-io]
+ironrdp-connector = { path = "vendor/ironrdp-connector" }
+# ironrdp-graphics: fixes RemoteFX Progressive context lifetime, signed
+# fixed-point color conversion, implicit full-quality upgrades, region DWT
+# selection, and continuous SRL/RAW stream decoding. These are required for
+# Windows RDP 8 frames to refine cleanly instead of failing after the first
+# frame or rendering black/white block artifacts.
+ironrdp-graphics = { path = "vendor/ironrdp-graphics" }

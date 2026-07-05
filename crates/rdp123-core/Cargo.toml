@@ -1,0 +1,33 @@
+[package]
+name = "rdp123-core"
+description = "UI-independent core for the RDP123 client: RDP session engine, profiles, secrets, input mapping"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+ironrdp.workspace = true
+ironrdp-tokio.workspace = true
+ironrdp-egfx.workspace = true
+
+tokio.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+x509-cert.workspace = true
+
+security-framework.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+directories.workspace = true
+
+anyhow.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+sha2.workspace = true
+cpal = "0.18"

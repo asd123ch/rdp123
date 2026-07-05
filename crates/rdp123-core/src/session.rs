@@ -1,0 +1,1553 @@
+//! The RDP session engine.
+//!
+//! A session runs on its own OS thread with a single-threaded Tokio runtime.
+//! It drives the IronRDP connect sequence, then an active loop that decodes
+//! server graphics into the shared framebuffer and forwards input, resize and
+//! clipboard traffic. It talks to the UI through a command channel (in) and an
+//! event callback (out); it never touches AppKit.
+
+#![allow(clippy::too_many_arguments)]
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Once};
+use std::time::Duration;
+
+use anyhow::{anyhow, Context, Result};
+use sha2::{Digest, Sha256};
+use tokio::net::TcpStream;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::oneshot;
+use zeroize::Zeroize;
+
+use ironrdp::cliprdr::backend::CliprdrBackend;
+use ironrdp::cliprdr::pdu::{
+    ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FileContentsRequest,
+    FileContentsResponse, FormatDataRequest, FormatDataResponse, LockDataId,
+    OwnedFormatDataResponse,
+};
+use ironrdp::cliprdr::{Client, CliprdrClient, CliprdrSvcMessages};
+use ironrdp::connector::connection_activation::{
+    ConnectionActivationSequence, ConnectionActivationState,
+};
+use ironrdp::connector::sspi::generator::NetworkRequest;
+use ironrdp::connector::{
+    BitmapConfig, ClientConnector, Config, ConnectionResult, ConnectorError, ConnectorErrorExt,
+    ConnectorResult, Credentials, DesktopSize, ServerName,
+};
+use ironrdp::core::WriteBuf;
+use ironrdp::displaycontrol::client::DisplayControlClient;
+use ironrdp::displaycontrol::pdu::MonitorLayoutEntry;
+use ironrdp::dvc::DrdynvcClient;
+use ironrdp::graphics::image_processing::PixelFormat;
+use ironrdp::input::{Database, MouseButton, MousePosition, Operation, Scancode, WheelRotations};
+use ironrdp::pdu::gcc::KeyboardType;
+use ironrdp::pdu::geometry::Rectangle as _;
+use ironrdp::pdu::rdp::capability_sets::{client_codecs_capabilities, MajorPlatformType};
+use ironrdp::pdu::rdp::client_info::{CompressionType, PerformanceFlags, TimezoneInfo};
+use ironrdp::pdu::PduResult;
+use ironrdp::rdpdr::{NoopRdpdrBackend, Rdpdr};
+use ironrdp::rdpsnd::client::Rdpsnd;
+use ironrdp::session::image::DecodedImage;
+use ironrdp::session::{ActiveStage, ActiveStageOutput};
+use ironrdp_tokio::{
+    connect_begin, connect_finalize, mark_as_upgraded, single_sequence_step_read,
+    split_tokio_framed, FramedWrite as _, NetworkClient, TokioFramed,
+};
+
+use crate::framebuffer::SharedFramebuffer;
+use crate::gfx::GfxEvent;
+use crate::keymap;
+use crate::profile::{AudioMode, ClipboardMode, GraphicsMode};
+
+/// The pixel format shared by the decoded image, the framebuffer and CoreGraphics.
+const PIXEL_FORMAT: PixelFormat = PixelFormat::BgrX32;
+
+/// How long to let the writer flush a graceful shutdown before giving up.
+const SHUTDOWN_FLUSH: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// `Disconnected` reason for a normal server-side session end (logoff). The UI
+/// treats this as expected and shows no error dialog.
+pub const REMOTE_ENDED: &str = "the remote session ended";
+
+type TlsStream = tokio_rustls::client::TlsStream<TcpStream>;
+type SessionFramed = TokioFramed<TlsStream>;
+type SessionReader = TokioFramed<tokio::io::ReadHalf<TlsStream>>;
+type SessionWriter = TokioFramed<tokio::io::WriteHalf<TlsStream>>;
+type OutSender = Sender<Vec<u8>>;
+type EventCb = Box<dyn Fn(SessionEvent) + Send>;
+const COMMAND_QUEUE_CAPACITY: usize = 256;
+const CLIPBOARD_QUEUE_CAPACITY: usize = 32;
+const OUTPUT_QUEUE_CAPACITY: usize = 64;
+const MAX_CLIPBOARD_TEXT_BYTES: usize = 16 * 1024 * 1024;
+
+/// A logical mouse button.
+#[derive(Debug, Clone, Copy)]
+pub enum PointerButton {
+    Left,
+    Right,
+    Middle,
+}
+
+/// UI-originated input, already translated into remote pixel coordinates.
+#[derive(Debug, Clone)]
+pub enum InputEvent {
+    Key {
+        keycode: u16,
+        down: bool,
+    },
+    MouseMove {
+        x: u16,
+        y: u16,
+    },
+    MouseButton {
+        button: PointerButton,
+        down: bool,
+        x: u16,
+        y: u16,
+    },
+    Wheel {
+        delta: i16,
+        horizontal: bool,
+    },
+}
+
+/// Commands the UI sends into a running session.
+#[derive(Debug)]
+pub enum SessionCommand {
+    Input(Vec<InputEvent>),
+    Resize {
+        width: u16,
+        height: u16,
+        scale: Option<u32>,
+    },
+    LocalClipboard(String),
+    ReleaseAllKeys,
+    Shutdown,
+}
+
+/// Events the session emits back to the UI. Delivered on the session thread —
+/// the UI callback is responsible for hopping to the main thread.
+pub enum SessionEvent {
+    Connected {
+        width: u16,
+        height: u16,
+    },
+    FrameUpdated {
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    },
+    Resized {
+        width: u16,
+        height: u16,
+    },
+    /// A new pointer shape from the server, decoded to straight-alpha RGBA.
+    /// Coordinates are in remote pixels.
+    PointerBitmap {
+        width: u16,
+        height: u16,
+        hotspot_x: u16,
+        hotspot_y: u16,
+        rgba: Vec<u8>,
+    },
+    /// The server asks for the default (arrow) pointer.
+    PointerDefault,
+    /// The server hides the pointer (e.g. touch input or full-screen video).
+    PointerHidden,
+    ClipboardText(String),
+    /// Ask the user to trust a server key fingerprint. `is_change` is true when
+    /// a *different* key was previously pinned. Reply true to proceed.
+    CertificateApproval {
+        fingerprint: String,
+        is_change: bool,
+        reply: oneshot::Sender<bool>,
+    },
+    /// The user accepted `fingerprint`; the app should persist it.
+    CertTrusted {
+        fingerprint: String,
+    },
+    /// The connection dropped and a reconnect attempt is starting.
+    Reconnecting,
+    Disconnected {
+        reason: String,
+    },
+    Error(String),
+}
+
+/// Everything needed to open a connection. The password is held only for the
+/// duration of the connect; callers should source it from the Keychain.
+pub struct SessionConfig {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub password: String,
+    pub domain: Option<String>,
+    pub width: u16,
+    pub height: u16,
+    pub scale: Option<u32>,
+    pub expected_fingerprint: Option<String>,
+    // --- RDP options ---
+    pub color_depth: u32,
+    /// FastPath transport compression (RDP 6.1 XCRUSH). EGFX/ZGFX and graphics
+    /// codec compression remain protocol-managed independently.
+    pub compression: bool,
+    pub clipboard: ClipboardMode,
+    /// Where remote audio plays (local playback, discarded, or left remote).
+    pub audio: AudioMode,
+    /// Graphics pipeline: EGFX (H.264/RemoteFX Progressive) or legacy bitmaps.
+    pub graphics: GraphicsMode,
+    /// When false, the remote stays at a fixed resolution (window resizes just scale it).
+    pub dynamic_resolution: bool,
+    pub reconnect: bool,
+    pub reconnect_per_minute: u32,
+    /// Global setting: ⌘ sends Alt and ⌥ sends the Windows key.
+    pub swap_cmd_alt: bool,
+}
+
+impl Drop for SessionConfig {
+    fn drop(&mut self) {
+        self.password.zeroize();
+    }
+}
+
+/// Handle to a running session held by the UI.
+#[derive(Clone)]
+pub struct SessionHandle {
+    command_tx: Sender<SessionCommand>,
+    framebuffer: Arc<SharedFramebuffer>,
+    pending: Arc<PendingCommands>,
+}
+
+#[derive(Debug, Default)]
+struct PendingValue<T> {
+    value: Option<T>,
+    queued: bool,
+}
+
+#[derive(Debug, Default)]
+struct PendingCommands {
+    mouse_move: Mutex<PendingValue<(u16, u16)>>,
+    resize: Mutex<PendingValue<(u16, u16, Option<u32>)>>,
+    release_all_keys: AtomicBool,
+    shutdown: AtomicBool,
+}
+
+impl SessionHandle {
+    /// Send a command; ignored if the session has already ended.
+    pub fn command(&self, cmd: SessionCommand) {
+        if let SessionCommand::Input(events) = &cmd {
+            if let [InputEvent::MouseMove { x, y }] = events.as_slice() {
+                self.queue_mouse_move(*x, *y);
+                return;
+            }
+        }
+        match cmd {
+            SessionCommand::Resize {
+                width,
+                height,
+                scale,
+            } => self.queue_resize(width, height, scale),
+            SessionCommand::ReleaseAllKeys => {
+                self.pending.release_all_keys.store(true, Ordering::Release);
+                let _ = self.command_tx.try_send(SessionCommand::ReleaseAllKeys);
+            }
+            SessionCommand::Shutdown => {
+                self.pending.shutdown.store(true, Ordering::Release);
+                let _ = self.command_tx.try_send(SessionCommand::Shutdown);
+            }
+            command => {
+                if let Err(error) = self.command_tx.try_send(command) {
+                    tracing::warn!("session command queue is full or closed: {error}");
+                }
+            }
+        }
+    }
+
+    pub fn framebuffer(&self) -> Arc<SharedFramebuffer> {
+        self.framebuffer.clone()
+    }
+
+    fn queue_mouse_move(&self, x: u16, y: u16) {
+        let should_signal = {
+            let mut pending = self.pending.mouse_move.lock().unwrap();
+            pending.value = Some((x, y));
+            if pending.queued {
+                false
+            } else {
+                pending.queued = true;
+                true
+            }
+        };
+        if should_signal
+            && self
+                .command_tx
+                .try_send(SessionCommand::Input(vec![InputEvent::MouseMove { x, y }]))
+                .is_err()
+        {
+            self.pending.mouse_move.lock().unwrap().queued = false;
+        }
+    }
+
+    fn queue_resize(&self, width: u16, height: u16, scale: Option<u32>) {
+        let should_signal = {
+            let mut pending = self.pending.resize.lock().unwrap();
+            pending.value = Some((width, height, scale));
+            if pending.queued {
+                false
+            } else {
+                pending.queued = true;
+                true
+            }
+        };
+        if should_signal
+            && self
+                .command_tx
+                .try_send(SessionCommand::Resize {
+                    width,
+                    height,
+                    scale,
+                })
+                .is_err()
+        {
+            self.pending.resize.lock().unwrap().queued = false;
+        }
+    }
+}
+
+/// Start a session on a dedicated thread and return a handle immediately.
+pub fn spawn(config: SessionConfig, event_cb: EventCb) -> SessionHandle {
+    let framebuffer = SharedFramebuffer::new();
+    let (command_tx, command_rx) = channel(COMMAND_QUEUE_CAPACITY);
+    let fb = framebuffer.clone();
+    let pending = Arc::new(PendingCommands::default());
+    let thread_pending = pending.clone();
+
+    std::thread::Builder::new()
+        .name("rdp-session".to_string())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    event_cb(SessionEvent::Error(format!("runtime: {e}")));
+                    return;
+                }
+            };
+            rt.block_on(run(config, fb, command_rx, thread_pending, event_cb));
+        })
+        .expect("spawn session thread");
+
+    SessionHandle {
+        command_tx,
+        framebuffer,
+        pending,
+    }
+}
+
+/// Signals produced by the clipboard backend, drained by the session loop.
+enum ClipSignal {
+    InitiateCopy(Vec<ClipboardFormat>),
+    InitiatePaste(ClipboardFormatId),
+    SubmitData(OwnedFormatDataResponse),
+    RemoteText(String),
+}
+
+/// Give up after this many consecutive failed reconnect attempts.
+const MAX_RECONNECT_FAILURES: u32 = 20;
+/// Attempts for the very first connect. A few retries let a just-granted macOS
+/// Local Network permission (or a transient blip) succeed instead of failing.
+const MAX_INITIAL_FAILURES: u32 = 4;
+/// Delay between initial-connect retries.
+const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
+/// Bound the TCP connect so a Local-Network-blocked LAN connect fails fast with
+/// a clear message rather than hanging on the long OS default.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// Why a single session attempt ended.
+enum SessionEnd {
+    /// User closed the window (or dropped the handle) — do not reconnect.
+    UserQuit,
+    /// Connection dropped — reconnect if enabled.
+    Disconnected(String),
+}
+
+/// What the reconnect loop should do after one attempt.
+enum Outcome {
+    Stop,
+    /// (reason, is_error): emit Error vs Disconnected, then stop.
+    Fail(String, bool),
+    /// Wait `delay`, then try again. `announce` emits a `Reconnecting` event.
+    Retry {
+        delay: Duration,
+        announce: bool,
+    },
+}
+
+enum ConnectFailure {
+    Retryable(anyhow::Error),
+    Fatal(anyhow::Error),
+}
+
+impl ConnectFailure {
+    fn retryable(error: impl Into<anyhow::Error>) -> Self {
+        Self::Retryable(error.into())
+    }
+
+    fn fatal(error: impl Into<anyhow::Error>) -> Self {
+        Self::Fatal(error.into())
+    }
+
+    fn into_parts(self) -> (anyhow::Error, bool) {
+        match self {
+            Self::Retryable(error) => (error, true),
+            Self::Fatal(error) => (error, false),
+        }
+    }
+}
+
+/// Delay between reconnect attempts, derived from the per-minute cap.
+fn reconnect_delay(config: &SessionConfig) -> Duration {
+    let secs = (60 / u64::from(config.reconnect_per_minute.max(1))).max(1);
+    Duration::from_secs(secs)
+}
+
+async fn run(
+    mut config: SessionConfig,
+    framebuffer: Arc<SharedFramebuffer>,
+    mut command_rx: Receiver<SessionCommand>,
+    pending: Arc<PendingCommands>,
+    event_cb: EventCb,
+) {
+    ensure_crypto_provider();
+    let local_text: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // One audio player for the whole session (reconnects reuse it). Missing
+    // audio is never fatal — the session simply runs silent.
+    let audio = if config.audio == AudioMode::ThisComputer {
+        match crate::audio::AudioPlayer::start() {
+            Ok(player) => Some(player),
+            Err(e) => {
+                tracing::warn!("audio playback unavailable: {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Keys trusted during this session so retries never re-prompt for the cert.
+    let mut session_trusted: Option<String> = config.expected_fingerprint.clone();
+    let mut connected_once = false;
+    let mut failures: u32 = 0;
+
+    loop {
+        let (clip_tx, clip_rx) = channel::<ClipSignal>(CLIPBOARD_QUEUE_CAPACITY);
+        let (gfx_tx, gfx_rx) = tokio::sync::mpsc::unbounded_channel::<GfxEvent>();
+        let outcome = match connect(
+            &config,
+            &mut session_trusted,
+            local_text.clone(),
+            clip_tx,
+            gfx_tx,
+            audio.as_ref(),
+            &framebuffer,
+            &event_cb,
+        )
+        .await
+        {
+            Ok((connection_result, framed)) => {
+                connected_once = true;
+                failures = 0;
+                if audio.is_some() {
+                    // Joined channel = the host accepted audio redirection; a
+                    // missing join means it is disabled server-side (GPO or a
+                    // stopped Windows Audio service), not a client problem.
+                    match connection_result
+                        .static_channels
+                        .get_channel_id_by_type::<Rdpsnd>()
+                    {
+                        Some(id) => tracing::info!("rdpsnd: channel joined (id {id})"),
+                        None => tracing::warn!(
+                            "rdpsnd: the server did not join the audio channel — audio \
+                             redirection is disabled on the host"
+                        ),
+                    }
+                }
+                if !config.reconnect {
+                    config.password.zeroize();
+                }
+                match run_session(
+                    connection_result,
+                    framed,
+                    &config,
+                    &framebuffer,
+                    &mut command_rx,
+                    &pending,
+                    clip_rx,
+                    gfx_rx,
+                    &local_text,
+                    &event_cb,
+                )
+                .await
+                {
+                    SessionEnd::UserQuit => Outcome::Stop,
+                    SessionEnd::Disconnected(reason) => {
+                        if config.reconnect {
+                            Outcome::Retry {
+                                delay: reconnect_delay(&config),
+                                announce: true,
+                            }
+                        } else {
+                            Outcome::Fail(reason, false)
+                        }
+                    }
+                }
+            }
+            Err(failure) => {
+                let (error, retryable) = failure.into_parts();
+                // `{error:#}` keeps the underlying io/TLS/auth cause.
+                let reason = format!("{error:#}");
+                if !connected_once && retryable {
+                    // Only TCP reachability failures are retried. Authentication,
+                    // certificate and protocol failures must never be repeated,
+                    // because repeated bad credentials can lock a domain account.
+                    failures += 1;
+                    if failures >= MAX_INITIAL_FAILURES {
+                        Outcome::Fail(reason, true)
+                    } else {
+                        Outcome::Retry {
+                            delay: INITIAL_RETRY_DELAY,
+                            announce: false,
+                        }
+                    }
+                } else if !connected_once || !config.reconnect || !retryable {
+                    Outcome::Fail(reason, false)
+                } else {
+                    failures += 1;
+                    if failures >= MAX_RECONNECT_FAILURES {
+                        Outcome::Fail(reason, false)
+                    } else {
+                        Outcome::Retry {
+                            delay: reconnect_delay(&config),
+                            announce: true,
+                        }
+                    }
+                }
+            }
+        };
+
+        match outcome {
+            Outcome::Stop => break,
+            Outcome::Fail(reason, is_error) => {
+                if is_error {
+                    event_cb(SessionEvent::Error(reason));
+                } else {
+                    event_cb(SessionEvent::Disconnected { reason });
+                }
+                break;
+            }
+            Outcome::Retry { delay, announce } => {
+                if drain_should_stop(&mut command_rx, &pending, &mut config) {
+                    break;
+                }
+                if announce {
+                    event_cb(SessionEvent::Reconnecting);
+                }
+                if wait_for_retry(delay, &mut command_rx, &pending, &mut config).await {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// A resize observed while disconnected becomes the size of the next connect,
+/// so the session comes back matching the current window.
+fn absorb_offline_command(command: Option<SessionCommand>, config: &mut SessionConfig) {
+    if let Some(SessionCommand::Resize {
+        width,
+        height,
+        scale,
+    }) = command
+    {
+        config.width = width;
+        config.height = height;
+        config.scale = scale;
+    }
+}
+
+async fn wait_for_retry(
+    delay: Duration,
+    command_rx: &mut Receiver<SessionCommand>,
+    pending: &PendingCommands,
+    config: &mut SessionConfig,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + delay;
+    loop {
+        if pending.shutdown.swap(false, Ordering::AcqRel) {
+            return true;
+        }
+        pending.release_all_keys.store(false, Ordering::Release);
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => return false,
+            command = command_rx.recv() => match command {
+                Some(SessionCommand::Shutdown) | None => return true,
+                Some(command) => {
+                    absorb_offline_command(resolve_pending_command(command, pending), config);
+                }
+            }
+        }
+    }
+}
+
+/// Drain any pending commands between reconnects. Returns true if the session
+/// should stop (the window was closed, so a Shutdown is queued or all senders
+/// are gone).
+fn drain_should_stop(
+    command_rx: &mut Receiver<SessionCommand>,
+    pending: &PendingCommands,
+    config: &mut SessionConfig,
+) -> bool {
+    use tokio::sync::mpsc::error::TryRecvError;
+    if pending.shutdown.swap(false, Ordering::AcqRel) {
+        return true;
+    }
+    loop {
+        match command_rx.try_recv() {
+            Ok(SessionCommand::Shutdown) => return true,
+            Ok(command) => {
+                absorb_offline_command(resolve_pending_command(command, pending), config);
+            }
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => return true,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_session(
+    connection_result: ConnectionResult,
+    framed: SessionFramed,
+    config: &SessionConfig,
+    framebuffer: &SharedFramebuffer,
+    command_rx: &mut Receiver<SessionCommand>,
+    pending: &PendingCommands,
+    mut clip_rx: Receiver<ClipSignal>,
+    mut gfx_rx: tokio::sync::mpsc::UnboundedReceiver<GfxEvent>,
+    local_text: &Arc<Mutex<Option<String>>>,
+    event_cb: &EventCb,
+) -> SessionEnd {
+    let width = connection_result.desktop_size.width;
+    let height = connection_result.desktop_size.height;
+    if width > crate::profile::MAX_REMOTE_DIMENSION || height > crate::profile::MAX_REMOTE_DIMENSION
+    {
+        return SessionEnd::Disconnected(format!(
+            "server negotiated an unreasonable desktop size {width}x{height}"
+        ));
+    }
+    framebuffer.resize(width, height);
+    let mut image = DecodedImage::new(PIXEL_FORMAT, width, height);
+    let mut active_stage = ActiveStage::new(connection_result);
+    let mut input_db = Database::new();
+    event_cb(SessionEvent::Connected { width, height });
+
+    // Split the stream so a write blocked on TCP backpressure can never stall
+    // reads: reads run here, writes drain on a dedicated task.
+    let (mut reader, writer) = split_tokio_framed(framed);
+    let (out_tx, out_rx) = channel::<Vec<u8>>(OUTPUT_QUEUE_CAPACITY);
+    let mut writer_task = tokio::spawn(writer_loop(writer, out_rx));
+    // With clipboard disabled the sender is dropped at connect; stop polling the
+    // closed channel or the select loop would spin at 100% CPU. Same for gfx.
+    let mut clip_open = true;
+    let mut gfx_open = true;
+
+    let end = loop {
+        if pending.shutdown.swap(false, Ordering::AcqRel) {
+            let _ = handle_command(
+                SessionCommand::Shutdown,
+                config,
+                &mut reader,
+                &out_tx,
+                &mut active_stage,
+                &mut image,
+                &mut input_db,
+                framebuffer,
+                local_text,
+                event_cb,
+            )
+            .await;
+            break SessionEnd::UserQuit;
+        }
+        if pending.release_all_keys.swap(false, Ordering::AcqRel) {
+            let fp_events = input_db.release_all();
+            if !fp_events.is_empty() {
+                match active_stage.process_fastpath_input(&mut image, &fp_events) {
+                    Ok(outputs) => match drain_outputs(
+                        outputs,
+                        &mut reader,
+                        &out_tx,
+                        &mut active_stage,
+                        &mut image,
+                        framebuffer,
+                        event_cb,
+                    )
+                    .await
+                    {
+                        Ok(true) => {
+                            break SessionEnd::Disconnected(REMOTE_ENDED.to_string());
+                        }
+                        Ok(false) => {}
+                        Err(error) => break SessionEnd::Disconnected(format!("{error:#}")),
+                    },
+                    Err(error) => break SessionEnd::Disconnected(format!("{error:#}")),
+                }
+            }
+        }
+        tokio::select! {
+            cmd = command_rx.recv() => {
+                let Some(cmd) = cmd else { break SessionEnd::UserQuit };
+                let Some(cmd) = resolve_pending_command(cmd, pending) else {
+                    continue;
+                };
+                match handle_command(
+                    cmd, config, &mut reader, &out_tx, &mut active_stage, &mut image,
+                    &mut input_db, framebuffer, local_text, event_cb,
+                ).await {
+                    Ok(true) => break SessionEnd::UserQuit,
+                    Ok(false) => {}
+                    Err(e) => break SessionEnd::Disconnected(format!("{e:#}")),
+                }
+            }
+
+            sig = clip_rx.recv(), if clip_open => {
+                match sig {
+                    Some(sig) => {
+                        if let Err(e) = handle_clip_signal(sig, &out_tx, &mut active_stage, event_cb).await {
+                            tracing::warn!("clipboard: {e}");
+                        }
+                    }
+                    None => clip_open = false,
+                }
+            }
+
+            ev = gfx_rx.recv(), if gfx_open => {
+                match ev {
+                    // The compositor already wrote the pixels; just repaint.
+                    Some(GfxEvent::Updated) => event_cb(SessionEvent::FrameUpdated {
+                        x: 0, y: 0, width: 0, height: 0,
+                    }),
+                    Some(GfxEvent::Resized { width, height }) => {
+                        event_cb(SessionEvent::Resized { width, height });
+                    }
+                    None => gfx_open = false,
+                }
+            }
+
+            pdu = reader.read_pdu() => {
+                match pdu {
+                    Ok((action, payload)) => match active_stage.process(&mut image, action, &payload) {
+                        Ok(outputs) => match drain_outputs(outputs, &mut reader, &out_tx, &mut active_stage, &mut image, framebuffer, event_cb).await {
+                            Ok(true) => break SessionEnd::Disconnected(REMOTE_ENDED.to_string()),
+                            Ok(false) => {}
+                            Err(e) => break SessionEnd::Disconnected(format!("{e:#}")),
+                        },
+                        Err(e) => break SessionEnd::Disconnected(format!("{e:#}")),
+                    },
+                    Err(e) => break SessionEnd::Disconnected(format!("{e:#}")),
+                }
+            }
+        }
+    };
+
+    // Close the queue so the writer drains and exits. On a clean quit, wait for
+    // the drain (bounded) so the graceful-shutdown PDU is flushed; then abort so
+    // a task blocked on a wedged socket can never leak.
+    drop(out_tx);
+    if matches!(end, SessionEnd::UserQuit) {
+        let _ = tokio::time::timeout(SHUTDOWN_FLUSH, &mut writer_task).await;
+    }
+    writer_task.abort();
+    end
+}
+
+fn resolve_pending_command(
+    command: SessionCommand,
+    pending: &PendingCommands,
+) -> Option<SessionCommand> {
+    match command {
+        SessionCommand::ReleaseAllKeys => pending
+            .release_all_keys
+            .swap(false, Ordering::AcqRel)
+            .then_some(SessionCommand::ReleaseAllKeys),
+        SessionCommand::Shutdown => pending
+            .shutdown
+            .swap(false, Ordering::AcqRel)
+            .then_some(SessionCommand::Shutdown),
+        SessionCommand::Input(events)
+            if matches!(events.as_slice(), [InputEvent::MouseMove { .. }]) =>
+        {
+            let mut slot = pending.mouse_move.lock().unwrap();
+            slot.queued = false;
+            slot.value
+                .take()
+                .map(|(x, y)| SessionCommand::Input(vec![InputEvent::MouseMove { x, y }]))
+        }
+        SessionCommand::Resize { .. } => {
+            let mut slot = pending.resize.lock().unwrap();
+            slot.queued = false;
+            slot.value
+                .take()
+                .map(|(width, height, scale)| SessionCommand::Resize {
+                    width,
+                    height,
+                    scale,
+                })
+        }
+        command => Some(command),
+    }
+}
+
+/// Drain queued frames to the socket. Runs concurrently with the read loop so a
+/// blocked write never stalls reads.
+async fn writer_loop(mut writer: SessionWriter, mut out_rx: Receiver<Vec<u8>>) {
+    while let Some(bytes) = out_rx.recv().await {
+        if let Err(e) = writer.write_all(&bytes).await {
+            tracing::debug!("write failed, stopping writer: {e}");
+            break;
+        }
+    }
+}
+
+async fn connect(
+    config: &SessionConfig,
+    session_trusted: &mut Option<String>,
+    local_text: Arc<Mutex<Option<String>>>,
+    clip_tx: Sender<ClipSignal>,
+    gfx_tx: tokio::sync::mpsc::UnboundedSender<GfxEvent>,
+    audio: Option<&crate::audio::AudioPlayer>,
+    framebuffer: &Arc<SharedFramebuffer>,
+    event_cb: &EventCb,
+) -> std::result::Result<(ConnectionResult, SessionFramed), ConnectFailure> {
+    let tcp = connect_tcp(&config.host, config.port).await?;
+    tcp.set_nodelay(true).ok();
+    let client_addr = tcp
+        .local_addr()
+        .context("resolving local address")
+        .map_err(ConnectFailure::fatal)?;
+
+    let display_control = DisplayControlClient::new(|_caps| Ok(Vec::new()));
+    let mut drdynvc = DrdynvcClient::new().with_dynamic_channel(display_control);
+    if let Some(player) = audio {
+        // Windows 7+ prefers audio over the dynamic channel when the client
+        // supports DVC; without this listener the session stays silent.
+        drdynvc =
+            drdynvc.with_dynamic_channel(crate::audio::RdpsndDvcChannel::new(player.handler()));
+    }
+    if config.graphics == GraphicsMode::Egfx {
+        // H.264 decode failing to initialize is not fatal: the pipeline still
+        // renders uncompressed updates, and the server prefers AVC only when
+        // the (filtered) capabilities advertise it.
+        let decoder = match ironrdp_egfx::decode::OpenH264Decoder::new() {
+            Ok(d) => Some(Box::new(d) as Box<dyn ironrdp_egfx::decode::H264Decoder>),
+            Err(e) => {
+                tracing::warn!("egfx: H.264 decoder unavailable ({e}); using fallback caps");
+                None
+            }
+        };
+        let handler = crate::gfx::GfxHandler::new(framebuffer.clone(), gfx_tx);
+        drdynvc = drdynvc.with_dynamic_channel(ironrdp_egfx::client::GraphicsPipelineClient::new(
+            Box::new(handler),
+            decoder,
+        ));
+    }
+
+    let mut connector = ClientConnector::new(build_config(config, audio.is_some()), client_addr)
+        .with_static_channel(drdynvc);
+
+    if let Some(player) = audio {
+        connector.attach_static_channel(Rdpsnd::new(Box::new(player.handler())));
+        // mstsc always announces device redirection; some servers gate parts
+        // of channel setup (audio among them) on its presence. No devices are
+        // shared — the Noop backend only completes the core handshake.
+        connector
+            .attach_static_channel(Rdpdr::new(Box::new(NoopRdpdrBackend), "RDP123".to_owned()));
+    }
+
+    // Only register clipboard redirection when it is enabled.
+    if config.clipboard.enabled() {
+        let backend = MacClipboardBackend {
+            tx: clip_tx,
+            local_text,
+            tmp: std::env::temp_dir().to_string_lossy().into_owned(),
+            mode: config.clipboard,
+        };
+        connector.attach_static_channel(CliprdrClient::new(Box::new(backend)));
+    } else {
+        drop((clip_tx, local_text));
+    }
+
+    let mut framed = TokioFramed::new(tcp);
+
+    // 1. Pre-TLS X.224 negotiation.
+    let should_upgrade = connect_begin(&mut framed, &mut connector)
+        .await
+        .map_err(connector_err)
+        .map_err(ConnectFailure::fatal)?;
+
+    // 2. TLS handshake. CA/hostname verification is intentionally replaced by
+    // TOFU below, but the server must still prove possession of the certificate
+    // private key by signing the TLS handshake.
+    let (initial_stream, leftover) = framed.into_inner();
+    let (tls_stream, server_public_key) = crate::tls::upgrade(initial_stream, &config.host)
+        .await
+        .context("TLS handshake")
+        .map_err(ConnectFailure::fatal)?;
+
+    // 3. Trust-on-first-use gate — before any credentials are sent via CredSSP.
+    let fingerprint = fingerprint_hex(&server_public_key);
+    tofu_gate(session_trusted, &fingerprint, event_cb)
+        .await
+        .map_err(ConnectFailure::fatal)?;
+
+    // 4. Finalize (MCS, licensing, capabilities, CredSSP/NLA).
+    let upgraded = mark_as_upgraded(should_upgrade, &mut connector);
+    let mut framed = TokioFramed::new_with_leftover(tls_stream, leftover);
+    let mut network_client = NoNetworkClient;
+    let result = connect_finalize(
+        upgraded,
+        connector,
+        &mut framed,
+        &mut network_client,
+        ServerName::new(&config.host),
+        server_public_key,
+        None,
+    )
+    .await
+    .map_err(connector_err)
+    .map_err(ConnectFailure::fatal)?;
+
+    Ok((result, framed))
+}
+
+/// Open the TCP socket with a bounded timeout. A LAN connect that macOS blocks
+/// for Local Network privacy fails or hangs here, so the message points at the fix.
+async fn connect_tcp(host: &str, port: u16) -> std::result::Result<TcpStream, ConnectFailure> {
+    match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port))).await {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(e)) => Err(ConnectFailure::retryable(anyhow!(
+            "could not reach {host}:{port} ({e}). If this host works in other RDP \
+             clients, enable RDP123 under System Settings → Privacy & Security → \
+             Local Network, then try again."
+        ))),
+        Err(_) => Err(ConnectFailure::retryable(anyhow!(
+            "timed out reaching {host}:{port}. Check the host and port, and that RDP123 \
+             is allowed under System Settings → Privacy & Security → Local Network."
+        ))),
+    }
+}
+
+async fn tofu_gate(
+    session_trusted: &mut Option<String>,
+    fingerprint: &str,
+    event_cb: &EventCb,
+) -> Result<()> {
+    if session_trusted.as_deref() == Some(fingerprint) {
+        return Ok(());
+    }
+    let is_change = session_trusted.is_some();
+    let (reply, rx) = oneshot::channel();
+    event_cb(SessionEvent::CertificateApproval {
+        fingerprint: fingerprint.to_string(),
+        is_change,
+        reply,
+    });
+    if rx.await.unwrap_or(false) {
+        event_cb(SessionEvent::CertTrusted {
+            fingerprint: fingerprint.to_string(),
+        });
+        *session_trusted = Some(fingerprint.to_string());
+        Ok(())
+    } else {
+        Err(anyhow!("server certificate not trusted"))
+    }
+}
+
+async fn handle_command(
+    cmd: SessionCommand,
+    config: &SessionConfig,
+    reader: &mut SessionReader,
+    out_tx: &OutSender,
+    active_stage: &mut ActiveStage,
+    image: &mut DecodedImage,
+    input_db: &mut Database,
+    framebuffer: &SharedFramebuffer,
+    local_text: &Arc<Mutex<Option<String>>>,
+    event_cb: &EventCb,
+) -> Result<bool> {
+    match cmd {
+        SessionCommand::Input(events) => {
+            let (operations, last_mouse) = translate_input(events, config.swap_cmd_alt);
+            if let Some((x, y)) = last_mouse {
+                active_stage.update_mouse_pos(x, y);
+            }
+            let fp_events = input_db.apply(operations);
+            if !fp_events.is_empty() {
+                let outputs = active_stage.process_fastpath_input(image, &fp_events)?;
+                return drain_outputs(
+                    outputs,
+                    reader,
+                    out_tx,
+                    active_stage,
+                    image,
+                    framebuffer,
+                    event_cb,
+                )
+                .await;
+            }
+        }
+        SessionCommand::Resize {
+            width,
+            height,
+            scale,
+        } => {
+            // Fixed-resolution sessions keep the remote size; the window just scales it.
+            if !config.dynamic_resolution {
+                return Ok(false);
+            }
+            let (w, h) =
+                MonitorLayoutEntry::adjust_display_size(u32::from(width), u32::from(height));
+            match active_stage.encode_resize(w, h, scale, None) {
+                Some(Ok(frame)) => emit(out_tx, frame).await?,
+                Some(Err(e)) => tracing::warn!("resize encode failed: {e}"),
+                None => tracing::debug!("resize ignored: display control not ready yet"),
+            }
+        }
+        SessionCommand::LocalClipboard(text) => {
+            if text.len() > MAX_CLIPBOARD_TEXT_BYTES {
+                tracing::warn!(
+                    "local clipboard text is too large to redirect ({} bytes)",
+                    text.len()
+                );
+                return Ok(false);
+            }
+            *local_text.lock().unwrap() = Some(text);
+            let formats = vec![ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
+            send_cliprdr(active_stage, out_tx, |c| c.initiate_copy(&formats)).await?;
+        }
+        SessionCommand::ReleaseAllKeys => {
+            let fp_events = input_db.release_all();
+            if !fp_events.is_empty() {
+                let outputs = active_stage.process_fastpath_input(image, &fp_events)?;
+                return drain_outputs(
+                    outputs,
+                    reader,
+                    out_tx,
+                    active_stage,
+                    image,
+                    framebuffer,
+                    event_cb,
+                )
+                .await;
+            }
+        }
+        SessionCommand::Shutdown => {
+            if let Ok(outputs) = active_stage.graceful_shutdown() {
+                for out in outputs {
+                    if let ActiveStageOutput::ResponseFrame(frame) = out {
+                        emit(out_tx, frame).await?;
+                    }
+                }
+            }
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+async fn handle_clip_signal(
+    sig: ClipSignal,
+    out_tx: &OutSender,
+    active_stage: &mut ActiveStage,
+    event_cb: &EventCb,
+) -> Result<()> {
+    match sig {
+        ClipSignal::InitiateCopy(formats) => {
+            send_cliprdr(active_stage, out_tx, |c| c.initiate_copy(&formats)).await
+        }
+        ClipSignal::InitiatePaste(format) => {
+            send_cliprdr(active_stage, out_tx, |c| c.initiate_paste(format)).await
+        }
+        ClipSignal::SubmitData(response) => {
+            send_cliprdr(active_stage, out_tx, |c| c.submit_format_data(response)).await
+        }
+        ClipSignal::RemoteText(text) => {
+            event_cb(SessionEvent::ClipboardText(text));
+            Ok(())
+        }
+    }
+}
+
+/// Queue a frame for the writer task with bounded backpressure.
+async fn emit(out_tx: &OutSender, bytes: Vec<u8>) -> Result<()> {
+    out_tx
+        .send(bytes)
+        .await
+        .map_err(|_| anyhow!("session writer stopped"))
+}
+
+/// Call a `CliprdrClient` method (if the channel exists), then encode and queue
+/// the resulting messages.
+async fn send_cliprdr<F>(active_stage: &mut ActiveStage, out_tx: &OutSender, make: F) -> Result<()>
+where
+    F: FnOnce(&mut CliprdrClient) -> PduResult<CliprdrSvcMessages<Client>>,
+{
+    let produced = active_stage
+        .get_svc_processor_mut::<CliprdrClient>()
+        .map(make);
+    if let Some(result) = produced {
+        let messages = result.map_err(|e| anyhow!("cliprdr: {e}"))?;
+        let bytes = active_stage
+            .process_svc_processor_messages(messages)
+            .map_err(|e| anyhow!("cliprdr encode: {e}"))?;
+        emit(out_tx, bytes).await?;
+    }
+    Ok(())
+}
+
+/// Apply every `ActiveStageOutput`. Returns `Ok(true)` when the session should end.
+async fn drain_outputs(
+    outputs: Vec<ActiveStageOutput>,
+    reader: &mut SessionReader,
+    out_tx: &OutSender,
+    active_stage: &mut ActiveStage,
+    image: &mut DecodedImage,
+    framebuffer: &SharedFramebuffer,
+    event_cb: &EventCb,
+) -> Result<bool> {
+    for output in outputs {
+        match output {
+            ActiveStageOutput::ResponseFrame(frame) => emit(out_tx, frame).await?,
+            ActiveStageOutput::GraphicsUpdate(region) => {
+                let width = region.width();
+                let height = region.height();
+                framebuffer.blit_rect(image.data(), region.left, region.top, width, height);
+                event_cb(SessionEvent::FrameUpdated {
+                    x: region.left,
+                    y: region.top,
+                    width,
+                    height,
+                });
+            }
+            ActiveStageOutput::DeactivateAll(cas) => {
+                reactivate(
+                    cas,
+                    reader,
+                    out_tx,
+                    active_stage,
+                    image,
+                    framebuffer,
+                    event_cb,
+                )
+                .await?;
+            }
+            ActiveStageOutput::Terminate(_reason) => return Ok(true),
+            // Pointer shapes are mirrored onto the native macOS cursor so the
+            // remote shape (resize arrows, I-beam, hand) shows without the
+            // laggy server-composited cursor.
+            ActiveStageOutput::PointerBitmap(pointer) => {
+                event_cb(SessionEvent::PointerBitmap {
+                    width: pointer.width,
+                    height: pointer.height,
+                    hotspot_x: pointer.hotspot_x,
+                    hotspot_y: pointer.hotspot_y,
+                    rgba: pointer.bitmap_data.clone(),
+                });
+            }
+            ActiveStageOutput::PointerDefault => event_cb(SessionEvent::PointerDefault),
+            ActiveStageOutput::PointerHidden => event_cb(SessionEvent::PointerHidden),
+            // Server-initiated pointer warps are not applied to the local
+            // mouse; the multitransport/autodetect paths are unused.
+            ActiveStageOutput::PointerPosition { .. }
+            | ActiveStageOutput::MultitransportRequest(_)
+            | ActiveStageOutput::AutoDetect(_) => {}
+        }
+    }
+    Ok(false)
+}
+
+/// Drive a Deactivation-Reactivation sequence (e.g. a server-side resolution
+/// change) to completion, then re-size local state to the new desktop.
+async fn reactivate(
+    mut cas: Box<ConnectionActivationSequence>,
+    reader: &mut SessionReader,
+    out_tx: &OutSender,
+    active_stage: &mut ActiveStage,
+    image: &mut DecodedImage,
+    framebuffer: &SharedFramebuffer,
+    event_cb: &EventCb,
+) -> Result<()> {
+    let (size, share_id) = loop {
+        if let ConnectionActivationState::Finalized {
+            desktop_size,
+            share_id,
+            ..
+        } = cas.connection_activation_state()
+        {
+            break (desktop_size, share_id);
+        }
+        // Read + step on the read half; queue any response for the writer task.
+        let mut buf = WriteBuf::new();
+        single_sequence_step_read(reader, &mut *cas, &mut buf)
+            .await
+            .map_err(connector_err)?;
+        if !buf.filled().is_empty() {
+            emit(out_tx, buf.filled().to_vec()).await?;
+        }
+    };
+
+    // Never allocate for an absurd server-announced size (a hostile or buggy
+    // server could otherwise request a multi-gigabyte framebuffer).
+    if size.width > crate::profile::MAX_REMOTE_DIMENSION
+        || size.height > crate::profile::MAX_REMOTE_DIMENSION
+    {
+        return Err(anyhow!(
+            "server requested an unreasonable desktop size {}x{}",
+            size.width,
+            size.height
+        ));
+    }
+    *image = DecodedImage::new(PIXEL_FORMAT, size.width, size.height);
+    framebuffer.resize(size.width, size.height);
+    active_stage.set_share_id(share_id);
+    event_cb(SessionEvent::Resized {
+        width: size.width,
+        height: size.height,
+    });
+    Ok(())
+}
+
+/// Convert UI input into IronRDP operations, returning the last mouse position seen.
+fn translate_input(
+    events: Vec<InputEvent>,
+    swap_cmd_alt: bool,
+) -> (Vec<Operation>, Option<(u16, u16)>) {
+    let mut ops = Vec::with_capacity(events.len() + 2);
+    let mut last_mouse = None;
+    for event in events {
+        match event {
+            InputEvent::Key { keycode, down } => {
+                if let Some(sc) = keymap::mac_keycode_to_scancode(keycode, swap_cmd_alt) {
+                    let scan = Scancode::from_u8(sc.extended, sc.code as u8);
+                    ops.push(if down {
+                        Operation::KeyPressed(scan)
+                    } else {
+                        Operation::KeyReleased(scan)
+                    });
+                }
+            }
+            InputEvent::MouseMove { x, y } => {
+                last_mouse = Some((x, y));
+                ops.push(Operation::MouseMove(MousePosition { x, y }));
+            }
+            InputEvent::MouseButton { button, down, x, y } => {
+                last_mouse = Some((x, y));
+                ops.push(Operation::MouseMove(MousePosition { x, y }));
+                let b = match button {
+                    PointerButton::Left => MouseButton::Left,
+                    PointerButton::Right => MouseButton::Right,
+                    PointerButton::Middle => MouseButton::Middle,
+                };
+                ops.push(if down {
+                    Operation::MouseButtonPressed(b)
+                } else {
+                    Operation::MouseButtonReleased(b)
+                });
+            }
+            InputEvent::Wheel { delta, horizontal } => {
+                ops.push(Operation::WheelRotations(WheelRotations {
+                    is_vertical: !horizontal,
+                    rotation_units: delta,
+                }));
+            }
+        }
+    }
+    (ops, last_mouse)
+}
+
+fn build_config(config: &SessionConfig, audio_active: bool) -> Config {
+    let bitmap = Some(BitmapConfig {
+        lossy_compression: true,
+        color_depth: config.color_depth,
+        codecs: client_codecs_capabilities(&[]).expect("default codecs"),
+    });
+    Config {
+        desktop_size: DesktopSize {
+            width: config.width,
+            height: config.height,
+        },
+        desktop_scale_factor: config.scale.unwrap_or(100),
+        enable_tls: false,
+        enable_credssp: true,
+        credentials: Credentials::UsernamePassword {
+            username: config.username.clone(),
+            password: config.password.clone(),
+        },
+        domain: config.domain.clone(),
+        client_build: 0,
+        client_name: "RDP123".to_string(),
+        keyboard_type: KeyboardType::IbmEnhanced,
+        keyboard_subtype: 0,
+        keyboard_functional_keys_count: 12,
+        keyboard_layout: 0,
+        ime_file_name: String::new(),
+        bitmap,
+        dig_product_id: String::new(),
+        client_dir: String::new(),
+        alternate_shell: String::new(),
+        work_dir: String::new(),
+        platform: MajorPlatformType::MACINTOSH,
+        hardware_id: None,
+        request_data: None,
+        autologon: false,
+        // ThisComputer: announced only when the local output is actually ready
+        // (false sets INFO_NOAUDIOPLAYBACK, telling the server to discard).
+        // RemoteComputer: don't suppress, but no redirection channel either —
+        // IronRDP does not expose INFO_REMOTECONSOLEAUDIO for true console audio.
+        enable_audio_playback: match config.audio {
+            AudioMode::ThisComputer => audio_active,
+            AudioMode::RemoteComputer => true,
+            AudioMode::Never => false,
+        },
+        // From our vendored connector patch: advertises the Graphics Pipeline.
+        support_gfx: config.graphics == GraphicsMode::Egfx,
+        // Ask the host to render text with ClearType/anti-aliasing; without this
+        // fonts come across rough and un-smoothed.
+        performance_flags: PerformanceFlags::ENABLE_FONT_SMOOTHING,
+        license_cache: None,
+        timezone_info: TimezoneInfo::default(),
+        compression_type: config.compression.then_some(CompressionType::Rdp61),
+        // Do not composite the server pointer into the framebuffer: that produces
+        // a laggy remote cursor that lingers. Pointer shapes are decoded to RGBA
+        // and applied to the native macOS cursor instead (see drain_outputs).
+        enable_server_pointer: true,
+        pointer_software_rendering: false,
+        multitransport_flags: None,
+    }
+}
+
+fn fingerprint_hex(public_key: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(public_key);
+    let digest = hasher.finalize();
+    let mut out = String::from("sha256:");
+    for byte in digest {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+fn connector_err(e: ConnectorError) -> anyhow::Error {
+    anyhow!("{e}")
+}
+
+fn ensure_crypto_provider() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
+/// CredSSP with password auth (NTLM) needs no out-of-band network access; this
+/// stub errors if the connector ever tries a Kerberos KDC request.
+#[derive(Debug)]
+struct NoNetworkClient;
+
+impl NetworkClient for NoNetworkClient {
+    fn send(
+        &mut self,
+        _request: &NetworkRequest,
+    ) -> impl std::future::Future<Output = ConnectorResult<Vec<u8>>> {
+        std::future::ready(Err(ConnectorError::general(
+            "out-of-band network requests (Kerberos) are not supported",
+        )))
+    }
+}
+
+/// A text-only clipboard backend bridging CLIPRDR to `NSPasteboard` (via the app).
+#[derive(Debug)]
+struct MacClipboardBackend {
+    tx: Sender<ClipSignal>,
+    local_text: Arc<Mutex<Option<String>>>,
+    tmp: String,
+    mode: ClipboardMode,
+}
+
+impl ironrdp::core::AsAny for MacClipboardBackend {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+impl CliprdrBackend for MacClipboardBackend {
+    fn temporary_directory(&self) -> &str {
+        &self.tmp
+    }
+
+    fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
+        ClipboardGeneralCapabilityFlags::empty()
+    }
+
+    fn on_ready(&mut self) {}
+
+    fn on_request_format_list(&mut self) {
+        // Advertise our clipboard only if local -> remote is allowed.
+        if self.mode.allow_local_to_remote() {
+            let formats = vec![ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
+            let _ = self.tx.try_send(ClipSignal::InitiateCopy(formats));
+        }
+    }
+
+    fn on_process_negotiated_capabilities(&mut self, _caps: ClipboardGeneralCapabilityFlags) {}
+
+    fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
+        // Fetch what the remote copied only if remote -> local is allowed.
+        if self.mode.allow_remote_to_local()
+            && available_formats
+                .iter()
+                .any(|f| f.id == ClipboardFormatId::CF_UNICODETEXT)
+        {
+            let _ = self
+                .tx
+                .try_send(ClipSignal::InitiatePaste(ClipboardFormatId::CF_UNICODETEXT));
+        }
+    }
+
+    fn on_format_data_request(&mut self, request: FormatDataRequest) {
+        let response = if self.mode.allow_local_to_remote()
+            && request.format == ClipboardFormatId::CF_UNICODETEXT
+        {
+            let text = self.local_text.lock().unwrap().clone().unwrap_or_default();
+            let crlf = normalize_clipboard_to_crlf(&text);
+            FormatDataResponse::new_unicode_string(&crlf)
+        } else {
+            FormatDataResponse::new_error()
+        };
+        let _ = self.tx.try_send(ClipSignal::SubmitData(response));
+    }
+
+    fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
+        if response.is_error() || !self.mode.allow_remote_to_local() {
+            return;
+        }
+        if let Ok(text) = response.to_unicode_string() {
+            if text.len() > MAX_CLIPBOARD_TEXT_BYTES {
+                tracing::warn!(
+                    "remote clipboard text is too large to accept ({} bytes)",
+                    text.len()
+                );
+                return;
+            }
+            let _ = self
+                .tx
+                .try_send(ClipSignal::RemoteText(text.replace("\r\n", "\n")));
+        }
+    }
+
+    // Text-only: files and locks are never negotiated, so these stay empty.
+    fn on_file_contents_request(&mut self, _request: FileContentsRequest) {}
+    fn on_file_contents_response(&mut self, _response: FileContentsResponse<'_>) {}
+    fn on_lock(&mut self, _data_id: LockDataId) {}
+    fn on_unlock(&mut self, _data_id: LockDataId) {}
+}
+
+fn normalize_clipboard_to_crlf(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\n', "\r\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_config, normalize_clipboard_to_crlf, resolve_pending_command, InputEvent,
+        PendingCommands, SessionCommand, SessionConfig,
+    };
+    use crate::profile::{AudioMode, ClipboardMode, GraphicsMode};
+    use ironrdp::pdu::rdp::client_info::CompressionType;
+    use std::sync::atomic::Ordering;
+
+    fn test_session_config(graphics: GraphicsMode, compression: bool) -> SessionConfig {
+        SessionConfig {
+            host: "example.test".to_string(),
+            port: 3389,
+            username: "user".to_string(),
+            password: "password".to_string(),
+            domain: None,
+            width: 1280,
+            height: 720,
+            scale: Some(100),
+            expected_fingerprint: None,
+            color_depth: 32,
+            compression,
+            clipboard: ClipboardMode::Disabled,
+            audio: AudioMode::Never,
+            graphics,
+            dynamic_resolution: false,
+            reconnect: false,
+            reconnect_per_minute: 0,
+            swap_cmd_alt: false,
+        }
+    }
+
+    #[test]
+    fn clipboard_line_endings_are_normalized_without_doubling_crlf() {
+        assert_eq!(
+            normalize_clipboard_to_crlf("one\r\ntwo\nthree\rfour"),
+            "one\r\ntwo\r\nthree\r\nfour"
+        );
+    }
+
+    #[test]
+    fn control_flags_do_not_consume_coalesced_mouse_markers() {
+        let pending = PendingCommands::default();
+        {
+            let mut mouse = pending.mouse_move.lock().unwrap();
+            mouse.value = Some((40, 50));
+            mouse.queued = true;
+        }
+        pending.release_all_keys.store(true, Ordering::Release);
+
+        let command = resolve_pending_command(
+            SessionCommand::Input(vec![InputEvent::MouseMove { x: 1, y: 2 }]),
+            &pending,
+        );
+        assert!(matches!(
+            command,
+            Some(SessionCommand::Input(events))
+                if matches!(events.as_slice(), [InputEvent::MouseMove { x: 40, y: 50 }])
+        ));
+        assert!(pending.release_all_keys.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn stale_control_markers_are_ignored() {
+        let pending = PendingCommands::default();
+        assert!(resolve_pending_command(SessionCommand::ReleaseAllKeys, &pending).is_none());
+        assert!(resolve_pending_command(SessionCommand::Shutdown, &pending).is_none());
+    }
+
+    #[test]
+    fn transport_compression_is_independent_of_graphics_mode() {
+        for graphics in [GraphicsMode::Classic, GraphicsMode::Egfx] {
+            let enabled = build_config(&test_session_config(graphics, true), false);
+            assert_eq!(enabled.compression_type, Some(CompressionType::Rdp61));
+
+            let disabled = build_config(&test_session_config(graphics, false), false);
+            assert_eq!(disabled.compression_type, None);
+        }
+    }
+}

@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Test
+        run: cargo test --workspace --all-targets --locked
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Intel compatibility
+        run: cargo check --workspace --target x86_64-apple-darwin --locked
+      - name: Dependency audit
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo audit --ignore RUSTSEC-2023-0071 -D warnings

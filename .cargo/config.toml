@@ -1,0 +1,3 @@
+# Enables `cargo xtask <cmd>` as a shortcut for the build-automation crate.
+[alias]
+xtask = "run --package xtask --"
