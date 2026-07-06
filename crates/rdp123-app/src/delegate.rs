@@ -85,6 +85,11 @@ define_class!(
             let mtm = self.mtm();
             DELEGATE.with(|d| *d.borrow_mut() = Some(self.retain()));
 
+            // Key equivalents (⌘V, ⌘C, …) are dispatched through the main
+            // menu; without one, text fields cannot paste. The menu is never
+            // visible for a menu-bar app, but it must exist.
+            install_main_menu(mtm);
+
             let menu = NSMenu::new(mtm);
             menu.setAutoenablesItems(false);
             let delegate: &ProtocolObject<dyn NSMenuDelegate> = ProtocolObject::from_ref(self);
@@ -492,4 +497,49 @@ impl AppDelegate {
             }
         }
     }
+}
+
+/// Install the (invisible) main menu so standard editing key equivalents
+/// reach text fields. Items target the first responder (nil target).
+fn install_main_menu(mtm: MainThreadMarker) {
+    fn item(
+        mtm: MainThreadMarker,
+        title: &str,
+        action: objc2::runtime::Sel,
+        key: &str,
+    ) -> Retained<NSMenuItem> {
+        unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(title),
+                Some(action),
+                &NSString::from_str(key),
+            )
+        }
+    }
+
+    let main_menu = NSMenu::new(mtm);
+
+    // App menu (first slot): Quit with ⌘Q.
+    let app_slot = NSMenuItem::new(mtm);
+    let app_menu = NSMenu::new(mtm);
+    app_menu.addItem(&item(mtm, "Quit RDP123", sel!(terminate:), "q"));
+    app_slot.setSubmenu(Some(&app_menu));
+    main_menu.addItem(&app_slot);
+
+    // Edit menu: the standard first-responder actions.
+    let edit_slot = NSMenuItem::new(mtm);
+    let edit_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Edit"));
+    edit_menu.addItem(&item(mtm, "Undo", sel!(undo:), "z"));
+    edit_menu.addItem(&item(mtm, "Redo", sel!(redo:), "Z"));
+    edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    edit_menu.addItem(&item(mtm, "Cut", sel!(cut:), "x"));
+    edit_menu.addItem(&item(mtm, "Copy", sel!(copy:), "c"));
+    edit_menu.addItem(&item(mtm, "Paste", sel!(paste:), "v"));
+    edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    edit_menu.addItem(&item(mtm, "Select All", sel!(selectAll:), "a"));
+    edit_slot.setSubmenu(Some(&edit_menu));
+    main_menu.addItem(&edit_slot);
+
+    NSApplication::sharedApplication(mtm).setMainMenu(Some(&main_menu));
 }
