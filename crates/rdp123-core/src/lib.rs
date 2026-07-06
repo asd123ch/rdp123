@@ -13,6 +13,7 @@ pub mod secrets;
 pub mod session;
 pub mod terminal;
 mod tls;
+pub mod wol;
 
 pub use framebuffer::SharedFramebuffer;
 pub use profile::{

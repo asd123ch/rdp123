@@ -203,6 +203,8 @@ pub struct SessionConfig {
     pub reconnect_per_minute: u32,
     /// Global setting: ⌘ sends Alt and ⌥ sends the Windows key.
     pub swap_cmd_alt: bool,
+    /// Wake-on-LAN MAC address; a magic packet is broadcast before connecting.
+    pub wake_mac: Option<String>,
 }
 
 impl Drop for SessionConfig {
@@ -360,6 +362,9 @@ const MAX_RECONNECT_FAILURES: u32 = 20;
 /// Attempts for the very first connect. A few retries let a just-granted macOS
 /// Local Network permission (or a transient blip) succeed instead of failing.
 const MAX_INITIAL_FAILURES: u32 = 4;
+/// Initial attempts when Wake-on-LAN is configured: the host may need to boot
+/// or resume, which takes far longer than a permission blip.
+const MAX_INITIAL_FAILURES_WOL: u32 = 20;
 /// Delay between initial-connect retries.
 const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
 /// Bound the TCP connect so a Local-Network-blocked LAN connect fails fast with
@@ -440,8 +445,28 @@ async fn run(
     let mut session_trusted: Option<String> = config.expected_fingerprint.clone();
     let mut connected_once = false;
     let mut failures: u32 = 0;
+    // Wake-on-LAN: parsed once; a packet goes out before every initial attempt
+    // (a machine that is already awake simply ignores it).
+    let wake_mac = config.wake_mac.as_deref().and_then(crate::wol::parse_mac);
+    let max_initial_failures = if wake_mac.is_some() {
+        MAX_INITIAL_FAILURES_WOL
+    } else {
+        MAX_INITIAL_FAILURES
+    };
 
     loop {
+        if !connected_once {
+            if let Some(mac) = wake_mac {
+                match crate::wol::send_magic_packet(mac) {
+                    Ok(()) => {
+                        if failures == 0 {
+                            tracing::info!("wol: magic packet sent");
+                        }
+                    }
+                    Err(e) => tracing::warn!("wol: sending the magic packet failed: {e}"),
+                }
+            }
+        }
         let (clip_tx, clip_rx) = channel::<ClipSignal>(CLIPBOARD_QUEUE_CAPACITY);
         let (gfx_tx, gfx_rx) = tokio::sync::mpsc::unbounded_channel::<GfxEvent>();
         let outcome = match connect(
@@ -513,7 +538,7 @@ async fn run(
                     // certificate and protocol failures must never be repeated,
                     // because repeated bad credentials can lock a domain account.
                     failures += 1;
-                    if failures >= MAX_INITIAL_FAILURES {
+                    if failures >= max_initial_failures {
                         Outcome::Fail(reason, true)
                     } else {
                         Outcome::Retry {
@@ -1500,6 +1525,7 @@ mod tests {
             reconnect: false,
             reconnect_per_minute: 0,
             swap_cmd_alt: false,
+            wake_mac: None,
         }
     }
 

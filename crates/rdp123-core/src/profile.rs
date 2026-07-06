@@ -188,6 +188,11 @@ pub struct RdpOptions {
     /// Restore the last window size on the next connect (fit-to-window only).
     #[serde(default = "default_true")]
     pub remember_size: bool,
+    /// Wake-on-LAN: MAC address of the host. When set, a magic packet is
+    /// broadcast before connecting and the initial retry window is extended
+    /// so the machine has time to wake up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_mac: Option<String>,
     /// Last window content size in points, saved when a session closes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_window_size: Option<(u16, u16)>,
@@ -209,6 +214,7 @@ impl Default for RdpOptions {
             reconnect_per_minute: default_reconnect_rate(),
             password_policy: PasswordPolicy::default(),
             remember_size: true,
+            wake_mac: None,
             last_window_size: None,
         }
     }

@@ -347,6 +347,7 @@ impl AppDelegate {
             reconnect: opts.reconnect,
             reconnect_per_minute: opts.reconnect_per_minute,
             swap_cmd_alt,
+            wake_mac: opts.wake_mac.clone(),
         };
 
         let frame_pending = Arc::new(AtomicBool::new(false));

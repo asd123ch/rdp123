@@ -132,6 +132,7 @@ pub struct SettingsIvars {
     res_w: Field,
     res_h: Field,
     rate: Field,
+    wake_mac: Field,
     compression: Check,
     fullscreen: Check,
     remember_size: Check,
@@ -882,6 +883,9 @@ impl SettingsController {
         yr -= PITCH;
         *self.ivars().rate.borrow_mut() =
             Some(self.text_row_g(mtm, parent, &mut yr, "Max attempts/minute:", &mut rdp));
+        let wake = self.text_row_g(mtm, parent, &mut yr, "Wake on LAN (MAC):", &mut rdp);
+        wake.setPlaceholderString(Some(&NSString::from_str("AA:BB:CC:DD:EE:FF (optional)")));
+        *self.ivars().wake_mac.borrow_mut() = Some(wake);
 
         // ---- SSH group ----
         let mut ssh = Vec::new();
@@ -1531,6 +1535,7 @@ impl SettingsController {
             self.set_field(&iv.res_w, &rw.to_string());
             self.set_field(&iv.res_h, &rh.to_string());
             self.set_field(&iv.rate, &c.rdp.reconnect_per_minute.to_string());
+            self.set_field(&iv.wake_mac, c.rdp.wake_mac.as_deref().unwrap_or(""));
             self.set_check(&iv.compression, c.rdp.compression);
             self.set_check(&iv.fullscreen, c.rdp.fullscreen);
             self.set_check(&iv.remember_size, c.rdp.remember_size);
@@ -1588,6 +1593,21 @@ impl SettingsController {
                     return false;
                 }
             };
+        let wake_mac = {
+            let raw = self.read_field(&iv.wake_mac).trim().to_string();
+            if raw.is_empty() {
+                None
+            } else if rdp123_core::wol::parse_mac(&raw).is_some() {
+                Some(raw)
+            } else {
+                ui::show_error(
+                    self.mtm(),
+                    "Invalid connection",
+                    "The Wake-on-LAN MAC address must look like AA:BB:CC:DD:EE:FF.",
+                );
+                return false;
+            }
+        };
         let kind = if self.popup_index(&iv.kind) == 1 {
             ConnectionKind::Ssh
         } else {
@@ -1649,6 +1669,7 @@ impl SettingsController {
             None
         };
         connection.rdp.reconnect_per_minute = rate;
+        connection.rdp.wake_mac = wake_mac;
         connection.rdp.compression = compression;
         connection.rdp.fullscreen = fullscreen;
         connection.rdp.remember_size = remember_size;
