@@ -337,8 +337,7 @@ RDP.
 - Audio is playback only (remote → local) and uses uncompressed PCM; microphone
   redirection is not implemented.
 - Multi-monitor and console/admin sessions are not implemented and therefore
-  are not exposed in Settings. Existing JSON values for these legacy fields are
-  ignored by the app.
+  are not exposed in Settings.
 
 ## Contributing
 
