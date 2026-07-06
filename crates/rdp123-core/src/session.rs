@@ -184,6 +184,260 @@ fn to_file_descriptors(files: &[LocalClipFile]) -> Vec<FileDescriptor> {
         .collect()
 }
 
+/// Chunk size for pulling remote files (one outstanding request at a time).
+const FETCH_CHUNK_BYTES: u32 = 1024 * 1024;
+
+/// A file entry on the remote clipboard (from `FileGroupDescriptorW`).
+#[derive(Debug, Clone)]
+struct RemoteFileEntry {
+    /// `\`-separated name relative to the copied selection.
+    wire_name: String,
+    size: Option<u64>,
+    is_dir: bool,
+}
+
+/// A top-level entry on the remote clipboard, offered to Finder as a file
+/// promise. Fetch it with [`SessionCommand::FetchRemoteClipItem`].
+#[derive(Debug, Clone)]
+pub struct RemoteClipItem {
+    pub name: String,
+    pub is_dir: bool,
+}
+
+#[derive(Debug)]
+struct PlannedEntry {
+    /// Index into the remote file list (CLIPRDR `lindex`).
+    index: i32,
+    dest: std::path::PathBuf,
+    size: Option<u64>,
+    is_dir: bool,
+}
+
+#[derive(Debug)]
+struct CurrentFetchFile {
+    file: std::fs::File,
+    index: i32,
+    /// Total size; not yet known while a SIZE request is outstanding.
+    size: u64,
+    needs_size: bool,
+    offset: u64,
+}
+
+/// One Finder paste (a top-level item plus its descendants).
+#[derive(Debug)]
+struct FetchJob {
+    queue: std::collections::VecDeque<PlannedEntry>,
+    current: Option<CurrentFetchFile>,
+    done: std::sync::mpsc::SyncSender<Result<(), String>>,
+}
+
+/// State of the remote clipboard's file offer and the fetch pipeline.
+#[derive(Debug, Default)]
+struct RemoteClipboard {
+    files: Vec<RemoteFileEntry>,
+    data_id: Option<u32>,
+    jobs: std::collections::VecDeque<FetchJob>,
+    next_stream_id: u32,
+    /// Outstanding request: (stream id, was a SIZE request).
+    outstanding: Option<(u32, bool)>,
+}
+
+/// Plan the entries for one pasted top-level item. Wire names containing
+/// `..` components are rejected (a hostile server must not escape `dest`).
+fn plan_fetch_job(
+    remote: &RemoteClipboard,
+    name: &str,
+    dest: &std::path::Path,
+    done: std::sync::mpsc::SyncSender<Result<(), String>>,
+) -> Option<FetchJob> {
+    let prefix = format!("{name}\\");
+    let mut queue = std::collections::VecDeque::new();
+    let mut found_root = false;
+    for (index, entry) in remote.files.iter().enumerate() {
+        let relative: Option<std::path::PathBuf> = if entry.wire_name == name {
+            found_root = true;
+            Some(std::path::PathBuf::new())
+        } else {
+            entry
+                .wire_name
+                .strip_prefix(&prefix)
+                .map(|sub| sub.split('\\').collect::<std::path::PathBuf>())
+        };
+        let Some(relative) = relative else { continue };
+        if relative
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            && !relative.as_os_str().is_empty()
+        {
+            tracing::warn!(
+                "clipboard: skipping suspicious remote path {:?}",
+                entry.wire_name
+            );
+            continue;
+        }
+        let dest_path = if relative.as_os_str().is_empty() {
+            dest.to_path_buf()
+        } else {
+            dest.join(relative)
+        };
+        queue.push_back(PlannedEntry {
+            index: i32::try_from(index).unwrap_or(i32::MAX),
+            dest: dest_path,
+            size: entry.size,
+            is_dir: entry.is_dir,
+        });
+    }
+    if !found_root {
+        let _ = done.send(Err(format!(
+            "'{name}' is no longer on the remote clipboard"
+        )));
+        return None;
+    }
+    Some(FetchJob {
+        queue,
+        current: None,
+        done,
+    })
+}
+
+/// Drive the fetch pipeline until it needs the next FileContents response
+/// (or all jobs are drained). Creates directories and files locally and
+/// issues at most one outstanding request.
+async fn advance_remote_fetch(
+    remote: &mut RemoteClipboard,
+    active_stage: &mut ActiveStage,
+    out_tx: &OutSender,
+) -> Result<()> {
+    loop {
+        if remote.outstanding.is_some() {
+            return Ok(());
+        }
+        let data_id = remote.data_id;
+        let Some(job) = remote.jobs.front_mut() else {
+            return Ok(());
+        };
+
+        if let Some(current) = &job.current {
+            let (flags, requested, was_size) = if current.needs_size {
+                (FileContentsFlags::SIZE, 8, true)
+            } else {
+                let remaining = current.size.saturating_sub(current.offset);
+                let chunk = u32::try_from(remaining.min(u64::from(FETCH_CHUNK_BYTES)))
+                    .unwrap_or(FETCH_CHUNK_BYTES);
+                (FileContentsFlags::RANGE, chunk, false)
+            };
+            let stream_id = remote.next_stream_id;
+            remote.next_stream_id = remote.next_stream_id.wrapping_add(1);
+            let request = FileContentsRequest {
+                stream_id,
+                index: current.index,
+                flags,
+                position: current.offset,
+                requested_size: requested,
+                data_id,
+            };
+            remote.outstanding = Some((stream_id, was_size));
+            return send_cliprdr(active_stage, out_tx, |c| c.request_file_contents(request)).await;
+        }
+
+        match job.queue.pop_front() {
+            Some(entry) if entry.is_dir => {
+                if let Err(e) = std::fs::create_dir_all(&entry.dest) {
+                    fail_front_job(remote, format!("creating {}: {e}", entry.dest.display()));
+                }
+            }
+            Some(entry) => {
+                if let Some(parent) = entry.dest.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                match std::fs::File::create(&entry.dest) {
+                    Ok(file) => {
+                        if entry.size == Some(0) {
+                            continue; // empty file, nothing to fetch
+                        }
+                        job.current = Some(CurrentFetchFile {
+                            file,
+                            index: entry.index,
+                            size: entry.size.unwrap_or(0),
+                            needs_size: entry.size.is_none(),
+                            offset: 0,
+                        });
+                    }
+                    Err(e) => {
+                        fail_front_job(remote, format!("creating {}: {e}", entry.dest.display()));
+                    }
+                }
+            }
+            None => {
+                if let Some(job) = remote.jobs.pop_front() {
+                    let _ = job.done.send(Ok(()));
+                }
+            }
+        }
+    }
+}
+
+fn fail_front_job(remote: &mut RemoteClipboard, reason: String) {
+    if let Some(job) = remote.jobs.pop_front() {
+        tracing::warn!("clipboard: file fetch failed: {reason}");
+        let _ = job.done.send(Err(reason));
+    }
+}
+
+/// Apply one FileContents response to the fetch pipeline.
+async fn handle_remote_file_contents(
+    remote: &mut RemoteClipboard,
+    stream_id: u32,
+    data: Option<Vec<u8>>,
+    active_stage: &mut ActiveStage,
+    out_tx: &OutSender,
+) -> Result<()> {
+    use std::io::Write as _;
+
+    let Some((expected_id, was_size)) = remote.outstanding else {
+        return Ok(()); // stale response after a failed/cancelled job
+    };
+    if stream_id != expected_id {
+        return Ok(());
+    }
+    remote.outstanding = None;
+
+    let outcome: Result<(), String> = (|| {
+        let bytes = data.ok_or("the remote refused the transfer")?;
+        let job = remote.jobs.front_mut().ok_or("no active transfer")?;
+        let current = job.current.as_mut().ok_or("no file in progress")?;
+        if was_size {
+            let size: [u8; 8] = bytes
+                .get(..8)
+                .and_then(|b| b.try_into().ok())
+                .ok_or("malformed size response")?;
+            current.size = u64::from_le_bytes(size);
+            current.needs_size = false;
+            if current.size == 0 {
+                job.current = None;
+            }
+        } else {
+            if bytes.is_empty() {
+                return Err("transfer ended early".to_string());
+            }
+            current
+                .file
+                .write_all(&bytes)
+                .map_err(|e| format!("writing file: {e}"))?;
+            current.offset += bytes.len() as u64;
+            if current.offset >= current.size {
+                job.current = None;
+            }
+        }
+        Ok(())
+    })();
+
+    if let Err(reason) = outcome {
+        fail_front_job(remote, reason);
+    }
+    advance_remote_fetch(remote, active_stage, out_tx).await
+}
+
 /// A logical mouse button.
 #[derive(Debug, Clone, Copy)]
 pub enum PointerButton {
@@ -227,6 +481,13 @@ pub enum SessionCommand {
     LocalClipboard(String),
     /// The user copied files in Finder; offer them to the remote clipboard.
     LocalClipboardFiles(Vec<std::path::PathBuf>),
+    /// Finder redeemed a file promise: pull `name` (and its descendants) from
+    /// the remote clipboard to `dest`, then report on `done`.
+    FetchRemoteClipItem {
+        name: String,
+        dest: std::path::PathBuf,
+        done: std::sync::mpsc::SyncSender<Result<(), String>>,
+    },
     ReleaseAllKeys,
     Shutdown,
 }
@@ -262,6 +523,9 @@ pub enum SessionEvent {
     /// The server hides the pointer (e.g. touch input or full-screen video).
     PointerHidden,
     ClipboardText(String),
+    /// The remote clipboard offers files; the app should put file promises on
+    /// the pasteboard and fetch on paste via `FetchRemoteClipItem`.
+    ClipboardFiles(Vec<RemoteClipItem>),
     /// Ask the user to trust a server key fingerprint. `is_change` is true when
     /// a *different* key was previously pinned. Reply true to proceed.
     CertificateApproval {
@@ -462,6 +726,16 @@ enum ClipSignal {
     InitiateFileCopy(Vec<FileDescriptor>),
     /// Serve one FileContents chunk or size to the remote.
     SubmitFileContents(FileContentsResponse<'static>),
+    /// The remote clipboard's file list arrived (parsed FileGroupDescriptorW).
+    RemoteFileList {
+        files: Vec<RemoteFileEntry>,
+        data_id: Option<u32>,
+    },
+    /// One FileContents response for our fetch pipeline (`None` = error).
+    RemoteFileContents {
+        stream_id: u32,
+        data: Option<Vec<u8>>,
+    },
     InitiatePaste(ClipboardFormatId),
     SubmitData(OwnedFormatDataResponse),
     RemoteText(String),
@@ -796,6 +1070,7 @@ async fn run_session(
     // closed channel or the select loop would spin at 100% CPU. Same for gfx.
     let mut clip_open = true;
     let mut gfx_open = true;
+    let mut remote_clip = RemoteClipboard::default();
 
     let end = loop {
         if pending.shutdown.swap(false, Ordering::AcqRel) {
@@ -809,6 +1084,7 @@ async fn run_session(
                 &mut input_db,
                 framebuffer,
                 local_clip,
+                &mut remote_clip,
                 event_cb,
             )
             .await;
@@ -847,7 +1123,7 @@ async fn run_session(
                 };
                 match handle_command(
                     cmd, config, &mut reader, &out_tx, &mut active_stage, &mut image,
-                    &mut input_db, framebuffer, local_clip, event_cb,
+                    &mut input_db, framebuffer, local_clip, &mut remote_clip, event_cb,
                 ).await {
                     Ok(true) => break SessionEnd::UserQuit,
                     Ok(false) => {}
@@ -858,7 +1134,7 @@ async fn run_session(
             sig = clip_rx.recv(), if clip_open => {
                 match sig {
                     Some(sig) => {
-                        if let Err(e) = handle_clip_signal(sig, &out_tx, &mut active_stage, event_cb).await {
+                        if let Err(e) = handle_clip_signal(sig, &out_tx, &mut active_stage, &mut remote_clip, event_cb).await {
                             tracing::warn!("clipboard: {e}");
                         }
                     }
@@ -1118,6 +1394,7 @@ async fn handle_command(
     input_db: &mut Database,
     framebuffer: &SharedFramebuffer,
     local_clip: &LocalClipState,
+    remote_clip: &mut RemoteClipboard,
     event_cb: &EventCb,
 ) -> Result<bool> {
     match cmd {
@@ -1180,6 +1457,12 @@ async fn handle_command(
             *local_clip.lock().unwrap() = LocalClip::Files(files);
             send_cliprdr(active_stage, out_tx, |c| c.initiate_file_copy(descriptors)).await?;
         }
+        SessionCommand::FetchRemoteClipItem { name, dest, done } => {
+            if let Some(job) = plan_fetch_job(remote_clip, &name, &dest, done) {
+                remote_clip.jobs.push_back(job);
+                advance_remote_fetch(remote_clip, active_stage, out_tx).await?;
+            }
+        }
         SessionCommand::ReleaseAllKeys => {
             let fp_events = input_db.release_all();
             if !fp_events.is_empty() {
@@ -1214,6 +1497,7 @@ async fn handle_clip_signal(
     sig: ClipSignal,
     out_tx: &OutSender,
     active_stage: &mut ActiveStage,
+    remote_clip: &mut RemoteClipboard,
     event_cb: &EventCb,
 ) -> Result<()> {
     match sig {
@@ -1235,6 +1519,26 @@ async fn handle_clip_signal(
         ClipSignal::RemoteText(text) => {
             event_cb(SessionEvent::ClipboardText(text));
             Ok(())
+        }
+        ClipSignal::RemoteFileList { files, data_id } => {
+            remote_clip.files = files;
+            remote_clip.data_id = data_id;
+            let items: Vec<RemoteClipItem> = remote_clip
+                .files
+                .iter()
+                .filter(|f| !f.wire_name.contains('\\'))
+                .map(|f| RemoteClipItem {
+                    name: f.wire_name.clone(),
+                    is_dir: f.is_dir,
+                })
+                .collect();
+            if !items.is_empty() {
+                event_cb(SessionEvent::ClipboardFiles(items));
+            }
+            Ok(())
+        }
+        ClipSignal::RemoteFileContents { stream_id, data } => {
+            handle_remote_file_contents(remote_clip, stream_id, data, active_stage, out_tx).await
         }
     }
 }
@@ -1644,10 +1948,19 @@ impl CliprdrBackend for MacClipboardBackend {
 
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
         // Fetch what the remote copied only if remote -> local is allowed.
-        if self.mode.allow_remote_to_local()
-            && available_formats
-                .iter()
-                .any(|f| f.id == ClipboardFormatId::CF_UNICODETEXT)
+        // A file copy wins over the file-name text that accompanies it.
+        if !self.mode.allow_remote_to_local() {
+            return;
+        }
+        let file_list = available_formats.iter().find(|f| {
+            f.name()
+                .is_some_and(|name| name.value() == "FileGroupDescriptorW")
+        });
+        if let Some(format) = file_list {
+            let _ = self.tx.try_send(ClipSignal::InitiatePaste(format.id()));
+        } else if available_formats
+            .iter()
+            .any(|f| f.id == ClipboardFormatId::CF_UNICODETEXT)
         {
             let _ = self
                 .tx
@@ -1694,9 +2007,42 @@ impl CliprdrBackend for MacClipboardBackend {
         let _ = self.tx.try_send(ClipSignal::SubmitFileContents(response));
     }
 
-    // Receiving files from the remote is not implemented yet; lock snapshots
-    // for outgoing copies are managed inside ironrdp-cliprdr.
-    fn on_file_contents_response(&mut self, _response: FileContentsResponse<'_>) {}
+    fn on_file_contents_response(&mut self, response: FileContentsResponse<'_>) {
+        let data = if response.is_error() {
+            None
+        } else {
+            Some(response.data().to_vec())
+        };
+        let _ = self.tx.try_send(ClipSignal::RemoteFileContents {
+            stream_id: response.stream_id(),
+            data,
+        });
+    }
+
+    fn on_remote_file_list(&mut self, files: &[FileDescriptor], clip_data_id: Option<u32>) {
+        if !self.mode.allow_remote_to_local() {
+            return;
+        }
+        let entries: Vec<RemoteFileEntry> = files
+            .iter()
+            .map(|descriptor| RemoteFileEntry {
+                wire_name: match descriptor.relative_path.as_deref() {
+                    Some(path) if !path.is_empty() => format!("{path}\\{}", descriptor.name),
+                    _ => descriptor.name.clone(),
+                },
+                size: descriptor.file_size,
+                is_dir: descriptor
+                    .attributes
+                    .is_some_and(|a| a.contains(ClipboardFileAttributes::DIRECTORY)),
+            })
+            .collect();
+        let _ = self.tx.try_send(ClipSignal::RemoteFileList {
+            files: entries,
+            data_id: clip_data_id,
+        });
+    }
+
+    // Lock snapshots for outgoing copies are managed inside ironrdp-cliprdr.
     fn on_lock(&mut self, _data_id: LockDataId) {}
     fn on_unlock(&mut self, _data_id: LockDataId) {}
 }

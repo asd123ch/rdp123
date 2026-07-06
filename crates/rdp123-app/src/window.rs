@@ -19,10 +19,12 @@ use objc2_foundation::{NSNotification, NSObjectProtocol, NSString, NSTimer, NSUR
 use objc2_quartz_core::kCAFilterLinear;
 
 use rdp123_core::{
-    ClipboardMode, RdpOptions, ResolutionMode, ScalingLevel, SessionCommand, SessionHandle,
+    ClipboardMode, RdpOptions, RemoteClipItem, ResolutionMode, ScalingLevel, SessionCommand,
+    SessionHandle,
 };
 
 use crate::delegate;
+use crate::promise;
 use crate::ui;
 use crate::view::RdpView;
 
@@ -47,6 +49,14 @@ pub struct WindowControllerIvars {
     remember_size: Cell<bool>,
     clipboard_mode: Cell<ClipboardMode>,
     last_change_count: Cell<isize>,
+    /// Keeps promise providers and their (weakly referenced) delegates alive
+    /// while the remote file offer sits on the pasteboard.
+    promise_holders: RefCell<
+        Vec<(
+            Retained<objc2_app_kit::NSFilePromiseProvider>,
+            Retained<promise::FilePromiseDelegate>,
+        )>,
+    >,
 }
 
 define_class!(
@@ -446,6 +456,38 @@ impl WindowController {
                 scale,
             });
         }
+    }
+
+    /// The remote session copied files: replace the pasteboard contents with
+    /// one file promise per top-level item, redeemed on Finder paste.
+    pub fn offer_remote_files(&self, items: Vec<RemoteClipItem>) {
+        if !self.ivars().clipboard_mode.get().allow_remote_to_local() {
+            return;
+        }
+        let Some(handle) = self.ivars().handle.borrow().clone() else {
+            return;
+        };
+        let mut holders = Vec::with_capacity(items.len());
+        let mut writers = Vec::with_capacity(items.len());
+        for item in items {
+            let (provider, delegate) = promise::make_provider(&handle, item);
+            writers.push(ProtocolObject::from_retained(provider.clone())
+                as Retained<ProtocolObject<dyn objc2_app_kit::NSPasteboardWriting>>);
+            holders.push((provider, delegate));
+        }
+        if writers.is_empty() {
+            return;
+        }
+        let pasteboard = NSPasteboard::generalPasteboard();
+        pasteboard.clearContents();
+        let array = objc2_foundation::NSArray::from_retained_slice(&writers);
+        let ok = pasteboard.writeObjects(&array);
+        if !ok {
+            tracing::warn!("clipboard: could not offer remote files to the pasteboard");
+        }
+        // Don't re-read our own pasteboard write on the next poll.
+        self.ivars().last_change_count.set(pasteboard.changeCount());
+        *self.ivars().promise_holders.borrow_mut() = holders;
     }
 
     fn start_clipboard_timer(&self) {

@@ -22,6 +22,7 @@ objc2-quartz-core.workspace = true
 objc2-core-graphics.workspace = true
 objc2-io-surface.workspace = true
 objc2-service-management.workspace = true
+block2.workspace = true
 dispatch2.workspace = true
 
 tracing.workspace = true

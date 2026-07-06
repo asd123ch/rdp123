@@ -21,6 +21,6 @@ pub use profile::{
     PasswordPolicy, ProfileStore, RdpOptions, ResolutionMode, ScalingLevel, Settings, TerminalKind,
 };
 pub use session::{
-    spawn as spawn_session, InputEvent, PointerButton, SessionCommand, SessionConfig, SessionEvent,
-    SessionHandle, REMOTE_ENDED,
+    spawn as spawn_session, InputEvent, PointerButton, RemoteClipItem, SessionCommand,
+    SessionConfig, SessionEvent, SessionHandle, REMOTE_ENDED,
 };

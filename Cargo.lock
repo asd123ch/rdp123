@@ -2325,8 +2325,9 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "rdp123-app"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
+ "block2",
  "dispatch2",
  "objc2",
  "objc2-app-kit",
@@ -2343,7 +2344,7 @@ dependencies = [
 
 [[package]]
 name = "rdp123-core"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "cpal",
@@ -3577,7 +3578,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
 ]

@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.2"
+version = "0.5.3"
 edition = "2021"
 rust-version = "1.89"
 license = "GPL-3.0-only"
@@ -61,6 +61,7 @@ objc2-quartz-core = "0.3"
 objc2-core-graphics = "0.3"
 objc2-io-surface = { version = "0.3", features = ["libc"] }
 objc2-service-management = "0.3"
+block2 = "0.6"
 dispatch2 = "0.3"
 security-framework = "3"
 

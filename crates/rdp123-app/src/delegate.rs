@@ -463,6 +463,7 @@ impl AppDelegate {
             SessionEvent::PointerHidden => controller.set_pointer_hidden(),
             SessionEvent::Reconnecting => controller.set_reconnecting(true),
             SessionEvent::ClipboardText(text) => controller.set_clipboard(&text),
+            SessionEvent::ClipboardFiles(items) => controller.offer_remote_files(items),
             SessionEvent::CertificateApproval {
                 fingerprint,
                 is_change,
