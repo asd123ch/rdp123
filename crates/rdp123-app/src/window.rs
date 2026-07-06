@@ -15,7 +15,7 @@ use objc2_app_kit::{
     NSProgressIndicator, NSProgressIndicatorStyle, NSScreen, NSTextField, NSTrackingArea,
     NSTrackingAreaOptions, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
-use objc2_foundation::{NSNotification, NSObjectProtocol, NSString, NSTimer};
+use objc2_foundation::{NSNotification, NSObjectProtocol, NSString, NSTimer, NSURL};
 use objc2_quartz_core::kCAFilterLinear;
 
 use rdp123_core::{
@@ -480,6 +480,16 @@ impl WindowController {
             return;
         }
         self.ivars().last_change_count.set(count);
+
+        // Files take precedence over text: a Finder copy also puts the file
+        // names on the pasteboard as a string.
+        let files = pasteboard_file_paths(&pasteboard);
+        if !files.is_empty() {
+            if let Some(handle) = self.ivars().handle.borrow().as_ref() {
+                handle.command(SessionCommand::LocalClipboardFiles(files));
+            }
+            return;
+        }
         if let Some(text) = unsafe { pasteboard.stringForType(NSPasteboardTypeString) } {
             let text = text.to_string();
             if !text.is_empty() {
@@ -494,4 +504,25 @@ impl WindowController {
 fn even(v: f64) -> u16 {
     let n = v as u16;
     n & !1
+}
+
+/// File URLs currently on the pasteboard, as local paths.
+fn pasteboard_file_paths(pasteboard: &NSPasteboard) -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    let Some(items) = pasteboard.pasteboardItems() else {
+        return paths;
+    };
+    let file_url_type = NSString::from_str("public.file-url");
+    for item in items {
+        let Some(url_string) = item.stringForType(&file_url_type) else {
+            continue;
+        };
+        let Some(url) = NSURL::URLWithString(&url_string) else {
+            continue;
+        };
+        if let Some(path) = url.path() {
+            paths.push(std::path::PathBuf::from(path.to_string()));
+        }
+    }
+    paths
 }

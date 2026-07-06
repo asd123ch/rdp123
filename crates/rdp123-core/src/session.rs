@@ -21,9 +21,9 @@ use zeroize::Zeroize;
 
 use ironrdp::cliprdr::backend::CliprdrBackend;
 use ironrdp::cliprdr::pdu::{
-    ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FileContentsRequest,
-    FileContentsResponse, FormatDataRequest, FormatDataResponse, LockDataId,
-    OwnedFormatDataResponse,
+    ClipboardFileAttributes, ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags,
+    FileContentsFlags, FileContentsRequest, FileContentsResponse, FileDescriptor,
+    FormatDataRequest, FormatDataResponse, LockDataId, OwnedFormatDataResponse,
 };
 use ironrdp::cliprdr::{Client, CliprdrClient, CliprdrSvcMessages};
 use ironrdp::connector::connection_activation::{
@@ -79,6 +79,110 @@ const COMMAND_QUEUE_CAPACITY: usize = 256;
 const CLIPBOARD_QUEUE_CAPACITY: usize = 32;
 const OUTPUT_QUEUE_CAPACITY: usize = 64;
 const MAX_CLIPBOARD_TEXT_BYTES: usize = 16 * 1024 * 1024;
+/// Cap on the number of files offered to the remote clipboard in one copy
+/// (folders are walked recursively; a runaway selection is truncated).
+const MAX_CLIPBOARD_FILES: usize = 4096;
+/// Cap on a single FileContents chunk we are willing to serve.
+const MAX_FILE_CHUNK_BYTES: u32 = 16 * 1024 * 1024;
+
+/// What the local (macOS) clipboard currently offers to the remote session.
+#[derive(Debug, Default)]
+enum LocalClip {
+    #[default]
+    Empty,
+    Text(String),
+    Files(Vec<LocalClipFile>),
+}
+
+/// One local file (or directory) offered to the remote clipboard.
+#[derive(Debug, Clone)]
+struct LocalClipFile {
+    /// Absolute path on disk.
+    path: std::path::PathBuf,
+    /// Wire name relative to the copied selection, `\`-separated.
+    wire_name: String,
+    size: u64,
+    is_dir: bool,
+}
+
+type LocalClipState = Arc<Mutex<LocalClip>>;
+
+/// Walk the copied selection into the flat, relative-path list the Windows
+/// clipboard expects. Unreadable entries and non-UTF-8 names are skipped.
+fn collect_clipboard_files(roots: &[std::path::PathBuf]) -> Vec<LocalClipFile> {
+    fn visit(path: &std::path::Path, wire_name: String, out: &mut Vec<LocalClipFile>) {
+        if out.len() >= MAX_CLIPBOARD_FILES {
+            return;
+        }
+        let Ok(metadata) = std::fs::metadata(path) else {
+            tracing::warn!("clipboard: skipping unreadable {}", path.display());
+            return;
+        };
+        if metadata.is_dir() {
+            out.push(LocalClipFile {
+                path: path.to_path_buf(),
+                wire_name: wire_name.clone(),
+                size: 0,
+                is_dir: true,
+            });
+            let Ok(entries) = std::fs::read_dir(path) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let child = entry.path();
+                let Some(name) = child.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                visit(&child, format!("{wire_name}\\{name}"), out);
+            }
+        } else if metadata.is_file() {
+            out.push(LocalClipFile {
+                path: path.to_path_buf(),
+                wire_name,
+                size: metadata.len(),
+                is_dir: false,
+            });
+        }
+    }
+
+    let mut out = Vec::new();
+    for root in roots {
+        let Some(name) = root.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        visit(root, name.to_string(), &mut out);
+    }
+    if out.len() >= MAX_CLIPBOARD_FILES {
+        tracing::warn!("clipboard: selection truncated at {MAX_CLIPBOARD_FILES} files");
+    }
+    out
+}
+
+/// Build the CLIPRDR descriptors for the offered files (wire name is split
+/// into `relative_path` + `name` as the encoder expects).
+fn to_file_descriptors(files: &[LocalClipFile]) -> Vec<FileDescriptor> {
+    files
+        .iter()
+        .map(|file| {
+            let (relative_path, name) = match file.wire_name.rsplit_once('\\') {
+                Some((path, name)) => (Some(path), name),
+                None => (None, file.wire_name.as_str()),
+            };
+            let mut descriptor = FileDescriptor::new(name);
+            if let Some(path) = relative_path {
+                descriptor = descriptor.with_relative_path(path);
+            }
+            if file.is_dir {
+                descriptor = descriptor.with_attributes(ClipboardFileAttributes::DIRECTORY);
+            } else {
+                descriptor = descriptor
+                    .with_attributes(ClipboardFileAttributes::NORMAL)
+                    .with_file_size(file.size);
+            }
+            descriptor
+        })
+        .collect()
+}
 
 /// A logical mouse button.
 #[derive(Debug, Clone, Copy)]
@@ -121,6 +225,8 @@ pub enum SessionCommand {
         scale: Option<u32>,
     },
     LocalClipboard(String),
+    /// The user copied files in Finder; offer them to the remote clipboard.
+    LocalClipboardFiles(Vec<std::path::PathBuf>),
     ReleaseAllKeys,
     Shutdown,
 }
@@ -352,6 +458,10 @@ pub fn spawn(config: SessionConfig, event_cb: EventCb) -> SessionHandle {
 /// Signals produced by the clipboard backend, drained by the session loop.
 enum ClipSignal {
     InitiateCopy(Vec<ClipboardFormat>),
+    /// Announce a file copy (FileGroupDescriptorW format list).
+    InitiateFileCopy(Vec<FileDescriptor>),
+    /// Serve one FileContents chunk or size to the remote.
+    SubmitFileContents(FileContentsResponse<'static>),
     InitiatePaste(ClipboardFormatId),
     SubmitData(OwnedFormatDataResponse),
     RemoteText(String),
@@ -427,7 +537,7 @@ async fn run(
     event_cb: EventCb,
 ) {
     ensure_crypto_provider();
-    let local_text: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let local_clip: LocalClipState = Arc::new(Mutex::new(LocalClip::Empty));
     // One audio player for the whole session (reconnects reuse it). Missing
     // audio is never fatal — the session simply runs silent.
     let audio = if config.audio == AudioMode::ThisComputer {
@@ -472,7 +582,7 @@ async fn run(
         let outcome = match connect(
             &config,
             &mut session_trusted,
-            local_text.clone(),
+            local_clip.clone(),
             clip_tx,
             gfx_tx,
             audio.as_ref(),
@@ -511,7 +621,7 @@ async fn run(
                     &pending,
                     clip_rx,
                     gfx_rx,
-                    &local_text,
+                    &local_clip,
                     &event_cb,
                 )
                 .await
@@ -660,7 +770,7 @@ async fn run_session(
     pending: &PendingCommands,
     mut clip_rx: Receiver<ClipSignal>,
     mut gfx_rx: tokio::sync::mpsc::UnboundedReceiver<GfxEvent>,
-    local_text: &Arc<Mutex<Option<String>>>,
+    local_clip: &LocalClipState,
     event_cb: &EventCb,
 ) -> SessionEnd {
     let width = connection_result.desktop_size.width;
@@ -698,7 +808,7 @@ async fn run_session(
                 &mut image,
                 &mut input_db,
                 framebuffer,
-                local_text,
+                local_clip,
                 event_cb,
             )
             .await;
@@ -737,7 +847,7 @@ async fn run_session(
                 };
                 match handle_command(
                     cmd, config, &mut reader, &out_tx, &mut active_stage, &mut image,
-                    &mut input_db, framebuffer, local_text, event_cb,
+                    &mut input_db, framebuffer, local_clip, event_cb,
                 ).await {
                     Ok(true) => break SessionEnd::UserQuit,
                     Ok(false) => {}
@@ -847,7 +957,7 @@ async fn writer_loop(mut writer: SessionWriter, mut out_rx: Receiver<Vec<u8>>) {
 async fn connect(
     config: &SessionConfig,
     session_trusted: &mut Option<String>,
-    local_text: Arc<Mutex<Option<String>>>,
+    local_clip: LocalClipState,
     clip_tx: Sender<ClipSignal>,
     gfx_tx: tokio::sync::mpsc::UnboundedSender<GfxEvent>,
     audio: Option<&crate::audio::AudioPlayer>,
@@ -903,13 +1013,13 @@ async fn connect(
     if config.clipboard.enabled() {
         let backend = MacClipboardBackend {
             tx: clip_tx,
-            local_text,
+            local_clip,
             tmp: std::env::temp_dir().to_string_lossy().into_owned(),
             mode: config.clipboard,
         };
         connector.attach_static_channel(CliprdrClient::new(Box::new(backend)));
     } else {
-        drop((clip_tx, local_text));
+        drop((clip_tx, local_clip));
     }
 
     let mut framed = TokioFramed::new(tcp);
@@ -1007,7 +1117,7 @@ async fn handle_command(
     image: &mut DecodedImage,
     input_db: &mut Database,
     framebuffer: &SharedFramebuffer,
-    local_text: &Arc<Mutex<Option<String>>>,
+    local_clip: &LocalClipState,
     event_cb: &EventCb,
 ) -> Result<bool> {
     match cmd {
@@ -1056,9 +1166,19 @@ async fn handle_command(
                 );
                 return Ok(false);
             }
-            *local_text.lock().unwrap() = Some(text);
+            *local_clip.lock().unwrap() = LocalClip::Text(text);
             let formats = vec![ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
             send_cliprdr(active_stage, out_tx, |c| c.initiate_copy(&formats)).await?;
+        }
+        SessionCommand::LocalClipboardFiles(paths) => {
+            let files = collect_clipboard_files(&paths);
+            if files.is_empty() {
+                return Ok(false);
+            }
+            let descriptors = to_file_descriptors(&files);
+            tracing::debug!("clipboard: offering {} file entries", files.len());
+            *local_clip.lock().unwrap() = LocalClip::Files(files);
+            send_cliprdr(active_stage, out_tx, |c| c.initiate_file_copy(descriptors)).await?;
         }
         SessionCommand::ReleaseAllKeys => {
             let fp_events = input_db.release_all();
@@ -1099,6 +1219,12 @@ async fn handle_clip_signal(
     match sig {
         ClipSignal::InitiateCopy(formats) => {
             send_cliprdr(active_stage, out_tx, |c| c.initiate_copy(&formats)).await
+        }
+        ClipSignal::InitiateFileCopy(descriptors) => {
+            send_cliprdr(active_stage, out_tx, |c| c.initiate_file_copy(descriptors)).await
+        }
+        ClipSignal::SubmitFileContents(response) => {
+            send_cliprdr(active_stage, out_tx, |c| c.submit_file_contents(response)).await
         }
         ClipSignal::InitiatePaste(format) => {
             send_cliprdr(active_stage, out_tx, |c| c.initiate_paste(format)).await
@@ -1399,13 +1525,78 @@ impl NetworkClient for NoNetworkClient {
     }
 }
 
-/// A text-only clipboard backend bridging CLIPRDR to `NSPasteboard` (via the app).
+/// A clipboard backend bridging CLIPRDR to `NSPasteboard` (via the app):
+/// Unicode text in both directions plus local files offered to the remote
+/// (file streams, MS-RDPECLIP 3.1.1.4).
 #[derive(Debug)]
 struct MacClipboardBackend {
     tx: Sender<ClipSignal>,
-    local_text: Arc<Mutex<Option<String>>>,
+    local_clip: LocalClipState,
     tmp: String,
     mode: ClipboardMode,
+}
+
+impl MacClipboardBackend {
+    /// Serve one FileContents request from the offered files snapshot.
+    fn file_contents_response(
+        &self,
+        request: &FileContentsRequest,
+    ) -> FileContentsResponse<'static> {
+        use std::io::{Read as _, Seek as _};
+
+        let error = FileContentsResponse::new_error(request.stream_id);
+        if !self.mode.allow_local_to_remote() {
+            return error;
+        }
+        let clip = self.local_clip.lock().unwrap();
+        let LocalClip::Files(files) = &*clip else {
+            return error;
+        };
+        let Some(file) = usize::try_from(request.index)
+            .ok()
+            .and_then(|index| files.get(index))
+        else {
+            tracing::warn!(
+                "clipboard: FileContents request for unknown index {}",
+                request.index
+            );
+            return error;
+        };
+
+        if request.flags.contains(FileContentsFlags::SIZE) {
+            return FileContentsResponse::new_size_response(request.stream_id, file.size);
+        }
+        if !request.flags.contains(FileContentsFlags::RANGE) || file.is_dir {
+            return error;
+        }
+
+        let requested = request.requested_size.min(MAX_FILE_CHUNK_BYTES) as usize;
+        let mut open = match std::fs::File::open(&file.path) {
+            Ok(open) => open,
+            Err(e) => {
+                tracing::warn!("clipboard: cannot open {}: {e}", file.path.display());
+                return error;
+            }
+        };
+        if let Err(e) = open.seek(std::io::SeekFrom::Start(request.position)) {
+            tracing::warn!("clipboard: seek in {} failed: {e}", file.path.display());
+            return error;
+        }
+        let mut data = vec![0u8; requested];
+        let mut filled = 0usize;
+        while filled < requested {
+            match open.read(&mut data[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) => {
+                    tracing::warn!("clipboard: read from {} failed: {e}", file.path.display());
+                    return error;
+                }
+            }
+        }
+        data.truncate(filled);
+        FileContentsResponse::new_data_response(request.stream_id, data)
+    }
 }
 
 impl ironrdp::core::AsAny for MacClipboardBackend {
@@ -1423,16 +1614,29 @@ impl CliprdrBackend for MacClipboardBackend {
     }
 
     fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
-        ClipboardGeneralCapabilityFlags::empty()
+        // File streams for Finder -> Explorer copies; names stay relative.
+        ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
+            | ClipboardGeneralCapabilityFlags::FILECLIP_NO_FILE_PATHS
+            | ClipboardGeneralCapabilityFlags::HUGE_FILE_SUPPORT_ENABLED
     }
 
     fn on_ready(&mut self) {}
 
     fn on_request_format_list(&mut self) {
         // Advertise our clipboard only if local -> remote is allowed.
-        if self.mode.allow_local_to_remote() {
-            let formats = vec![ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
-            let _ = self.tx.try_send(ClipSignal::InitiateCopy(formats));
+        if !self.mode.allow_local_to_remote() {
+            return;
+        }
+        match &*self.local_clip.lock().unwrap() {
+            LocalClip::Files(files) => {
+                let _ = self
+                    .tx
+                    .try_send(ClipSignal::InitiateFileCopy(to_file_descriptors(files)));
+            }
+            _ => {
+                let formats = vec![ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
+                let _ = self.tx.try_send(ClipSignal::InitiateCopy(formats));
+            }
         }
     }
 
@@ -1455,7 +1659,10 @@ impl CliprdrBackend for MacClipboardBackend {
         let response = if self.mode.allow_local_to_remote()
             && request.format == ClipboardFormatId::CF_UNICODETEXT
         {
-            let text = self.local_text.lock().unwrap().clone().unwrap_or_default();
+            let text = match &*self.local_clip.lock().unwrap() {
+                LocalClip::Text(text) => text.clone(),
+                _ => String::new(),
+            };
             let crlf = normalize_clipboard_to_crlf(&text);
             FormatDataResponse::new_unicode_string(&crlf)
         } else {
@@ -1482,8 +1689,13 @@ impl CliprdrBackend for MacClipboardBackend {
         }
     }
 
-    // Text-only: files and locks are never negotiated, so these stay empty.
-    fn on_file_contents_request(&mut self, _request: FileContentsRequest) {}
+    fn on_file_contents_request(&mut self, request: FileContentsRequest) {
+        let response = self.file_contents_response(&request);
+        let _ = self.tx.try_send(ClipSignal::SubmitFileContents(response));
+    }
+
+    // Receiving files from the remote is not implemented yet; lock snapshots
+    // for outgoing copies are managed inside ironrdp-cliprdr.
     fn on_file_contents_response(&mut self, _response: FileContentsResponse<'_>) {}
     fn on_lock(&mut self, _data_id: LockDataId) {}
     fn on_unlock(&mut self, _data_id: LockDataId) {}
@@ -1575,5 +1787,82 @@ mod tests {
             let disabled = build_config(&test_session_config(graphics, false), false);
             assert_eq!(disabled.compression_type, None);
         }
+    }
+
+    #[test]
+    fn file_descriptors_split_wire_names_and_mark_directories() {
+        use super::{to_file_descriptors, LocalClipFile};
+        use ironrdp::cliprdr::pdu::ClipboardFileAttributes;
+
+        let files = vec![
+            LocalClipFile {
+                path: "/tmp/report.pdf".into(),
+                wire_name: "report.pdf".to_string(),
+                size: 1234,
+                is_dir: false,
+            },
+            LocalClipFile {
+                path: "/tmp/project".into(),
+                wire_name: "project".to_string(),
+                size: 0,
+                is_dir: true,
+            },
+            LocalClipFile {
+                path: "/tmp/project/src/main.rs".into(),
+                wire_name: "project\\src\\main.rs".to_string(),
+                size: 7,
+                is_dir: false,
+            },
+        ];
+        let descriptors = to_file_descriptors(&files);
+
+        assert_eq!(descriptors[0].name, "report.pdf");
+        assert_eq!(descriptors[0].relative_path, None);
+        assert_eq!(descriptors[0].file_size, Some(1234));
+
+        assert_eq!(descriptors[1].name, "project");
+        assert_eq!(
+            descriptors[1].attributes,
+            Some(ClipboardFileAttributes::DIRECTORY)
+        );
+        assert_eq!(descriptors[1].file_size, None);
+
+        assert_eq!(descriptors[2].name, "main.rs");
+        assert_eq!(
+            descriptors[2].relative_path.as_deref(),
+            Some("project\\src")
+        );
+    }
+
+    #[test]
+    fn collected_selection_walks_folders_with_relative_wire_names() {
+        use super::collect_clipboard_files;
+
+        let root = std::env::temp_dir().join(format!("rdp123-clip-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("folder/inner")).unwrap();
+        std::fs::write(root.join("folder/a.txt"), b"aaa").unwrap();
+        std::fs::write(root.join("folder/inner/b.txt"), b"bb").unwrap();
+
+        let files = collect_clipboard_files(&[root.join("folder")]);
+        let mut names: Vec<&str> = files.iter().map(|f| f.wire_name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "folder",
+                "folder\\a.txt",
+                "folder\\inner",
+                "folder\\inner\\b.txt"
+            ]
+        );
+        let a = files
+            .iter()
+            .find(|f| f.wire_name == "folder\\a.txt")
+            .unwrap();
+        assert_eq!(a.size, 3);
+        assert!(!a.is_dir);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
