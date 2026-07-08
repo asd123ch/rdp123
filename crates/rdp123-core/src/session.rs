@@ -1769,7 +1769,13 @@ async fn send_keepalive_tap(
     }
     let outputs = active_stage.process_fastpath_input(image, &fp_events)?;
     drain_outputs(
-        outputs, reader, out_tx, active_stage, image, framebuffer, event_cb,
+        outputs,
+        reader,
+        out_tx,
+        active_stage,
+        image,
+        framebuffer,
+        event_cb,
     )
     .await
 }
@@ -2234,7 +2240,10 @@ mod tests {
     #[test]
     fn key_counter_never_underflows_and_full_release_zeroes_it() {
         // A stray release with nothing held saturates at zero, not u32::MAX.
-        assert_eq!(update_keys_down(&SessionCommand::Input(vec![key(false)]), 0), 0);
+        assert_eq!(
+            update_keys_down(&SessionCommand::Input(vec![key(false)]), 0),
+            0
+        );
         // ReleaseAllKeys clears any stuck held-key state.
         assert_eq!(update_keys_down(&SessionCommand::ReleaseAllKeys, 3), 0);
     }
