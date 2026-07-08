@@ -1109,6 +1109,10 @@ async fn run_session(
             break SessionEnd::UserQuit;
         }
         if pending.release_all_keys.swap(false, Ordering::AcqRel) {
+            // This path (not the command channel) usually wins the race, so
+            // clear the held-key counter here too or the keep-alive could stay
+            // suppressed after focus is lost while a key was held.
+            keys_down = 0;
             let fp_events = input_db.release_all();
             if !fp_events.is_empty() {
                 match active_stage.process_fastpath_input(&mut image, &fp_events) {
