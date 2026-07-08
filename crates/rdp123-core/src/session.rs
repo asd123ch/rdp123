@@ -84,6 +84,14 @@ const MAX_CLIPBOARD_TEXT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CLIPBOARD_FILES: usize = 4096;
 /// Cap on a single FileContents chunk we are willing to serve.
 const MAX_FILE_CHUNK_BYTES: u32 = 16 * 1024 * 1024;
+/// Idle keep-alive: how long a session must be free of real user input before
+/// an invisible F15 tap is injected. 30 s sits well under the one-minute
+/// minimum of a Windows idle-session policy, so the keep-alive always wins the
+/// race against the timeout (and the remote lock screen).
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+/// Set-1 scancode for F15 (not extended). No mainstream application reacts to
+/// it, so the injected tap resets the remote idle timer with no visible effect.
+const KEEP_ALIVE_SCANCODE: u8 = 0x66;
 
 /// What the local (macOS) clipboard currently offers to the remote session.
 #[derive(Debug, Default)]
@@ -575,6 +583,10 @@ pub struct SessionConfig {
     pub swap_cmd_alt: bool,
     /// Wake-on-LAN MAC address; a magic packet is broadcast before connecting.
     pub wake_mac: Option<String>,
+    /// Keep the remote session awake: while the user is idle, tap an invisible
+    /// F15 every [`KEEP_ALIVE_INTERVAL`] so idle-disconnect policies and the
+    /// remote lock screen never trigger.
+    pub keep_alive: bool,
 }
 
 impl Drop for SessionConfig {
@@ -1071,6 +1083,12 @@ async fn run_session(
     let mut clip_open = true;
     let mut gfx_open = true;
     let mut remote_clip = RemoteClipboard::default();
+    // Idle keep-alive bookkeeping: `last_input` is pushed forward by every real
+    // user command, so the timer arm below only fires after a full idle
+    // interval; `keys_down` suppresses the tap while a key is held so the
+    // injected F15 can never merge with a modifier the user is pressing.
+    let mut last_input = tokio::time::Instant::now();
+    let mut keys_down: u32 = 0;
 
     let end = loop {
         if pending.shutdown.swap(false, Ordering::AcqRel) {
@@ -1121,6 +1139,10 @@ async fn run_session(
                 let Some(cmd) = resolve_pending_command(cmd, pending) else {
                     continue;
                 };
+                if matches!(cmd, SessionCommand::Input(_)) {
+                    last_input = tokio::time::Instant::now();
+                }
+                keys_down = update_keys_down(&cmd, keys_down);
                 match handle_command(
                     cmd, config, &mut reader, &out_tx, &mut active_stage, &mut image,
                     &mut input_db, framebuffer, local_clip, &mut remote_clip, event_cb,
@@ -1153,6 +1175,23 @@ async fn run_session(
                     }
                     None => gfx_open = false,
                 }
+            }
+
+            // Idle keep-alive. Disabled unless enabled and no key is held; the
+            // sleep target moves with `last_input`, so any real input reschedules
+            // it and the tap only fires after a full idle interval.
+            _ = tokio::time::sleep_until(last_input + KEEP_ALIVE_INTERVAL),
+                if config.keep_alive && keys_down == 0 =>
+            {
+                match send_keepalive_tap(
+                    &mut reader, &out_tx, &mut active_stage, &mut image,
+                    &mut input_db, framebuffer, event_cb,
+                ).await {
+                    Ok(true) => break SessionEnd::Disconnected(REMOTE_ENDED.to_string()),
+                    Ok(false) => {}
+                    Err(e) => break SessionEnd::Disconnected(format!("{e:#}")),
+                }
+                last_input = tokio::time::Instant::now();
             }
 
             pdu = reader.read_pdu() => {
@@ -1682,6 +1721,55 @@ async fn reactivate(
     Ok(())
 }
 
+/// Fold a command's key events into the held-key counter that gates the idle
+/// keep-alive. Key-down bumps it, key-up drops it (saturating at zero), and a
+/// full release resets it; everything else leaves the count untouched. While
+/// the count is above zero the keep-alive is suppressed so an injected F15
+/// cannot combine with a modifier the user is holding.
+fn update_keys_down(cmd: &SessionCommand, keys_down: u32) -> u32 {
+    match cmd {
+        SessionCommand::Input(events) => {
+            let mut n = i64::from(keys_down);
+            for ev in events {
+                if let InputEvent::Key { down, .. } = ev {
+                    n += if *down { 1 } else { -1 };
+                }
+            }
+            n.max(0) as u32
+        }
+        SessionCommand::ReleaseAllKeys => 0,
+        _ => keys_down,
+    }
+}
+
+/// Inject a single invisible F15 tap (down+up) straight into the FastPath input
+/// stream, bypassing the mac→scancode keymap. Returns `Ok(true)` if flushing the
+/// tap revealed that the remote had already ended. Used by the idle keep-alive.
+#[allow(clippy::too_many_arguments)]
+async fn send_keepalive_tap(
+    reader: &mut SessionReader,
+    out_tx: &OutSender,
+    active_stage: &mut ActiveStage,
+    image: &mut DecodedImage,
+    input_db: &mut Database,
+    framebuffer: &SharedFramebuffer,
+    event_cb: &EventCb,
+) -> Result<bool> {
+    let scan = Scancode::from_u8(false, KEEP_ALIVE_SCANCODE);
+    let fp_events = input_db.apply(vec![
+        Operation::KeyPressed(scan),
+        Operation::KeyReleased(scan),
+    ]);
+    if fp_events.is_empty() {
+        return Ok(false);
+    }
+    let outputs = active_stage.process_fastpath_input(image, &fp_events)?;
+    drain_outputs(
+        outputs, reader, out_tx, active_stage, image, framebuffer, event_cb,
+    )
+    .await
+}
+
 /// Convert UI input into IronRDP operations, returning the last mouse position seen.
 fn translate_input(
     events: Vec<InputEvent>,
@@ -2056,8 +2144,8 @@ fn normalize_clipboard_to_crlf(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_config, normalize_clipboard_to_crlf, resolve_pending_command, InputEvent,
-        PendingCommands, SessionCommand, SessionConfig,
+        build_config, normalize_clipboard_to_crlf, resolve_pending_command, update_keys_down,
+        InputEvent, PendingCommands, SessionCommand, SessionConfig,
     };
     use crate::profile::{AudioMode, ClipboardMode, GraphicsMode};
     use ironrdp::pdu::rdp::client_info::CompressionType;
@@ -2084,7 +2172,12 @@ mod tests {
             reconnect_per_minute: 0,
             swap_cmd_alt: false,
             wake_mac: None,
+            keep_alive: false,
         }
+    }
+
+    fn key(down: bool) -> InputEvent {
+        InputEvent::Key { keycode: 0, down }
     }
 
     #[test]
@@ -2122,6 +2215,31 @@ mod tests {
         let pending = PendingCommands::default();
         assert!(resolve_pending_command(SessionCommand::ReleaseAllKeys, &pending).is_none());
         assert!(resolve_pending_command(SessionCommand::Shutdown, &pending).is_none());
+    }
+
+    #[test]
+    fn held_keys_are_counted_and_balanced() {
+        // Two presses without releases keep the count up (keep-alive suppressed).
+        let cmd = SessionCommand::Input(vec![key(true), key(true)]);
+        assert_eq!(update_keys_down(&cmd, 0), 2);
+        // The matching releases bring it back to zero.
+        let cmd = SessionCommand::Input(vec![key(false), key(false)]);
+        assert_eq!(update_keys_down(&cmd, 2), 0);
+    }
+
+    #[test]
+    fn key_counter_never_underflows_and_full_release_zeroes_it() {
+        // A stray release with nothing held saturates at zero, not u32::MAX.
+        assert_eq!(update_keys_down(&SessionCommand::Input(vec![key(false)]), 0), 0);
+        // ReleaseAllKeys clears any stuck held-key state.
+        assert_eq!(update_keys_down(&SessionCommand::ReleaseAllKeys, 3), 0);
+    }
+
+    #[test]
+    fn non_key_input_leaves_the_held_counter_untouched() {
+        let mouse = SessionCommand::Input(vec![InputEvent::MouseMove { x: 5, y: 5 }]);
+        assert_eq!(update_keys_down(&mouse, 1), 1);
+        assert_eq!(update_keys_down(&SessionCommand::Shutdown, 1), 1);
     }
 
     #[test]

@@ -279,7 +279,7 @@ fn info_plist() -> String {
     <key>NSLocalNetworkUsageDescription</key><string>RDP123 connects to remote desktop hosts on your local network by their IP address or hostname.</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSPrincipalClass</key><string>NSApplication</string>
-    <key>NSHumanReadableCopyright</key><string>Copyright (c) 2026 asd123.ai. GPL-3.0-only.</string>
+    <key>NSHumanReadableCopyright</key><string>Copyright (c) 2026 asd123.ai. AGPL-3.0-only.</string>
 </dict>
 </plist>
 "#

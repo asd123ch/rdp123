@@ -139,6 +139,7 @@ pub struct SettingsIvars {
     audio: Popup,
     graphics: Popup,
     reconnect: Check,
+    keep_alive: Check,
 
     // Global
     terminal: Popup,
@@ -881,8 +882,24 @@ impl SettingsController {
         rdp.push(unsafe { Retained::cast_unchecked(re.clone()) });
         *self.ivars().reconnect.borrow_mut() = Some(re);
         yr -= PITCH;
-        *self.ivars().rate.borrow_mut() =
-            Some(self.text_row_g(mtm, parent, &mut yr, "Max attempts/minute:", &mut rdp));
+        // Reconnect rate and keep-alive share one row so the group stays clear
+        // of the Save/Revert bar below.
+        {
+            let label = self.row_label(mtm, parent, yr, "Max attempts/minute:");
+            rdp.push(unsafe { Retained::cast_unchecked(label) });
+            let rate = self.plain_text(mtm, parent, rect(FIELD_X, yr, 60.0, ROW_H));
+            rdp.push(unsafe { Retained::cast_unchecked(rate.clone()) });
+            *self.ivars().rate.borrow_mut() = Some(rate);
+            let ka =
+                self.checkbox_fit(mtm, parent, FIELD_X + 76.0, yr, "Keep session awake", dirty);
+            ka.setToolTip(Some(&NSString::from_str(
+                "While idle, taps an invisible key so the remote session is not \
+                 disconnected or locked. Also keeps the host from auto-locking.",
+            )));
+            rdp.push(unsafe { Retained::cast_unchecked(ka.clone()) });
+            *self.ivars().keep_alive.borrow_mut() = Some(ka);
+            yr -= PITCH;
+        }
         let wake = self.text_row_g(mtm, parent, &mut yr, "Wake on LAN (MAC):", &mut rdp);
         wake.setPlaceholderString(Some(&NSString::from_str("AA:BB:CC:DD:EE:FF (optional)")));
         *self.ivars().wake_mac.borrow_mut() = Some(wake);
@@ -1542,6 +1559,7 @@ impl SettingsController {
             self.set_popup(&iv.audio, index_of(&AUDIO, &c.rdp.audio));
             self.set_popup(&iv.graphics, index_of(&GRAPHICS, &c.rdp.graphics));
             self.set_check(&iv.reconnect, c.rdp.reconnect);
+            self.set_check(&iv.keep_alive, c.rdp.keep_alive);
         } else {
             for f in [&iv.name, &iv.host, &iv.port, &iv.user, &iv.domain] {
                 self.set_field(f, "");
@@ -1624,6 +1642,7 @@ impl SettingsController {
         let audio = AUDIO[self.popup_index(&iv.audio).clamp(0, 2) as usize];
         let graphics = GRAPHICS[self.popup_index(&iv.graphics).clamp(0, 1) as usize];
         let reconnect = self.check_on(&iv.reconnect);
+        let keep_alive = self.check_on(&iv.keep_alive);
         let password = self.read_secure(&iv.password);
 
         let mut document = iv.document.borrow().clone();
@@ -1676,6 +1695,7 @@ impl SettingsController {
         connection.rdp.audio = audio;
         connection.rdp.graphics = graphics;
         connection.rdp.reconnect = reconnect;
+        connection.rdp.keep_alive = keep_alive;
         connection.rdp.password_policy = pw_policy;
         if let Err(error) = connection.validate() {
             ui::show_error(self.mtm(), "Invalid connection", &format!("{error:#}"));

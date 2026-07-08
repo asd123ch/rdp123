@@ -9,8 +9,8 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.5.4" src="https://img.shields.io/badge/version-0.5.4-2f81f7">
-  <a href="LICENSE"><img alt="GNU GPL v3.0" src="https://img.shields.io/badge/license-GPLv3-3da639"></a>
+  <img alt="Version 0.5.5" src="https://img.shields.io/badge/version-0.5.5-2f81f7">
+  <a href="LICENSE"><img alt="GNU AGPL v3.0" src="https://img.shields.io/badge/license-AGPLv3-3da639"></a>
   <img alt="macOS 11 or newer" src="https://img.shields.io/badge/macOS-11%2B-black">
   <img alt="Rust 1.89 or newer" src="https://img.shields.io/badge/Rust-1.89%2B-b7410e">
   <a href="#privacy"><img alt="Privacy: no telemetry" src="https://img.shields.io/badge/privacy-no_telemetry-6f42c1"></a>
@@ -111,6 +111,9 @@ sign the app yourself, you know exactly what runs.
   (e.g. Swiss German); modifiers never get "stuck" when switching apps.
 - **Wake on LAN** — optionally store the host's MAC address; RDP123 broadcasts
   a magic packet before connecting and waits for the machine to wake up.
+- **Keep session awake** — an optional, invisible key tap while you're idle so
+  the remote session isn't disconnected by an idle-timeout policy or sent to the
+  lock screen. Off by default; enable it per connection.
 - **Secure by default** — passwords are kept in the macOS **Keychain**, and each
   server's key is pinned the first time you trust it.
 - **Simple Settings** — add and edit connections in a native window with a clear
@@ -159,7 +162,7 @@ open /Applications/RDP123.app
 twice in Spotlight/Launchpad). Use `cargo xtask bundle` if you only want to build
 `dist/RDP123.app` without installing. It uses the stable **`RDP123 Local`**
 identity if present (auto-detected), otherwise falls
-back to **ad-hoc** (signature `-`). The generated bundle includes the GPLv3
+back to **ad-hoc** (signature `-`). The generated bundle includes the AGPLv3
 license text under `Contents/Resources`.
 
 ### Strongly recommended: run the signing script once
@@ -402,6 +405,8 @@ license files in their respective `vendor/` directories.
 Copyright (c) 2026 asd123.ai
 
 RDP123 is free software licensed under the
-[GNU General Public License, version 3](LICENSE). You may use, study, modify and
-redistribute it under those terms. Third-party components remain available
-under their own licenses (see [Credits](#credits)).
+[GNU Affero General Public License, version 3](LICENSE). You may use, study,
+modify and redistribute it under those terms; if you run a modified version and
+make it available to others over a network, you must also offer them the
+corresponding source. Third-party components remain available under their own
+licenses (see [Credits](#credits)).

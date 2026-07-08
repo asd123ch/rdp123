@@ -193,6 +193,11 @@ pub struct RdpOptions {
     /// so the machine has time to wake up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake_mac: Option<String>,
+    /// Keep the remote session awake: while idle, tap an invisible F15 key so
+    /// idle-disconnect policies and the remote lock screen never trigger. Off
+    /// by default because it also prevents the host from auto-locking.
+    #[serde(default)]
+    pub keep_alive: bool,
     /// Last window content size in points, saved when a session closes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_window_size: Option<(u16, u16)>,
@@ -215,6 +220,7 @@ impl Default for RdpOptions {
             password_policy: PasswordPolicy::default(),
             remember_size: true,
             wake_mac: None,
+            keep_alive: false,
             last_window_size: None,
         }
     }
