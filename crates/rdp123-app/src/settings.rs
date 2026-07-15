@@ -1,6 +1,6 @@
 //! The Settings window: manage connections and global settings.
 //!
-//! Layout: a "Connection | Global" segmented control switches the pane. The
+//! Layout: a "Connections | Global | About" segmented control switches panes. The
 //! Connection pane has the connection list plus a grouped editor; the Global
 //! pane has the shared SSH-terminal setting (entered once, used by every SSH
 //! connection).
@@ -32,8 +32,9 @@ use objc2_foundation::{
 };
 
 use rdp123_core::{
-    secrets, AudioMode, ClipboardMode, ColorQuality, Connection, ConnectionKind, Document,
-    GraphicsMode, PasswordPolicy, ProfileStore, ResolutionMode, ScalingLevel, TerminalKind,
+    secrets, AudioMode, AuthenticationMode, ClipboardMode, ColorQuality, Connection,
+    ConnectionKind, Document, GraphicsMode, PasswordPolicy, ProfileStore, ResolutionMode,
+    ScalingLevel, TerminalKind,
 };
 
 use crate::ui::{self, UnsavedChoice};
@@ -61,19 +62,25 @@ const AUDIO: [AudioMode; 3] = [
 const GRAPHICS: [GraphicsMode; 2] = [GraphicsMode::Egfx, GraphicsMode::Classic];
 const RESMODE: [ResolutionMode; 2] = [ResolutionMode::FitToWindow, ResolutionMode::Fixed];
 const PWPOLICY: [PasswordPolicy; 2] = [PasswordPolicy::Remember, PasswordPolicy::AlwaysAsk];
+const AUTHENTICATION: [AuthenticationMode; 2] =
+    [AuthenticationMode::Password, AuthenticationMode::EntraWeb];
 
 // Window / layout geometry.
 const W: f64 = 720.0;
 const H: f64 = 760.0;
 const CH: f64 = 716.0; // container height (below the segmented control)
 const SEG_H: f64 = 24.0;
-const EDIT_TOP: f64 = 684.0; // top of the first editor row
+const EDIT_TOP: f64 = 690.0; // top of the first editor row
 const FORM_X: f64 = 224.0;
 const LABEL_W: f64 = 150.0;
 const FIELD_X: f64 = 382.0;
 const FIELD_W: f64 = 322.0;
 const ROW_H: f64 = 22.0;
-const PITCH: f64 = 28.0;
+const PITCH: f64 = 24.0;
+// Pop-up buttons are 24 points tall, so give their rows a visible gutter.
+const POPUP_PITCH: f64 = 26.0;
+// Checkboxes need less vertical air than bordered form controls.
+const CHECKBOX_PITCH: f64 = 22.0;
 const HDR_PITCH: f64 = 26.0;
 
 fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
@@ -122,6 +129,7 @@ pub struct SettingsIvars {
     user: Field,
 
     // RDP
+    authentication: Popup,
     password: Secure,
     pw_policy: Popup,
     domain: Field,
@@ -150,6 +158,8 @@ pub struct SettingsIvars {
     launch_at_login: Check,
 
     rdp_group: RefCell<Vec<Retained<NSView>>>,
+    password_auth_group: RefCell<Vec<Retained<NSView>>>,
+    entra_auth_group: RefCell<Vec<Retained<NSView>>>,
     ssh_group: RefCell<Vec<Retained<NSView>>>,
 }
 
@@ -190,11 +200,11 @@ define_class!(
     unsafe impl NSControlTextEditingDelegate for SettingsController {
         #[unsafe(method(controlTextDidEndEditing:))]
         fn text_end(&self, _n: &NSNotification) {
-            // Global text lives in the Global pane; connection text is staged.
+            // Global text saves when editing ends. Connection text is already
+            // tracked by controlTextDidChange; marking it here would report a
+            // false edit whenever focus moves to another connection.
             if self.pane() == 1 {
                 self.save_global();
-            } else {
-                self.mark_dirty();
             }
         }
 
@@ -313,6 +323,12 @@ define_class!(
         fn res_mode_changed(&self, _s: Option<&AnyObject>) {
             self.mark_dirty();
             self.update_fixed_enabled();
+        }
+
+        #[unsafe(method(authenticationChanged:))]
+        fn authentication_changed(&self, _s: Option<&AnyObject>) {
+            self.mark_dirty();
+            self.update_visibility();
         }
 
         #[unsafe(method(typeChanged:))]
@@ -733,12 +749,25 @@ impl SettingsController {
         let mut yr = group_top;
 
         self.header_g(mtm, parent, &mut yr, "Authentication", &mut rdp);
+        let authentication = self.popup_row_g(
+            mtm,
+            parent,
+            &mut yr,
+            "Method:",
+            &["Password (NLA)", "Microsoft Entra web"],
+            sel!(authenticationChanged:),
+            210.0,
+            &mut rdp,
+        );
+        *self.ivars().authentication.borrow_mut() = Some(authentication);
         // The username applies to RDP and SSH alike, and both layouts have a
         // row at this position (under "Authentication" and under "SSH"), so
         // the field lives in the common group at shared coordinates.
         let user = self.text_row_g(mtm, parent, &mut yr, "Username:", &mut common);
-        user.setPlaceholderString(Some(&NSString::from_str("user")));
+        user.setPlaceholderString(Some(&NSString::from_str("user or user@company.com")));
         *self.ivars().user.borrow_mut() = Some(user);
+        let password_start = rdp.len();
+        let password_top = yr;
         *self.ivars().domain.borrow_mut() =
             Some(self.text_row_g(mtm, parent, &mut yr, "Domain:", &mut rdp));
         let pw = self.secure_row_g(mtm, parent, &mut yr, "Password:", &mut rdp);
@@ -754,6 +783,37 @@ impl SettingsController {
             210.0,
             &mut rdp,
         ));
+        *self.ivars().password_auth_group.borrow_mut() = rdp[password_start..].to_vec();
+
+        let entra_line_1 = self.label(
+            mtm,
+            parent,
+            rect(FIELD_X, password_top, FIELD_W, ROW_H),
+            "Signs in interactively with your Microsoft account.",
+        );
+        self.muted(&entra_line_1);
+        rdp.push(unsafe { Retained::cast_unchecked(entra_line_1.clone()) });
+        let entra_line_2 = self.label(
+            mtm,
+            parent,
+            rect(FIELD_X, password_top - PITCH, FIELD_W, ROW_H),
+            "Hostname required; IP addresses are not supported.",
+        );
+        self.muted(&entra_line_2);
+        rdp.push(unsafe { Retained::cast_unchecked(entra_line_2.clone()) });
+        let entra_line_3 = self.label(
+            mtm,
+            parent,
+            rect(FIELD_X, password_top - 2.0 * PITCH, FIELD_W, ROW_H),
+            "No RDP password or domain is stored or sent.",
+        );
+        self.muted(&entra_line_3);
+        rdp.push(unsafe { Retained::cast_unchecked(entra_line_3.clone()) });
+        *self.ivars().entra_auth_group.borrow_mut() = vec![
+            unsafe { Retained::cast_unchecked(entra_line_1) },
+            unsafe { Retained::cast_unchecked(entra_line_2) },
+            unsafe { Retained::cast_unchecked(entra_line_3) },
+        ];
 
         self.header_g(mtm, parent, &mut yr, "Display", &mut rdp);
         *self.ivars().res_mode.borrow_mut() = Some(self.popup_row_g(
@@ -816,36 +876,24 @@ impl SettingsController {
         let comp = self.checkbox_fit(
             mtm,
             parent,
-            FORM_X,
+            FIELD_X,
             yr,
             "Transport compression (recommended)",
             dirty,
         );
         rdp.push(unsafe { Retained::cast_unchecked(comp.clone()) });
         *self.ivars().compression.borrow_mut() = Some(comp);
-        yr -= PITCH;
-        let fs = self.checkbox_fit(mtm, parent, FORM_X, yr, "Start in full screen", dirty);
-        let rs = self.checkbox_fit(
-            mtm,
-            parent,
-            FORM_X + 200.0,
-            yr,
-            "Remember window size",
-            dirty,
-        );
+        yr -= CHECKBOX_PITCH;
+        let fs = self.checkbox_fit(mtm, parent, FIELD_X, yr, "Start in full screen", dirty);
         rdp.push(unsafe { Retained::cast_unchecked(fs.clone()) });
-        rdp.push(unsafe { Retained::cast_unchecked(rs.clone()) });
         *self.ivars().fullscreen.borrow_mut() = Some(fs);
+        yr -= CHECKBOX_PITCH;
+        let rs = self.checkbox_fit(mtm, parent, FIELD_X, yr, "Remember window size", dirty);
+        rdp.push(unsafe { Retained::cast_unchecked(rs.clone()) });
         *self.ivars().remember_size.borrow_mut() = Some(rs);
-        yr -= PITCH;
+        yr -= CHECKBOX_PITCH;
 
-        self.header_g(
-            mtm,
-            parent,
-            &mut yr,
-            "Clipboard, sound & reconnect",
-            &mut rdp,
-        );
+        self.header_g(mtm, parent, &mut yr, "Clipboard, sound & session", &mut rdp);
         *self.ivars().clipboard.borrow_mut() = Some(self.popup_row_g(
             mtm,
             parent,
@@ -874,32 +922,30 @@ impl SettingsController {
         let re = self.checkbox_fit(
             mtm,
             parent,
-            FORM_X,
+            FIELD_X,
             yr,
-            "Automatically reconnect if the connection is dropped",
+            "Automatically reconnect after connection drops",
             dirty,
         );
         rdp.push(unsafe { Retained::cast_unchecked(re.clone()) });
         *self.ivars().reconnect.borrow_mut() = Some(re);
-        yr -= PITCH;
-        // Reconnect rate and keep-alive share one row so the group stays clear
-        // of the Save/Revert bar below.
+        yr -= CHECKBOX_PITCH;
         {
             let label = self.row_label(mtm, parent, yr, "Max attempts/minute:");
             rdp.push(unsafe { Retained::cast_unchecked(label) });
             let rate = self.plain_text(mtm, parent, rect(FIELD_X, yr, 60.0, ROW_H));
             rdp.push(unsafe { Retained::cast_unchecked(rate.clone()) });
             *self.ivars().rate.borrow_mut() = Some(rate);
-            let ka =
-                self.checkbox_fit(mtm, parent, FIELD_X + 76.0, yr, "Keep session awake", dirty);
-            ka.setToolTip(Some(&NSString::from_str(
-                "While idle, taps an invisible key so the remote session is not \
-                 disconnected or locked. Also keeps the host from auto-locking.",
-            )));
-            rdp.push(unsafe { Retained::cast_unchecked(ka.clone()) });
-            *self.ivars().keep_alive.borrow_mut() = Some(ka);
             yr -= PITCH;
         }
+        let ka = self.checkbox_fit(mtm, parent, FIELD_X, yr, "Keep session awake", dirty);
+        ka.setToolTip(Some(&NSString::from_str(
+            "While idle, taps an invisible key so the remote session is not \
+             disconnected or locked. Also keeps the host from auto-locking.",
+        )));
+        rdp.push(unsafe { Retained::cast_unchecked(ka.clone()) });
+        *self.ivars().keep_alive.borrow_mut() = Some(ka);
+        yr -= CHECKBOX_PITCH;
         let wake = self.text_row_g(mtm, parent, &mut yr, "Wake on LAN (MAC):", &mut rdp);
         wake.setPlaceholderString(Some(&NSString::from_str("AA:BB:CC:DD:EE:FF (optional)")));
         *self.ivars().wake_mac.borrow_mut() = Some(wake);
@@ -983,7 +1029,7 @@ impl SettingsController {
         let swap = self.checkbox_fit(
             mtm,
             parent,
-            gx,
+            gfield,
             y,
             "Swap ⌘ and ⌥ in RDP sessions (⌘ acts as Alt, ⌥ as the Windows key)",
             sel!(globalChanged:),
@@ -1004,7 +1050,7 @@ impl SettingsController {
         let login = self.checkbox_fit(
             mtm,
             parent,
-            gx,
+            gfield,
             y,
             "Start RDP123 automatically when you log in",
             sel!(loginItemChanged:),
@@ -1208,7 +1254,7 @@ impl SettingsController {
         );
         group.push(unsafe { Retained::cast_unchecked(l) });
         group.push(unsafe { Retained::cast_unchecked(p.clone()) });
-        *y -= PITCH;
+        *y -= POPUP_PITCH;
         p
     }
 
@@ -1416,6 +1462,13 @@ impl SettingsController {
         if let Some(b) = self.ivars().remove_button.borrow().as_ref() {
             b.setEnabled(has_selection);
         }
+        let entra = self.popup_index(&self.ivars().authentication) == 1;
+        for v in self.ivars().password_auth_group.borrow().iter() {
+            v.setHidden(!has_selection || is_ssh || entra);
+        }
+        for v in self.ivars().entra_auth_group.borrow().iter() {
+            v.setHidden(!has_selection || is_ssh || !entra);
+        }
     }
 
     fn update_fixed_enabled(&self) {
@@ -1542,6 +1595,10 @@ impl SettingsController {
                 },
             );
             self.set_secure(&iv.password, "");
+            self.set_popup(
+                &iv.authentication,
+                index_of(&AUTHENTICATION, &c.rdp.authentication),
+            );
             self.set_popup(&iv.pw_policy, index_of(&PWPOLICY, &c.rdp.password_policy));
             self.set_field(&iv.domain, c.domain.as_deref().unwrap_or(""));
             self.set_popup(&iv.color, index_of(&COLOR, &c.rdp.color_quality));
@@ -1636,6 +1693,8 @@ impl SettingsController {
         let scaling = SCALING[self.popup_index(&iv.scaling).clamp(0, 4) as usize];
         let res_mode = RESMODE[self.popup_index(&iv.res_mode).clamp(0, 1) as usize];
         let pw_policy = PWPOLICY[self.popup_index(&iv.pw_policy).clamp(0, 1) as usize];
+        let authentication =
+            AUTHENTICATION[self.popup_index(&iv.authentication).clamp(0, 1) as usize];
         let compression = self.check_on(&iv.compression);
         let fullscreen = self.check_on(&iv.fullscreen);
         let remember_size = self.check_on(&iv.remember_size);
@@ -1659,12 +1718,13 @@ impl SettingsController {
         connection.host = host;
         connection.port = port;
         connection.username = user;
-        connection.domain = if domain.is_empty() {
+        connection.domain = if authentication == AuthenticationMode::EntraWeb || domain.is_empty() {
             None
         } else {
             Some(domain)
         };
         connection.rdp.color_quality = color;
+        connection.rdp.authentication = authentication;
         connection.rdp.clipboard = clip;
         connection.rdp.scaling = scaling;
         connection.rdp.resolution_mode = res_mode;
@@ -1703,7 +1763,10 @@ impl SettingsController {
         }
         let connection_id = connection.id.clone();
 
-        if pw_policy == PasswordPolicy::Remember && !password.is_empty() {
+        if authentication == AuthenticationMode::Password
+            && pw_policy == PasswordPolicy::Remember
+            && !password.is_empty()
+        {
             if let Err(error) = secrets::store_password(&connection_id, &password) {
                 ui::show_error(self.mtm(), "Could not save password", &format!("{error:#}"));
                 return false;
@@ -1716,7 +1779,8 @@ impl SettingsController {
         *iv.document.borrow_mut() = document;
         self.set_secure(&iv.password, "");
 
-        if pw_policy == PasswordPolicy::AlwaysAsk {
+        if authentication == AuthenticationMode::EntraWeb || pw_policy == PasswordPolicy::AlwaysAsk
+        {
             if let Err(error) = secrets::delete_password(&connection_id) {
                 ui::show_error(
                     self.mtm(),

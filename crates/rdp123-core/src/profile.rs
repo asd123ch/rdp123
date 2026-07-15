@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+use std::net::IpAddr;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
@@ -146,6 +147,17 @@ pub enum PasswordPolicy {
     AlwaysAsk,
 }
 
+/// Authentication protocol used for an RDP connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthenticationMode {
+    /// Network Level Authentication using the saved or prompted password.
+    #[default]
+    Password,
+    /// Microsoft Entra web authentication (`enablerdsaadauth:i:1`).
+    EntraWeb,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -156,6 +168,9 @@ fn default_reconnect_rate() -> u32 {
 /// RDP-specific options (ignored for SSH connections).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RdpOptions {
+    /// Password/CredSSP or Microsoft Entra web authentication.
+    #[serde(default)]
+    pub authentication: AuthenticationMode,
     #[serde(default)]
     pub color_quality: ColorQuality,
     /// FastPath transport compression (RDP 6.1 XCRUSH), independent of the
@@ -206,6 +221,7 @@ pub struct RdpOptions {
 impl Default for RdpOptions {
     fn default() -> Self {
         Self {
+            authentication: AuthenticationMode::default(),
             color_quality: ColorQuality::default(),
             compression: true,
             clipboard: ClipboardMode::default(),
@@ -288,6 +304,12 @@ impl Connection {
         {
             bail!("domain must not contain control characters");
         }
+        if self.kind == ConnectionKind::Rdp
+            && self.rdp.authentication == AuthenticationMode::EntraWeb
+            && is_ip_address(&self.host)
+        {
+            bail!("Microsoft Entra web authentication requires a hostname, not an IP address");
+        }
         if !(1..=MAX_RECONNECTS_PER_MINUTE).contains(&self.rdp.reconnect_per_minute) {
             bail!(
                 "maximum reconnect attempts must be between 1 and {MAX_RECONNECTS_PER_MINUTE} per minute"
@@ -309,6 +331,14 @@ impl Connection {
         }
         Ok(())
     }
+}
+
+fn is_ip_address(host: &str) -> bool {
+    host.parse::<IpAddr>().is_ok()
+        || host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .is_some_and(|host| host.parse::<IpAddr>().is_ok())
 }
 
 fn new_id() -> String {
@@ -598,6 +628,41 @@ mod tests {
         document.connections.truncate(1);
         document.connections[0].host = "-oProxyCommand=evil".to_string();
         assert!(format!("{:#}", document.validate().unwrap_err()).contains("must not start"));
+    }
+
+    #[test]
+    fn entra_web_auth_rejects_ip_addresses() {
+        let mut connection = Connection::new("Entra PC", ConnectionKind::Rdp);
+        connection.host = "192.0.2.10".to_string();
+        connection.rdp.authentication = AuthenticationMode::EntraWeb;
+        assert!(connection
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("hostname"));
+
+        connection.host = "entra-pc.example.com".to_string();
+        assert!(connection.validate().is_ok());
+    }
+
+    #[test]
+    fn missing_authentication_mode_defaults_to_password() {
+        let json = r#"{
+            "version": 1,
+            "connections": [{
+                "id": "legacy-profile",
+                "name": "Legacy",
+                "kind": "rdp",
+                "host": "legacy.example.com",
+                "port": 3389,
+                "rdp": {}
+            }]
+        }"#;
+        let document: Document = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            document.connections[0].rdp.authentication,
+            AuthenticationMode::Password
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
+use std::{io, net::IpAddr};
 
 use anyhow::{anyhow, Context, Result};
 use sha2::{Digest, Sha256};
@@ -57,7 +58,8 @@ use ironrdp_tokio::{
 use crate::framebuffer::SharedFramebuffer;
 use crate::gfx::GfxEvent;
 use crate::keymap;
-use crate::profile::{AudioMode, ClipboardMode, GraphicsMode};
+use crate::profile::{AudioMode, AuthenticationMode, ClipboardMode, GraphicsMode};
+use crate::rdsaad::RdsAadClient;
 
 /// The pixel format shared by the decoded image, the framebuffer and CoreGraphics.
 const PIXEL_FORMAT: PixelFormat = PixelFormat::BgrX32;
@@ -541,6 +543,12 @@ pub enum SessionEvent {
         is_change: bool,
         reply: oneshot::Sender<bool>,
     },
+    /// Open the Microsoft login page and return its final OAuth redirect URL.
+    EntraSignIn {
+        authorization_url: String,
+        redirect_uri: String,
+        reply: oneshot::Sender<std::result::Result<String, String>>,
+    },
     /// The user accepted `fingerprint`; the app should persist it.
     CertTrusted {
         fingerprint: String,
@@ -561,6 +569,7 @@ pub struct SessionConfig {
     pub username: String,
     pub password: String,
     pub domain: Option<String>,
+    pub authentication: AuthenticationMode,
     pub width: u16,
     pub height: u16,
     pub scale: Option<u32>,
@@ -823,6 +832,17 @@ async fn run(
     event_cb: EventCb,
 ) {
     ensure_crypto_provider();
+    let mut rdsaad_client = if config.authentication == AuthenticationMode::EntraWeb {
+        match RdsAadClient::new(&config.host) {
+            Ok(client) => Some(client),
+            Err(error) => {
+                event_cb(SessionEvent::Error(format!("{error:#}")));
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let local_clip: LocalClipState = Arc::new(Mutex::new(LocalClip::Empty));
     // One audio player for the whole session (reconnects reuse it). Missing
     // audio is never fatal — the session simply runs silent.
@@ -867,6 +887,7 @@ async fn run(
         let (gfx_tx, gfx_rx) = tokio::sync::mpsc::unbounded_channel::<GfxEvent>();
         let outcome = match connect(
             &config,
+            &mut rdsaad_client,
             &mut session_trusted,
             local_clip.clone(),
             clip_tx,
@@ -1275,6 +1296,7 @@ async fn writer_loop(mut writer: SessionWriter, mut out_rx: Receiver<Vec<u8>>) {
 
 async fn connect(
     config: &SessionConfig,
+    rdsaad_client: &mut Option<RdsAadClient>,
     session_trusted: &mut Option<String>,
     local_clip: LocalClipState,
     clip_tx: Sender<ClipSignal>,
@@ -1353,7 +1375,7 @@ async fn connect(
     // TOFU below, but the server must still prove possession of the certificate
     // private key by signing the TLS handshake.
     let (initial_stream, leftover) = framed.into_inner();
-    let (tls_stream, server_public_key) = crate::tls::upgrade(initial_stream, &config.host)
+    let (mut tls_stream, server_public_key) = crate::tls::upgrade(initial_stream, &config.host)
         .await
         .context("TLS handshake")
         .map_err(ConnectFailure::fatal)?;
@@ -1366,6 +1388,18 @@ async fn connect(
 
     // 4. Finalize (MCS, licensing, capabilities, CredSSP/NLA).
     let upgraded = mark_as_upgraded(should_upgrade, &mut connector);
+    if connector.should_perform_rdsaad() {
+        let client = rdsaad_client
+            .as_mut()
+            .context("RDS AAD authentication state is missing")
+            .map_err(ConnectFailure::fatal)?;
+        client
+            .authenticate(&mut tls_stream, &config.username, event_cb)
+            .await
+            .context("Microsoft Entra RDP authentication")
+            .map_err(ConnectFailure::fatal)?;
+        connector.mark_rdsaad_as_done();
+    }
     let mut framed = TokioFramed::new_with_leftover(tls_stream, leftover);
     let mut network_client = NoNetworkClient;
     let result = connect_finalize(
@@ -1384,16 +1418,101 @@ async fn connect(
     Ok((result, framed))
 }
 
-/// Open the TCP socket with a bounded timeout. A LAN connect that macOS blocks
-/// for Local Network privacy fails or hangs here, so the message points at the fix.
+enum TcpHostFailure {
+    Resolve(io::Error),
+    Connect(io::Error),
+}
+
+/// Return the Bonjour/mDNS form of a single-label host name. Microsoft clients
+/// can resolve these names through local discovery even when macOS DNS cannot;
+/// appending `.local` lets the system mDNS resolver provide the same address.
+fn mdns_fallback_hostname(host: &str) -> Option<String> {
+    let host = host.trim();
+    if host.is_empty() || host.contains('.') || host.contains(':') || host.parse::<IpAddr>().is_ok()
+    {
+        return None;
+    }
+    Some(format!("{host}.local"))
+}
+
+/// Resolve and connect to one host, retaining whether failure happened during
+/// name resolution or while opening the socket. The distinction prevents a
+/// reachable DNS host with a closed RDP port from being redirected elsewhere.
+async fn connect_tcp_host(host: &str, port: u16) -> std::result::Result<TcpStream, TcpHostFailure> {
+    let addresses = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(TcpHostFailure::Resolve)?;
+    let mut last_error = None;
+    let mut found_address = false;
+
+    for address in addresses {
+        found_address = true;
+        match TcpStream::connect(address).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    let error = last_error.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            if found_address {
+                "could not connect to any resolved address"
+            } else {
+                "name resolved to no addresses"
+            },
+        )
+    });
+    Err(TcpHostFailure::Connect(error))
+}
+
+/// Open the TCP socket with a bounded timeout. For a single-label LAN host,
+/// fall back to Bonjour/mDNS only when ordinary DNS resolution fails. The
+/// configured host remains unchanged for TLS, Entra and CredSSP identity.
 async fn connect_tcp(host: &str, port: u16) -> std::result::Result<TcpStream, ConnectFailure> {
-    match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port))).await {
+    let connect = async {
+        match connect_tcp_host(host, port).await {
+            Ok(stream) => Ok(stream),
+            Err(TcpHostFailure::Resolve(primary_error)) => {
+                if let Some(mdns_host) = mdns_fallback_hostname(host) {
+                    tracing::info!(
+                        host,
+                        mdns_host,
+                        "ordinary host lookup failed; trying Bonjour/mDNS"
+                    );
+                    match connect_tcp_host(&mdns_host, port).await {
+                        Ok(stream) => Ok(stream),
+                        Err(TcpHostFailure::Resolve(mdns_error)) => Err(anyhow!(
+                            "could not resolve {host}:{port} ({primary_error}); also tried \
+                             {mdns_host}:{port} via Bonjour/mDNS ({mdns_error}). If this host \
+                             works in other RDP clients, enable RDP123 under System Settings → \
+                             Privacy & Security → Local Network, then try again."
+                        )),
+                        Err(TcpHostFailure::Connect(mdns_error)) => Err(anyhow!(
+                            "resolved {host} as {mdns_host} via Bonjour/mDNS, but could not \
+                             reach port {port} ({mdns_error}). Check that RDP is enabled and \
+                             RDP123 is allowed under System Settings → Privacy & Security → \
+                             Local Network."
+                        )),
+                    }
+                } else {
+                    Err(anyhow!(
+                        "could not resolve {host}:{port} ({primary_error}). Check the host name \
+                         and network connection."
+                    ))
+                }
+            }
+            Err(TcpHostFailure::Connect(error)) => Err(anyhow!(
+                "could not reach {host}:{port} ({error}). If this host works in other RDP \
+                 clients, enable RDP123 under System Settings → Privacy & Security → Local \
+                 Network, then try again."
+            )),
+        }
+    };
+
+    match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
         Ok(Ok(stream)) => Ok(stream),
-        Ok(Err(e)) => Err(ConnectFailure::retryable(anyhow!(
-            "could not reach {host}:{port} ({e}). If this host works in other RDP \
-             clients, enable RDP123 under System Settings → Privacy & Security → \
-             Local Network, then try again."
-        ))),
+        Ok(Err(error)) => Err(ConnectFailure::retryable(error)),
         Err(_) => Err(ConnectFailure::retryable(anyhow!(
             "timed out reaching {host}:{port}. Check the host and port, and that RDP123 \
              is allowed under System Settings → Privacy & Security → Local Network."
@@ -1841,7 +1960,8 @@ fn build_config(config: &SessionConfig, audio_active: bool) -> Config {
         },
         desktop_scale_factor: config.scale.unwrap_or(100),
         enable_tls: false,
-        enable_credssp: true,
+        enable_credssp: config.authentication == AuthenticationMode::Password,
+        enable_rdsaad: config.authentication == AuthenticationMode::EntraWeb,
         credentials: Credentials::UsernamePassword {
             username: config.username.clone(),
             password: config.password.clone(),
@@ -2154,10 +2274,10 @@ fn normalize_clipboard_to_crlf(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_config, normalize_clipboard_to_crlf, resolve_pending_command, update_keys_down,
-        InputEvent, PendingCommands, SessionCommand, SessionConfig,
+        build_config, mdns_fallback_hostname, normalize_clipboard_to_crlf, resolve_pending_command,
+        update_keys_down, InputEvent, PendingCommands, SessionCommand, SessionConfig,
     };
-    use crate::profile::{AudioMode, ClipboardMode, GraphicsMode};
+    use crate::profile::{AudioMode, AuthenticationMode, ClipboardMode, GraphicsMode};
     use ironrdp::pdu::rdp::client_info::CompressionType;
     use std::sync::atomic::Ordering;
 
@@ -2168,6 +2288,7 @@ mod tests {
             username: "user".to_string(),
             password: "password".to_string(),
             domain: None,
+            authentication: AuthenticationMode::Password,
             width: 1280,
             height: 720,
             scale: Some(100),
@@ -2196,6 +2317,26 @@ mod tests {
             normalize_clipboard_to_crlf("one\r\ntwo\nthree\rfour"),
             "one\r\ntwo\r\nthree\r\nfour"
         );
+    }
+
+    #[test]
+    fn single_label_hosts_get_an_mdns_fallback() {
+        assert_eq!(
+            mdns_fallback_hostname("BIHA-5CG6094NC9").as_deref(),
+            Some("BIHA-5CG6094NC9.local")
+        );
+        assert_eq!(
+            mdns_fallback_hostname(" workstation ").as_deref(),
+            Some("workstation.local")
+        );
+    }
+
+    #[test]
+    fn addresses_and_qualified_hosts_do_not_get_an_mdns_fallback() {
+        assert_eq!(mdns_fallback_hostname("server.example.test"), None);
+        assert_eq!(mdns_fallback_hostname("192.168.1.124"), None);
+        assert_eq!(mdns_fallback_hostname("2001:db8::1"), None);
+        assert_eq!(mdns_fallback_hostname(""), None);
     }
 
     #[test]
@@ -2264,6 +2405,19 @@ mod tests {
             let disabled = build_config(&test_session_config(graphics, false), false);
             assert_eq!(disabled.compression_type, None);
         }
+    }
+
+    #[test]
+    fn authentication_mode_selects_exactly_one_pre_session_protocol() {
+        let password = build_config(&test_session_config(GraphicsMode::Classic, true), false);
+        assert!(password.enable_credssp);
+        assert!(!password.enable_rdsaad);
+
+        let mut entra = test_session_config(GraphicsMode::Classic, true);
+        entra.authentication = AuthenticationMode::EntraWeb;
+        let entra = build_config(&entra, false);
+        assert!(!entra.enable_credssp);
+        assert!(entra.enable_rdsaad);
     }
 
     #[test]

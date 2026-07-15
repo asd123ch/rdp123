@@ -12,14 +12,14 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSMenu, NSMenuDelegate,
-    NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSControlStateValueOn,
+    NSMenu, NSMenuDelegate, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
 };
 use objc2_foundation::{ns_string, NSNotification, NSObject, NSObjectProtocol, NSString};
 
 use rdp123_core::{
-    secrets, spawn_session, terminal, Connection, ConnectionKind, PasswordPolicy, ProfileStore,
-    SessionConfig, SessionEvent,
+    secrets, spawn_session, terminal, AuthenticationMode, Connection, ConnectionKind,
+    PasswordPolicy, ProfileStore, SessionConfig, SessionEvent,
 };
 
 use crate::settings::SettingsController;
@@ -106,6 +106,15 @@ define_class!(
             self.rebuild_menu(&menu, mtm);
             self.ivars().borrow_mut().status_item = Some(status);
         }
+
+        /// Add every live RDP session to the Dock icon's context menu. macOS
+        /// gives one Dock icon to the application process, so this is the
+        /// native way to make its individual session windows directly
+        /// addressable.
+        #[unsafe(method_id(applicationDockMenu:))]
+        fn application_dock_menu(&self, _sender: &NSApplication) -> Option<Retained<NSMenu>> {
+            Some(self.build_dock_menu())
+        }
     }
 
     unsafe impl NSMenuDelegate for AppDelegate {
@@ -129,6 +138,16 @@ define_class!(
         #[unsafe(method(openSettings:))]
         fn open_settings(&self, _sender: Option<&AnyObject>) {
             self.show_settings();
+        }
+
+        #[unsafe(method(showSessionFromDock:))]
+        fn show_session_from_dock(&self, sender: Option<&AnyObject>) {
+            let Some(sender) = sender else { return };
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            let Ok(window_id) = u64::try_from(tag) else {
+                return;
+            };
+            self.show_session(window_id);
         }
 
         /// Quit via our own selector: macOS attaches an automatic icon to
@@ -248,6 +267,58 @@ impl AppDelegate {
         }
     }
 
+    fn build_dock_menu(&self) -> Retained<NSMenu> {
+        let mtm = self.mtm();
+        let menu = NSMenu::new(mtm);
+        menu.setAutoenablesItems(false);
+
+        let mut sessions: Vec<_> = self
+            .ivars()
+            .borrow()
+            .windows
+            .iter()
+            .filter_map(|(&window_id, controller)| {
+                let tag = isize::try_from(window_id).ok()?;
+                Some((tag, controller.title(), controller.is_key_window()))
+            })
+            .collect();
+        sessions.sort_by(|a, b| {
+            a.1.to_lowercase()
+                .cmp(&b.1.to_lowercase())
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
+        for (tag, title, is_key_window) in sessions {
+            let item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &NSString::from_str(&title),
+                    Some(sel!(showSessionFromDock:)),
+                    ns_string!(""),
+                )
+            };
+            item.setTag(tag);
+            if is_key_window {
+                item.setState(NSControlStateValueOn);
+            }
+            let target: &AnyObject = self;
+            unsafe { item.setTarget(Some(target)) };
+            menu.addItem(&item);
+        }
+
+        menu
+    }
+
+    fn show_session(&self, window_id: u64) {
+        let controller = self.ivars().borrow().windows.get(&window_id).cloned();
+        let Some(controller) = controller else { return };
+
+        let app = NSApplication::sharedApplication(self.mtm());
+        #[allow(deprecated)]
+        app.activateIgnoringOtherApps(true);
+        controller.bring_to_front();
+    }
+
     fn open_ssh(&self, connection: &Connection) {
         let store = self.ivars().borrow().store.clone();
         let settings = match store.load_document() {
@@ -303,9 +374,12 @@ impl AppDelegate {
     fn open_rdp(&self, connection: Connection) {
         let mtm = self.mtm();
 
-        let password = match self.resolve_password(mtm, &connection) {
-            Some(p) => p,
-            None => return,
+        let password = match connection.rdp.authentication {
+            AuthenticationMode::Password => match self.resolve_password(mtm, &connection) {
+                Some(password) => password,
+                None => return,
+            },
+            AuthenticationMode::EntraWeb => String::new(),
         };
 
         let window_id = {
@@ -339,6 +413,7 @@ impl AppDelegate {
             username: connection.username.clone(),
             password,
             domain: connection.domain.clone(),
+            authentication: opts.authentication,
             width,
             height,
             scale,
@@ -452,6 +527,7 @@ impl AppDelegate {
 
         match event {
             SessionEvent::Connected { .. } => {
+                controller.end_entra_sign_in();
                 controller.set_reconnecting(false);
                 controller.refresh();
             }
@@ -478,6 +554,11 @@ impl AppDelegate {
                 let ok = ui::prompt_certificate(mtm, &fingerprint, is_change);
                 let _ = reply.send(ok);
             }
+            SessionEvent::EntraSignIn {
+                authorization_url,
+                redirect_uri,
+                reply,
+            } => controller.begin_entra_sign_in(mtm, &authorization_url, redirect_uri, reply),
             SessionEvent::CertTrusted { fingerprint } => {
                 let store = self.ivars().borrow().store.clone();
                 if let Err(e) = store.set_fingerprint(&controller.connection_id(), &fingerprint) {

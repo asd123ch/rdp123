@@ -194,6 +194,11 @@ pub struct Config {
     /// computers.
     #[doc(alias("enable_nla", "nla"))]
     pub enable_credssp: bool,
+    /// TLS + Microsoft Entra web authentication (RDS AAD Auth).
+    ///
+    /// The PROTOCOL_RDSAAD flag will be set. The caller must perform the
+    /// token-bound RDS AAD exchange after TLS and then mark it as complete.
+    pub enable_rdsaad: bool,
     pub credentials: Credentials,
     pub domain: Option<String>,
     /// The build number of the client.

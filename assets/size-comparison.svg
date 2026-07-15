@@ -12,6 +12,6 @@
 
     <text x="250" y="136" text-anchor="end" font-weight="600" fill="#2f81f7">RDP123</text>
     <rect x="260" y="124" width="4" height="14" rx="2" fill="#2f81f7"/>
-    <text x="272" y="136" font-weight="600" fill="#2f81f7">8 MB</text>
+    <text x="272" y="136" font-weight="600" fill="#2f81f7">9 MB</text>
   </g>
 </svg>

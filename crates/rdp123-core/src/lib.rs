@@ -9,6 +9,7 @@ pub mod framebuffer;
 pub mod gfx;
 pub mod keymap;
 pub mod profile;
+mod rdsaad;
 pub mod secrets;
 pub mod session;
 pub mod terminal;
@@ -17,8 +18,9 @@ pub mod wol;
 
 pub use framebuffer::SharedFramebuffer;
 pub use profile::{
-    AudioMode, ClipboardMode, ColorQuality, Connection, ConnectionKind, Document, GraphicsMode,
-    PasswordPolicy, ProfileStore, RdpOptions, ResolutionMode, ScalingLevel, Settings, TerminalKind,
+    AudioMode, AuthenticationMode, ClipboardMode, ColorQuality, Connection, ConnectionKind,
+    Document, GraphicsMode, PasswordPolicy, ProfileStore, RdpOptions, ResolutionMode, ScalingLevel,
+    Settings, TerminalKind,
 };
 pub use session::{
     spawn as spawn_session, InputEvent, PointerButton, RemoteClipItem, SessionCommand,

@@ -6,6 +6,7 @@ mod promise;
 mod settings;
 mod ui;
 mod view;
+mod web_auth;
 mod window;
 
 use objc2::runtime::ProtocolObject;

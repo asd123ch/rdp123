@@ -27,6 +27,7 @@ use crate::delegate;
 use crate::promise;
 use crate::ui;
 use crate::view::RdpView;
+use crate::web_auth::WebAuthController;
 
 const CLIPBOARD_POLL_SECONDS: f64 = 0.5;
 const DEFAULT_CONTENT_W: f64 = 1280.0;
@@ -40,6 +41,7 @@ pub struct WindowControllerIvars {
     timer: RefCell<Option<Retained<NSTimer>>>,
     status_label: RefCell<Option<Retained<NSTextField>>>,
     status_spinner: RefCell<Option<Retained<NSProgressIndicator>>>,
+    web_auth: RefCell<Option<Retained<WebAuthController>>>,
     connection_id: RefCell<String>,
     title: RefCell<String>,
     window_id: Cell<u64>,
@@ -107,6 +109,9 @@ define_class!(
             }
             if let Some(handle) = self.ivars().handle.borrow().as_ref() {
                 handle.command(SessionCommand::Shutdown);
+            }
+            if let Some(web_auth) = self.ivars().web_auth.borrow_mut().take() {
+                web_auth.cancel();
             }
             self.save_size_if_enabled();
             // Deferred: dropping the last controller retain inside its own
@@ -281,6 +286,29 @@ impl WindowController {
         }
     }
 
+    pub fn begin_entra_sign_in(
+        &self,
+        mtm: MainThreadMarker,
+        authorization_url: &str,
+        redirect_uri: String,
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    ) {
+        if let Some(previous) = self.ivars().web_auth.borrow_mut().take() {
+            previous.cancel();
+        }
+        let web_auth = WebAuthController::new(mtm, redirect_uri, reply);
+        if let Err(error) = web_auth.show(mtm, authorization_url) {
+            web_auth.cancel();
+            ui::show_error(mtm, "Could not open Microsoft sign-in", &error);
+            return;
+        }
+        *self.ivars().web_auth.borrow_mut() = Some(web_auth);
+    }
+
+    pub fn end_entra_sign_in(&self) {
+        self.ivars().web_auth.borrow_mut().take();
+    }
+
     /// Raise the session after the app's activation policy has switched from
     /// menu-bar accessory to a regular foreground application.
     pub fn bring_to_front(&self) {
@@ -288,10 +316,28 @@ impl WindowController {
         let Some(window) = window.as_ref() else {
             return;
         };
+        if window.isMiniaturized() {
+            window.deminiaturize(None);
+        }
         window.makeKeyAndOrderFront(None);
         if let Some(view) = self.ivars().view.borrow().as_ref() {
             window.makeFirstResponder(Some(view));
         }
+    }
+
+    /// User-facing connection name shown in the Dock menu.
+    pub fn title(&self) -> String {
+        self.ivars().title.borrow().clone()
+    }
+
+    /// Whether this session is currently frontmost, represented by a checkmark
+    /// in the Dock menu.
+    pub fn is_key_window(&self) -> bool {
+        self.ivars()
+            .window
+            .borrow()
+            .as_ref()
+            .is_some_and(|window| window.isKeyWindow())
     }
 
     pub fn connection_id(&self) -> String {
