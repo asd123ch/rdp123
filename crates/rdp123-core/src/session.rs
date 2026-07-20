@@ -248,8 +248,30 @@ struct RemoteClipboard {
     data_id: Option<u32>,
     jobs: std::collections::VecDeque<FetchJob>,
     next_stream_id: u32,
-    /// Outstanding request: (stream id, was a SIZE request).
-    outstanding: Option<(u32, bool)>,
+    /// Outstanding request: (stream id, was a SIZE request, requested bytes).
+    outstanding: Option<(u32, bool, u32)>,
+}
+
+/// Reject a server response that exceeds either the requested range or the
+/// remaining size advertised for the remote file.
+fn validate_remote_file_range(
+    requested_size: u32,
+    remaining_size: u64,
+    response_len: usize,
+) -> Result<(), String> {
+    let response_len = u64::try_from(response_len)
+        .map_err(|_| "remote file response length does not fit in u64".to_string())?;
+    if response_len > u64::from(requested_size) {
+        return Err(format!(
+            "remote returned {response_len} bytes for a {requested_size}-byte request"
+        ));
+    }
+    if response_len > remaining_size {
+        return Err(format!(
+            "remote returned {response_len} bytes with only {remaining_size} bytes remaining"
+        ));
+    }
+    Ok(())
 }
 
 /// Plan the entries for one pasted top-level item. Wire names containing
@@ -346,7 +368,7 @@ async fn advance_remote_fetch(
                 requested_size: requested,
                 data_id,
             };
-            remote.outstanding = Some((stream_id, was_size));
+            remote.outstanding = Some((stream_id, was_size, requested));
             return send_cliprdr(active_stage, out_tx, |c| c.request_file_contents(request)).await;
         }
 
@@ -404,7 +426,7 @@ async fn handle_remote_file_contents(
 ) -> Result<()> {
     use std::io::Write as _;
 
-    let Some((expected_id, was_size)) = remote.outstanding else {
+    let Some((expected_id, was_size, requested_size)) = remote.outstanding else {
         return Ok(()); // stale response after a failed/cancelled job
     };
     if stream_id != expected_id {
@@ -430,6 +452,11 @@ async fn handle_remote_file_contents(
             if bytes.is_empty() {
                 return Err("transfer ended early".to_string());
             }
+            validate_remote_file_range(
+                requested_size,
+                current.size.saturating_sub(current.offset),
+                bytes.len(),
+            )?;
             current
                 .file
                 .write_all(&bytes)
@@ -2275,7 +2302,8 @@ fn normalize_clipboard_to_crlf(text: &str) -> String {
 mod tests {
     use super::{
         build_config, mdns_fallback_hostname, normalize_clipboard_to_crlf, resolve_pending_command,
-        update_keys_down, InputEvent, PendingCommands, SessionCommand, SessionConfig,
+        update_keys_down, validate_remote_file_range, InputEvent, PendingCommands, SessionCommand,
+        SessionConfig,
     };
     use crate::profile::{AudioMode, AuthenticationMode, ClipboardMode, GraphicsMode};
     use ironrdp::pdu::rdp::client_info::CompressionType;
@@ -2317,6 +2345,18 @@ mod tests {
             normalize_clipboard_to_crlf("one\r\ntwo\nthree\rfour"),
             "one\r\ntwo\r\nthree\r\nfour"
         );
+    }
+
+    #[test]
+    fn remote_file_range_rejects_more_data_than_requested_or_remaining() {
+        assert!(validate_remote_file_range(1_048_576, 2_000_000, 1_048_577).is_err());
+        assert!(validate_remote_file_range(1_048_576, 12, 13).is_err());
+    }
+
+    #[test]
+    fn remote_file_range_accepts_full_and_short_final_chunks() {
+        assert!(validate_remote_file_range(1_048_576, 2_000_000, 1_048_576).is_ok());
+        assert!(validate_remote_file_range(1_048_576, 12, 12).is_ok());
     }
 
     #[test]
