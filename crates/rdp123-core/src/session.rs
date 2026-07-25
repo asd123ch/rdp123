@@ -30,19 +30,22 @@ use ironrdp::cliprdr::{Client, CliprdrClient, CliprdrSvcMessages};
 use ironrdp::connector::connection_activation::{
     ConnectionActivationSequence, ConnectionActivationState,
 };
-use ironrdp::connector::sspi::generator::NetworkRequest;
+use ironrdp::connector::sspi::{generator::NetworkRequest, ErrorKind as SspiErrorKind};
 use ironrdp::connector::{
     BitmapConfig, ClientConnector, Config, ConnectionResult, ConnectorError, ConnectorErrorExt,
-    ConnectorResult, Credentials, DesktopSize, ServerName,
+    ConnectorErrorKind, ConnectorResult, Credentials, DesktopSize, ServerName,
 };
 use ironrdp::core::WriteBuf;
 use ironrdp::displaycontrol::client::DisplayControlClient;
 use ironrdp::displaycontrol::pdu::MonitorLayoutEntry;
 use ironrdp::dvc::DrdynvcClient;
 use ironrdp::graphics::image_processing::PixelFormat;
-use ironrdp::input::{Database, MouseButton, MousePosition, Operation, Scancode, WheelRotations};
+use ironrdp::input::{
+    synchronize_event, Database, MouseButton, MousePosition, Operation, Scancode, WheelRotations,
+};
 use ironrdp::pdu::gcc::KeyboardType;
 use ironrdp::pdu::geometry::Rectangle as _;
+use ironrdp::pdu::input::fast_path::FastPathInputEvent;
 use ironrdp::pdu::rdp::capability_sets::{client_codecs_capabilities, MajorPlatformType};
 use ironrdp::pdu::rdp::client_info::{CompressionType, PerformanceFlags, TimezoneInfo};
 use ironrdp::pdu::PduResult;
@@ -580,8 +583,15 @@ pub enum SessionEvent {
     CertTrusted {
         fingerprint: String,
     },
-    /// The connection dropped and a reconnect attempt is starting.
-    Reconnecting,
+    /// The connection dropped and another reconnect attempt is scheduled.
+    Reconnecting {
+        attempt: u32,
+        max_attempts: u32,
+    },
+    /// Automatic reconnect was enabled, but all attempts have failed.
+    ReconnectFailed {
+        reason: String,
+    },
     Disconnected {
         reason: String,
     },
@@ -814,13 +824,23 @@ enum SessionEnd {
 /// What the reconnect loop should do after one attempt.
 enum Outcome {
     Stop,
-    /// (reason, is_error): emit Error vs Disconnected, then stop.
-    Fail(String, bool),
-    /// Wait `delay`, then try again. `announce` emits a `Reconnecting` event.
+    Fail {
+        reason: String,
+        event: TerminalEvent,
+    },
+    /// Wait `delay`, then try again. A reconnect attempt is announced when
+    /// `reconnect_attempt` is present; initial-connect retries stay silent.
     Retry {
         delay: Duration,
-        announce: bool,
+        reconnect_attempt: Option<u32>,
     },
+}
+
+#[derive(Clone, Copy)]
+enum TerminalEvent {
+    Error,
+    Disconnected,
+    ReconnectFailed,
 }
 
 enum ConnectFailure {
@@ -922,6 +942,7 @@ async fn run(
             audio.as_ref(),
             &framebuffer,
             &event_cb,
+            connected_once && config.reconnect,
         )
         .await
         {
@@ -965,10 +986,13 @@ async fn run(
                         if config.reconnect {
                             Outcome::Retry {
                                 delay: reconnect_delay(&config),
-                                announce: true,
+                                reconnect_attempt: Some(1),
                             }
                         } else {
-                            Outcome::Fail(reason, false)
+                            Outcome::Fail {
+                                reason,
+                                event: TerminalEvent::Disconnected,
+                            }
                         }
                     }
                 }
@@ -983,23 +1007,42 @@ async fn run(
                     // because repeated bad credentials can lock a domain account.
                     failures += 1;
                     if failures >= max_initial_failures {
-                        Outcome::Fail(reason, true)
+                        Outcome::Fail {
+                            reason,
+                            event: TerminalEvent::Error,
+                        }
                     } else {
                         Outcome::Retry {
                             delay: INITIAL_RETRY_DELAY,
-                            announce: false,
+                            reconnect_attempt: None,
                         }
                     }
-                } else if !connected_once || !config.reconnect || !retryable {
-                    Outcome::Fail(reason, false)
+                } else if !connected_once {
+                    Outcome::Fail {
+                        reason,
+                        event: TerminalEvent::Error,
+                    }
+                } else if !config.reconnect {
+                    Outcome::Fail {
+                        reason,
+                        event: TerminalEvent::Disconnected,
+                    }
+                } else if !retryable {
+                    Outcome::Fail {
+                        reason,
+                        event: TerminalEvent::ReconnectFailed,
+                    }
                 } else {
                     failures += 1;
                     if failures >= MAX_RECONNECT_FAILURES {
-                        Outcome::Fail(reason, false)
+                        Outcome::Fail {
+                            reason,
+                            event: TerminalEvent::ReconnectFailed,
+                        }
                     } else {
                         Outcome::Retry {
                             delay: reconnect_delay(&config),
-                            announce: true,
+                            reconnect_attempt: Some(failures + 1),
                         }
                     }
                 }
@@ -1008,20 +1051,29 @@ async fn run(
 
         match outcome {
             Outcome::Stop => break,
-            Outcome::Fail(reason, is_error) => {
-                if is_error {
-                    event_cb(SessionEvent::Error(reason));
-                } else {
-                    event_cb(SessionEvent::Disconnected { reason });
+            Outcome::Fail { reason, event } => {
+                let reason = user_facing_disconnect_reason(&reason);
+                match event {
+                    TerminalEvent::Error => event_cb(SessionEvent::Error(reason)),
+                    TerminalEvent::Disconnected => event_cb(SessionEvent::Disconnected { reason }),
+                    TerminalEvent::ReconnectFailed => {
+                        event_cb(SessionEvent::ReconnectFailed { reason })
+                    }
                 }
                 break;
             }
-            Outcome::Retry { delay, announce } => {
+            Outcome::Retry {
+                delay,
+                reconnect_attempt,
+            } => {
                 if drain_should_stop(&mut command_rx, &pending, &mut config) {
                     break;
                 }
-                if announce {
-                    event_cb(SessionEvent::Reconnecting);
+                if let Some(attempt) = reconnect_attempt {
+                    event_cb(SessionEvent::Reconnecting {
+                        attempt,
+                        max_attempts: MAX_RECONNECT_FAILURES,
+                    });
                 }
                 if wait_for_retry(delay, &mut command_rx, &pending, &mut config).await {
                     break;
@@ -1119,13 +1171,20 @@ async fn run_session(
     let mut image = DecodedImage::new(PIXEL_FORMAT, width, height);
     let mut active_stage = ActiveStage::new(connection_result);
     let mut input_db = Database::new();
-    event_cb(SessionEvent::Connected { width, height });
 
     // Split the stream so a write blocked on TCP backpressure can never stall
     // reads: reads run here, writes drain on a dedicated task.
     let (mut reader, writer) = split_tokio_framed(framed);
     let (out_tx, out_rx) = channel::<Vec<u8>>(OUTPUT_QUEUE_CAPACITY);
     let mut writer_task = tokio::spawn(writer_loop(writer, out_rx));
+    if let Err(error) =
+        synchronize_initial_keyboard_state(&mut active_stage, &mut image, &out_tx).await
+    {
+        drop(out_tx);
+        writer_task.abort();
+        return SessionEnd::Disconnected(format!("{error:#}"));
+    }
+    event_cb(SessionEvent::Connected { width, height });
     // With clipboard disabled the sender is dropped at connect; stop polling the
     // closed channel or the select loop would spin at 100% CPU. Same for gfx.
     let mut clip_open = true;
@@ -1331,6 +1390,7 @@ async fn connect(
     audio: Option<&crate::audio::AudioPlayer>,
     framebuffer: &Arc<SharedFramebuffer>,
     event_cb: &EventCb,
+    retry_authentication_during_reconnect: bool,
 ) -> std::result::Result<(ConnectionResult, SessionFramed), ConnectFailure> {
     let tcp = connect_tcp(&config.host, config.port).await?;
     tcp.set_nodelay(true).ok();
@@ -1395,8 +1455,7 @@ async fn connect(
     // 1. Pre-TLS X.224 negotiation.
     let should_upgrade = connect_begin(&mut framed, &mut connector)
         .await
-        .map_err(connector_err)
-        .map_err(ConnectFailure::fatal)?;
+        .map_err(|error| connector_failure(error, retry_authentication_during_reconnect))?;
 
     // 2. TLS handshake. CA/hostname verification is intentionally replaced by
     // TOFU below, but the server must still prove possession of the certificate
@@ -1439,8 +1498,7 @@ async fn connect(
         None,
     )
     .await
-    .map_err(connector_err)
-    .map_err(ConnectFailure::fatal)?;
+    .map_err(|error| connector_failure(error, retry_authentication_during_reconnect))?;
 
     Ok((result, framed))
 }
@@ -1864,10 +1922,39 @@ async fn reactivate(
     *image = DecodedImage::new(PIXEL_FORMAT, size.width, size.height);
     framebuffer.resize(size.width, size.height);
     active_stage.set_share_id(share_id);
+    synchronize_initial_keyboard_state(active_stage, image, out_tx).await?;
     event_cb(SessionEvent::Resized {
         width: size.width,
         height: size.height,
     });
+    Ok(())
+}
+
+/// Set a deterministic remote toggle-key state. A synchronize event is
+/// idempotent, unlike pressing Num Lock, which could turn an already-on state
+/// back off.
+fn initial_keyboard_sync_event() -> FastPathInputEvent {
+    synchronize_event(false, true, false, false)
+}
+
+/// Send Num Lock = on after each activation (initial connect, reconnect, or a
+/// server-initiated Deactivation-Reactivation cycle).
+async fn synchronize_initial_keyboard_state(
+    active_stage: &mut ActiveStage,
+    image: &mut DecodedImage,
+    out_tx: &OutSender,
+) -> Result<()> {
+    let outputs = active_stage.process_fastpath_input(image, &[initial_keyboard_sync_event()])?;
+    for output in outputs {
+        match output {
+            ActiveStageOutput::ResponseFrame(frame) => emit(out_tx, frame).await?,
+            _ => {
+                return Err(anyhow!(
+                    "unexpected session output while synchronizing keyboard state"
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2048,7 +2135,128 @@ fn fingerprint_hex(public_key: &[u8]) -> String {
 }
 
 fn connector_err(e: ConnectorError) -> anyhow::Error {
-    anyhow!("{e}")
+    tracing::debug!("RDP connector failure: {}", e.report());
+    let message = match e.kind() {
+        ConnectorErrorKind::Decode(_) => {
+            "The remote computer closed the connection or sent an incomplete RDP response. \
+             It may be offline, restarting, or not ready to accept RDP connections yet."
+                .to_string()
+        }
+        ConnectorErrorKind::Credssp(_) if connector_credentials_rejected(e.kind()) => {
+            "The remote computer rejected the sign-in. Check the username, password, and account \
+             permissions."
+                .to_string()
+        }
+        ConnectorErrorKind::Credssp(_) => {
+            "The remote computer is not ready to complete authentication yet.".to_string()
+        }
+        ConnectorErrorKind::AccessDenied => {
+            "The remote computer rejected the sign-in. Check the username, password, and account \
+             permissions."
+                .to_string()
+        }
+        ConnectorErrorKind::Negotiation(_) => {
+            "The remote computer rejected the requested RDP security protocol.".to_string()
+        }
+        ConnectorErrorKind::Reason(description) => {
+            format!("The remote computer rejected the connection: {description}")
+        }
+        _ => "The RDP connection could not be established.".to_string(),
+    };
+    anyhow!(message)
+}
+
+fn connector_credentials_rejected(kind: &ConnectorErrorKind) -> bool {
+    match kind {
+        ConnectorErrorKind::AccessDenied => true,
+        ConnectorErrorKind::Credssp(error) => matches!(
+            error.error_type,
+            SspiErrorKind::LogonDenied
+                | SspiErrorKind::UnknownCredentials
+                | SspiErrorKind::NoCredentials
+                | SspiErrorKind::IncompleteCredentials
+                | SspiErrorKind::WrongCredentialHandle
+        ),
+        _ => false,
+    }
+}
+
+fn user_facing_disconnect_reason(reason: &str) -> String {
+    let lower = reason.to_ascii_lowercase();
+    if lower.contains("operation timed out") || lower.contains("connection timed out") {
+        return "The remote computer did not respond in time.".to_string();
+    }
+    if lower.contains("credssp") {
+        if lower.contains("logondenied")
+            || lower.contains("logon denied")
+            || lower.contains("access denied")
+            || lower.contains("unknown credentials")
+        {
+            return "The remote computer rejected the sign-in. Check the username, password, and \
+                    account permissions."
+                .to_string();
+        }
+        return "The remote computer is not ready to complete authentication yet.".to_string();
+    }
+    if lower.contains("decode error") || lower.contains("[connector error @") {
+        return "The remote computer closed the connection or sent an incomplete RDP response. \
+                It may be offline, restarting, or not ready to accept RDP connections yet."
+            .to_string();
+    }
+
+    let mut cleaned = reason.to_string();
+    while let Some(start) = cleaned.find('[') {
+        let Some(relative_end) = cleaned[start..].find(']') else {
+            break;
+        };
+        let end = start + relative_end + 1;
+        if !cleaned[start..end].contains(" @ ") {
+            break;
+        }
+        let remove_end = if cleaned.as_bytes().get(end) == Some(&b' ') {
+            end + 1
+        } else {
+            end
+        };
+        cleaned.replace_range(start..remove_end, "");
+    }
+    while let Some(start) = cleaned.find("(os error ") {
+        let Some(relative_end) = cleaned[start..].find(')') else {
+            break;
+        };
+        let end = start + relative_end + 1;
+        let remove_start = if start > 0 && cleaned.as_bytes()[start - 1] == b' ' {
+            start - 1
+        } else {
+            start
+        };
+        cleaned.replace_range(remove_start..end, "");
+    }
+    cleaned
+}
+
+/// An incomplete RDP or CredSSP response commonly means that a host accepted
+/// TCP while Windows was still starting or shutting down. Explicit credential
+/// rejection is fatal on the initial connection. After this session has
+/// already authenticated successfully, it is safe to treat a short-lived
+/// CredSSP rejection during reboot as part of the bounded reconnect loop.
+fn connector_failure(
+    e: ConnectorError,
+    retry_authentication_during_reconnect: bool,
+) -> ConnectFailure {
+    let retryable = match e.kind() {
+        ConnectorErrorKind::Decode(_) => true,
+        ConnectorErrorKind::Credssp(_) | ConnectorErrorKind::AccessDenied => {
+            retry_authentication_during_reconnect || !connector_credentials_rejected(e.kind())
+        }
+        _ => false,
+    };
+    let error = connector_err(e);
+    if retryable {
+        ConnectFailure::retryable(error)
+    } else {
+        ConnectFailure::fatal(error)
+    }
 }
 
 fn ensure_crypto_provider() {
@@ -2301,11 +2509,16 @@ fn normalize_clipboard_to_crlf(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_config, mdns_fallback_hostname, normalize_clipboard_to_crlf, resolve_pending_command,
-        update_keys_down, validate_remote_file_range, InputEvent, PendingCommands, SessionCommand,
-        SessionConfig,
+        build_config, connector_failure, initial_keyboard_sync_event, mdns_fallback_hostname,
+        normalize_clipboard_to_crlf, resolve_pending_command, update_keys_down,
+        user_facing_disconnect_reason, validate_remote_file_range, InputEvent, PendingCommands,
+        SessionCommand, SessionConfig,
     };
     use crate::profile::{AudioMode, AuthenticationMode, ClipboardMode, GraphicsMode};
+    use ironrdp::connector::sspi::{Error as SspiError, ErrorKind as SspiErrorKind};
+    use ironrdp::connector::{ConnectorError, ConnectorErrorExt};
+    use ironrdp::core::{not_enough_bytes_err, DecodeError};
+    use ironrdp::pdu::input::fast_path::{FastPathInputEvent, SynchronizeFlags};
     use ironrdp::pdu::rdp::client_info::CompressionType;
     use std::sync::atomic::Ordering;
 
@@ -2344,6 +2557,99 @@ mod tests {
         assert_eq!(
             normalize_clipboard_to_crlf("one\r\ntwo\nthree\rfour"),
             "one\r\ntwo\r\nthree\r\nfour"
+        );
+    }
+
+    #[test]
+    fn initial_keyboard_sync_enables_only_num_lock() {
+        assert_eq!(
+            initial_keyboard_sync_event(),
+            FastPathInputEvent::SyncEvent(SynchronizeFlags::NUM_LOCK)
+        );
+    }
+
+    #[test]
+    fn connector_decode_errors_hide_internal_source_locations() {
+        let decode: DecodeError = not_enough_bytes_err("test packet", 0, 4);
+        let (error, retryable) =
+            connector_failure(ConnectorError::decode(decode), false).into_parts();
+        let message = error.to_string();
+
+        assert!(retryable);
+        assert_eq!(
+            message,
+            "The remote computer closed the connection or sent an incomplete RDP response. \
+             It may be offline, restarting, or not ready to accept RDP connections yet."
+        );
+        assert!(!message.contains("vendor/"));
+        assert!(!message.contains("decode error"));
+    }
+
+    #[test]
+    fn transient_credssp_failures_retry_without_exposing_source_paths() {
+        let transient = ConnectorError::new(
+            "CredSSP",
+            ironrdp::connector::ConnectorErrorKind::Credssp(SspiError::new(
+                SspiErrorKind::InternalError,
+                "server is still starting",
+            )),
+        );
+        let (error, retryable) = connector_failure(transient, false).into_parts();
+        let message = error.to_string();
+
+        assert!(retryable);
+        assert_eq!(
+            message,
+            "The remote computer is not ready to complete authentication yet."
+        );
+        assert!(!message.contains("/Users/"));
+        assert!(!message.contains(".cargo"));
+
+        let rejected = ConnectorError::new(
+            "CredSSP",
+            ironrdp::connector::ConnectorErrorKind::Credssp(SspiError::new(
+                SspiErrorKind::LogonDenied,
+                "bad credentials",
+            )),
+        );
+        let (error, retryable) = connector_failure(rejected, false).into_parts();
+        assert!(!retryable);
+        assert_eq!(
+            error.to_string(),
+            "The remote computer rejected the sign-in. Check the username, password, and account permissions."
+        );
+
+        let reconnect_rejection = ConnectorError::new(
+            "CredSSP",
+            ironrdp::connector::ConnectorErrorKind::AccessDenied,
+        );
+        let (_, retryable) = connector_failure(reconnect_rejection, true).into_parts();
+        assert!(retryable);
+    }
+
+    #[test]
+    fn disconnect_timeouts_hide_operating_system_error_codes() {
+        assert_eq!(
+            user_facing_disconnect_reason("Operation timed out (os error 60)"),
+            "The remote computer did not respond in time."
+        );
+        assert_eq!(
+            user_facing_disconnect_reason("Connection reset by peer (os error 54)"),
+            "Connection reset by peer"
+        );
+        assert_eq!(
+            user_facing_disconnect_reason(
+                "[connector error @ /Users/patrick/.cargo/registry/src/lib.rs:413] decode error"
+            ),
+            "The remote computer closed the connection or sent an incomplete RDP response. \
+             It may be offline, restarting, or not ready to accept RDP connections yet."
+        );
+        assert_eq!(
+            user_facing_disconnect_reason(
+                "[CredSSP @ /Users/patrick/.cargo/registry/src/lib.rs:413] CredSSP, caused by: \
+                 InternalError: server is restarting"
+            ),
+            "The remote computer is not ready to complete authentication yet."
         );
     }
 

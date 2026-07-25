@@ -26,6 +26,40 @@ use crate::settings::SettingsController;
 use crate::ui;
 use crate::window::WindowController;
 
+#[derive(Debug, PartialEq, Eq)]
+enum TerminalSessionPresentation<'a> {
+    CloseSilently,
+    SheetAndClose {
+        title: &'static str,
+        message: &'a str,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum TerminalSessionKind {
+    Disconnected,
+    ConnectionError,
+    ReconnectFailed,
+}
+
+fn terminal_session_presentation(
+    kind: TerminalSessionKind,
+    reason: &str,
+) -> TerminalSessionPresentation<'_> {
+    if matches!(kind, TerminalSessionKind::Disconnected) && reason == rdp123_core::REMOTE_ENDED {
+        TerminalSessionPresentation::CloseSilently
+    } else {
+        TerminalSessionPresentation::SheetAndClose {
+            title: match kind {
+                TerminalSessionKind::Disconnected => "Disconnected",
+                TerminalSessionKind::ConnectionError => "Connection failed",
+                TerminalSessionKind::ReconnectFailed => "Reconnect failed",
+            },
+            message: reason,
+        }
+    }
+}
+
 thread_local! {
     static DELEGATE: RefCell<Option<Retained<AppDelegate>>> = const { RefCell::new(None) };
 }
@@ -157,6 +191,7 @@ define_class!(
         fn quit_app(&self, _sender: Option<&AnyObject>) {
             NSApplication::sharedApplication(self.mtm()).terminate(None);
         }
+
     }
 );
 
@@ -528,7 +563,7 @@ impl AppDelegate {
         match event {
             SessionEvent::Connected { .. } => {
                 controller.end_entra_sign_in();
-                controller.set_reconnecting(false);
+                controller.set_connected();
                 controller.refresh();
             }
             SessionEvent::FrameUpdated { .. } | SessionEvent::Resized { .. } => {
@@ -543,7 +578,10 @@ impl AppDelegate {
             } => controller.set_pointer_bitmap(rgba, width, height, hotspot_x, hotspot_y),
             SessionEvent::PointerDefault => controller.set_pointer_default(),
             SessionEvent::PointerHidden => controller.set_pointer_hidden(),
-            SessionEvent::Reconnecting => controller.set_reconnecting(true),
+            SessionEvent::Reconnecting {
+                attempt,
+                max_attempts,
+            } => controller.set_reconnecting(attempt, max_attempts),
             SessionEvent::ClipboardText(text) => controller.set_clipboard(&text),
             SessionEvent::ClipboardFiles(items) => controller.offer_remote_files(items),
             SessionEvent::CertificateApproval {
@@ -566,16 +604,32 @@ impl AppDelegate {
                 }
             }
             SessionEvent::Disconnected { reason } => {
-                // Close first so the dead window doesn't linger behind the
-                // dialog; a normal remote logoff needs no dialog at all.
-                controller.close();
-                if reason != rdp123_core::REMOTE_ENDED {
-                    ui::show_error(mtm, "Disconnected", &reason);
+                controller.end_entra_sign_in();
+                match terminal_session_presentation(TerminalSessionKind::Disconnected, &reason) {
+                    TerminalSessionPresentation::CloseSilently => controller.close(),
+                    TerminalSessionPresentation::SheetAndClose { title, message } => {
+                        controller.show_terminal_sheet(mtm, title, message);
+                    }
+                }
+            }
+            SessionEvent::ReconnectFailed { reason } => {
+                controller.end_entra_sign_in();
+                match terminal_session_presentation(TerminalSessionKind::ReconnectFailed, &reason) {
+                    TerminalSessionPresentation::CloseSilently => controller.close(),
+                    TerminalSessionPresentation::SheetAndClose { title, message } => {
+                        controller.show_terminal_sheet(mtm, title, message);
+                    }
                 }
             }
             SessionEvent::Error(message) => {
-                controller.close();
-                ui::show_error(mtm, "Connection failed", &message);
+                controller.end_entra_sign_in();
+                match terminal_session_presentation(TerminalSessionKind::ConnectionError, &message)
+                {
+                    TerminalSessionPresentation::CloseSilently => controller.close(),
+                    TerminalSessionPresentation::SheetAndClose { title, message } => {
+                        controller.show_terminal_sheet(mtm, title, message);
+                    }
+                }
             }
         }
     }
@@ -624,4 +678,45 @@ fn install_main_menu(mtm: MainThreadMarker) {
     main_menu.addItem(&edit_slot);
 
     NSApplication::sharedApplication(mtm).setMainMenu(Some(&main_menu));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{terminal_session_presentation, TerminalSessionKind, TerminalSessionPresentation};
+
+    #[test]
+    fn terminal_failures_do_not_leave_a_frozen_session_inline() {
+        assert_eq!(
+            terminal_session_presentation(TerminalSessionKind::Disconnected, "network dropped"),
+            TerminalSessionPresentation::SheetAndClose {
+                title: "Disconnected",
+                message: "network dropped",
+            }
+        );
+        assert_eq!(
+            terminal_session_presentation(TerminalSessionKind::ConnectionError, "host unavailable"),
+            TerminalSessionPresentation::SheetAndClose {
+                title: "Connection failed",
+                message: "host unavailable",
+            }
+        );
+        assert_eq!(
+            terminal_session_presentation(TerminalSessionKind::ReconnectFailed, "host unavailable"),
+            TerminalSessionPresentation::SheetAndClose {
+                title: "Reconnect failed",
+                message: "host unavailable",
+            }
+        );
+    }
+
+    #[test]
+    fn normal_remote_logoff_closes_without_an_error() {
+        assert_eq!(
+            terminal_session_presentation(
+                TerminalSessionKind::Disconnected,
+                rdp123_core::REMOTE_ENDED
+            ),
+            TerminalSessionPresentation::CloseSilently
+        );
+    }
 }

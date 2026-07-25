@@ -4,16 +4,18 @@
 
 use std::cell::{Cell, RefCell};
 
+use block2::RcBlock;
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{
-    define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly,
+    define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, Message,
 };
 use objc2_app_kit::{
-    NSAutoresizingMaskOptions, NSBackingStoreType, NSPasteboard, NSPasteboardTypeString,
-    NSProgressIndicator, NSProgressIndicatorStyle, NSScreen, NSTextField, NSTrackingArea,
-    NSTrackingAreaOptions, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSAlert, NSAlertStyle, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSFont,
+    NSLineBreakMode, NSModalResponse, NSPasteboard, NSPasteboardTypeString, NSProgressIndicator,
+    NSProgressIndicatorStyle, NSScreen, NSTextField, NSTrackingArea, NSTrackingAreaOptions, NSView,
+    NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{NSNotification, NSObjectProtocol, NSString, NSTimer, NSURL};
 use objc2_quartz_core::kCAFilterLinear;
@@ -30,6 +32,7 @@ use crate::view::RdpView;
 use crate::web_auth::WebAuthController;
 
 const CLIPBOARD_POLL_SECONDS: f64 = 0.5;
+const TERMINAL_SHEET_AUTO_CLOSE_SECONDS: f64 = 5.0 * 60.0;
 const DEFAULT_CONTENT_W: f64 = 1280.0;
 const DEFAULT_CONTENT_H: f64 = 800.0;
 
@@ -39,8 +42,11 @@ pub struct WindowControllerIvars {
     view: RefCell<Option<Retained<RdpView>>>,
     handle: RefCell<Option<SessionHandle>>,
     timer: RefCell<Option<Retained<NSTimer>>>,
+    status_overlay: RefCell<Option<Retained<NSView>>>,
     status_label: RefCell<Option<Retained<NSTextField>>>,
     status_spinner: RefCell<Option<Retained<NSProgressIndicator>>>,
+    terminal_alert: RefCell<Option<Retained<NSAlert>>>,
+    terminal_timer: RefCell<Option<Retained<NSTimer>>>,
     web_auth: RefCell<Option<Retained<WebAuthController>>>,
     connection_id: RefCell<String>,
     title: RefCell<String>,
@@ -104,6 +110,9 @@ define_class!(
             if let Some(timer) = self.ivars().timer.borrow_mut().take() {
                 timer.invalidate();
             }
+            if let Some(timer) = self.ivars().terminal_timer.borrow_mut().take() {
+                timer.invalidate();
+            }
             if let Some(view) = self.ivars().view.borrow().as_ref() {
                 view.release_all_keys();
             }
@@ -125,6 +134,17 @@ define_class!(
         #[unsafe(method(pollClipboard:))]
         fn poll_clipboard(&self, _timer: &NSTimer) {
             self.poll_clipboard_impl();
+        }
+
+        #[unsafe(method(dismissTerminalSheet:))]
+        fn dismiss_terminal_sheet(&self, _timer: &NSTimer) {
+            let Some(alert) = self.ivars().terminal_alert.borrow().clone() else {
+                return;
+            };
+            let Some(window) = self.ivars().window.borrow().clone() else {
+                return;
+            };
+            window.endSheet(&alert.window());
         }
     }
 );
@@ -218,6 +238,19 @@ impl WindowController {
         };
         view.addTrackingArea(&tracking);
 
+        let status_overlay =
+            NSView::initWithFrame(NSView::alloc(mtm), ui::rect(content_width, content_height));
+        status_overlay.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable
+                | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
+        status_overlay.setWantsLayer(true);
+        if let Some(layer) = status_overlay.layer() {
+            let shade = NSColor::colorWithWhite_alpha(0.04, 0.72);
+            layer.setBackgroundColor(Some(&shade.CGColor()));
+        }
+        view.addSubview(&status_overlay);
+
         let spinner = NSProgressIndicator::initWithFrame(
             NSProgressIndicator::alloc(mtm),
             ui::rect(32.0, 32.0),
@@ -236,20 +269,24 @@ impl WindowController {
                 | NSAutoresizingMaskOptions::ViewMaxYMargin,
         );
         unsafe { spinner.startAnimation(None) };
-        view.addSubview(&spinner);
+        status_overlay.addSubview(&spinner);
 
         let status_label = NSTextField::labelWithString(&NSString::from_str("Connecting…"), mtm);
         status_label.setAlignment(objc2_app_kit::NSTextAlignment::Center);
+        status_label.setFont(Some(&NSFont::boldSystemFontOfSize(18.0)));
+        status_label.setTextColor(Some(&NSColor::whiteColor()));
+        status_label.setMaximumNumberOfLines(4);
+        status_label.setLineBreakMode(NSLineBreakMode::ByWordWrapping);
         status_label.setFrame(objc2_core_foundation::CGRect::new(
-            objc2_core_foundation::CGPoint::new(20.0, content_height / 2.0 - 28.0),
-            objc2_core_foundation::CGSize::new(content_width - 40.0, 24.0),
+            objc2_core_foundation::CGPoint::new(32.0, content_height / 2.0 - 88.0),
+            objc2_core_foundation::CGSize::new(content_width - 64.0, 120.0),
         ));
         status_label.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewWidthSizable
                 | NSAutoresizingMaskOptions::ViewMinYMargin
                 | NSAutoresizingMaskOptions::ViewMaxYMargin,
         );
-        view.addSubview(&status_label);
+        status_overlay.addSubview(&status_label);
 
         window.setContentView(Some(&view));
         window.setDelegate(Some(ProtocolObject::from_ref(self)));
@@ -262,6 +299,7 @@ impl WindowController {
 
         *self.ivars().window.borrow_mut() = Some(window);
         *self.ivars().view.borrow_mut() = Some(view);
+        *self.ivars().status_overlay.borrow_mut() = Some(status_overlay);
         *self.ivars().status_label.borrow_mut() = Some(status_label);
         *self.ivars().status_spinner.borrow_mut() = Some(spinner);
     }
@@ -399,29 +437,101 @@ impl WindowController {
         }
     }
 
-    /// Reflect reconnect state in the window title.
-    pub fn set_reconnecting(&self, on: bool) {
+    pub fn set_connected(&self) {
         if let Some(window) = self.ivars().window.borrow().as_ref() {
             let base = self.ivars().title.borrow().clone();
-            let title = if on {
-                format!("{base} — reconnecting…")
-            } else {
-                base
-            };
-            window.setTitle(&NSString::from_str(&title));
+            window.setTitle(&NSString::from_str(&base));
         }
-        if let Some(label) = self.ivars().status_label.borrow().as_ref() {
-            label.setStringValue(&NSString::from_str("Reconnecting…"));
-            label.setHidden(!on);
+        if let Some(overlay) = self.ivars().status_overlay.borrow().as_ref() {
+            overlay.setHidden(true);
         }
         if let Some(spinner) = self.ivars().status_spinner.borrow().as_ref() {
-            spinner.setHidden(!on);
-            if on {
-                unsafe { spinner.startAnimation(None) };
-            } else {
-                unsafe { spinner.stopAnimation(None) };
-            }
+            unsafe { spinner.stopAnimation(None) };
         }
+    }
+
+    /// Dim the last remote frame so it is visibly stale while reconnecting.
+    pub fn set_reconnecting(&self, attempt: u32, max_attempts: u32) {
+        if let Some(window) = self.ivars().window.borrow().as_ref() {
+            let base = self.ivars().title.borrow().clone();
+            window.setTitle(&NSString::from_str(&format!("{base} — reconnecting…")));
+        }
+        if let Some(overlay) = self.ivars().status_overlay.borrow().as_ref() {
+            overlay.setHidden(false);
+        }
+        if let Some(label) = self.ivars().status_label.borrow().as_ref() {
+            label.setStringValue(&NSString::from_str(&format!(
+                "Connection interrupted\nReconnecting automatically…\nAttempt {attempt} of {max_attempts}"
+            )));
+        }
+        if let Some(spinner) = self.ivars().status_spinner.borrow().as_ref() {
+            spinner.setHidden(false);
+            unsafe { spinner.stopAnimation(None) };
+            unsafe { spinner.startAnimation(None) };
+        }
+    }
+
+    /// Present a document-modal failure sheet. Unlike `NSAlert::runModal`, this
+    /// blocks only the ended session window; the OK button and automatic close
+    /// both finish the sheet through AppKit's supported modal-session path.
+    pub fn show_terminal_sheet(&self, mtm: MainThreadMarker, heading: &str, message: &str) {
+        if self.ivars().terminal_alert.borrow().is_some() {
+            return;
+        }
+        if let Some(timer) = self.ivars().timer.borrow_mut().take() {
+            timer.invalidate();
+        }
+        if let Some(view) = self.ivars().view.borrow().as_ref() {
+            view.release_all_keys();
+        }
+        self.ivars().handle.borrow_mut().take();
+
+        let Some(window) = self.ivars().window.borrow().clone() else {
+            return;
+        };
+        let base = self.ivars().title.borrow().clone();
+        window.setTitle(&NSString::from_str(&format!(
+            "{base} — {}",
+            heading.to_lowercase()
+        )));
+        if let Some(overlay) = self.ivars().status_overlay.borrow().as_ref() {
+            overlay.setHidden(false);
+        }
+        if let Some(label) = self.ivars().status_label.borrow().as_ref() {
+            label.setStringValue(&NSString::from_str(&format!("{heading}\n{message}")));
+        }
+        if let Some(spinner) = self.ivars().status_spinner.borrow().as_ref() {
+            unsafe { spinner.stopAnimation(None) };
+            spinner.setHidden(true);
+        }
+
+        let alert = NSAlert::new(mtm);
+        alert.setAlertStyle(NSAlertStyle::Warning);
+        alert.setMessageText(&NSString::from_str(heading));
+        alert.setInformativeText(&NSString::from_str(message));
+        alert.addButtonWithTitle(&NSString::from_str("OK"));
+        *self.ivars().terminal_alert.borrow_mut() = Some(alert.clone());
+
+        let controller = self.retain();
+        let completion = RcBlock::new(move |_response: NSModalResponse| {
+            if let Some(timer) = controller.ivars().terminal_timer.borrow_mut().take() {
+                timer.invalidate();
+            }
+            controller.ivars().terminal_alert.borrow_mut().take();
+            controller.close();
+        });
+        alert.beginSheetModalForWindow_completionHandler(&window, Some(&completion));
+
+        let timer = unsafe {
+            NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                TERMINAL_SHEET_AUTO_CLOSE_SECONDS,
+                self as &AnyObject,
+                sel!(dismissTerminalSheet:),
+                None,
+                false,
+            )
+        };
+        *self.ivars().terminal_timer.borrow_mut() = Some(timer);
     }
 
     pub fn close(&self) {
