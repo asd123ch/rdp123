@@ -153,6 +153,7 @@ pub struct SettingsIvars {
     terminal: Popup,
     custom: Field,
     swap_cmd_alt: Check,
+    external_stt_paste: Check,
     /// Launch-at-login. Not persisted in the document: the checkbox mirrors
     /// the system's `SMAppService` status.
     launch_at_login: Check,
@@ -1044,6 +1045,28 @@ impl SettingsController {
         );
         y -= PITCH + 10.0;
 
+        let stt_header = self.label(mtm, parent, rect(gx, y, 460.0, 20.0), "Speech to text");
+        stt_header.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
+        y -= HDR_PITCH;
+        let external_stt_paste = self.checkbox_fit(
+            mtm,
+            parent,
+            gfield,
+            y,
+            "Enable external STT paste in RDP sessions",
+            sel!(globalChanged:),
+        );
+        *self.ivars().external_stt_paste.borrow_mut() = Some(external_stt_paste);
+        y -= CHECKBOX_PITCH;
+        let stt_note = self.label(
+            mtm,
+            parent,
+            rect(gx, y, 640.0, ROW_H),
+            "Synchronizes macOS clipboard text before inserting it remotely with Ctrl+V.",
+        );
+        self.muted(&stt_note);
+        y -= PITCH + 10.0;
+
         let startup_header = self.label(mtm, parent, rect(gx, y, 460.0, 20.0), "Startup");
         startup_header.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
         y -= HDR_PITCH;
@@ -1573,6 +1596,8 @@ impl SettingsController {
         self.set_field(&iv.custom, &custom);
         let swap_cmd_alt = iv.document.borrow().settings.swap_cmd_alt;
         self.set_check(&iv.swap_cmd_alt, swap_cmd_alt);
+        let external_stt_paste = iv.document.borrow().settings.external_stt_paste;
+        self.set_check(&iv.external_stt_paste, external_stt_paste);
         // Reflect the system's login-item state, not a stored flag.
         self.set_check(&iv.launch_at_login, crate::login_item::is_enabled());
 
@@ -1807,7 +1832,9 @@ impl SettingsController {
             Some(custom)
         };
         document.settings.swap_cmd_alt = self.check_on(&self.ivars().swap_cmd_alt);
+        document.settings.external_stt_paste = self.check_on(&self.ivars().external_stt_paste);
         if self.save_document(&document) {
+            crate::delegate::set_external_stt_paste_enabled(document.settings.external_stt_paste);
             *self.ivars().document.borrow_mut() = document;
         }
     }

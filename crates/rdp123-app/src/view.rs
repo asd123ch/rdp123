@@ -1,13 +1,17 @@
 //! The custom `NSView` that renders the remote framebuffer and forwards input.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use objc2::rc::Retained;
-use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSCursor, NSEvent, NSView};
-use objc2_foundation::{NSPoint, NSRect};
+use objc2::runtime::AnyObject;
+use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
+use objc2_app_kit::{
+    NSCursor, NSEvent, NSMenuItem, NSMenuItemValidation, NSPasteboard, NSPasteboardTypeString,
+    NSView,
+};
+use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect};
 
 use rdp123_core::{InputEvent, PointerButton, SessionCommand, SessionHandle, SharedFramebuffer};
 
@@ -17,11 +21,12 @@ use crate::ui;
 pub struct RdpViewIvars {
     handle: RefCell<Option<SessionHandle>>,
     framebuffer: RefCell<Option<Arc<SharedFramebuffer>>>,
-    /// Physical modifier keys currently held (by macOS key code), so
-    /// `flagsChanged:` can be turned into discrete down/up events.
-    pressed_modifiers: RefCell<HashSet<u16>>,
+    input_routing: RefCell<InputRoutingState>,
     /// The server-provided pointer shape; `None` shows the native arrow.
     remote_cursor: RefCell<Option<Retained<NSCursor>>>,
+    /// Opt-in bridge for external macOS speech-to-text tools that insert by
+    /// invoking the focused application's standard Paste action.
+    external_stt_paste_enabled: Cell<bool>,
     /// Recycled presentation buffers (see `ui::upload_framebuffer`).
     present_pool: ui::PresentPool,
     /// Recycled IOSurfaces for zero-copy presentation.
@@ -34,6 +39,15 @@ define_class!(
     #[name = "RDP123RdpView"]
     #[ivars = RdpViewIvars]
     pub struct RdpView;
+
+    unsafe impl NSObjectProtocol for RdpView {}
+
+    unsafe impl NSMenuItemValidation for RdpView {
+        #[unsafe(method(validateMenuItem:))]
+        fn validate_menu_item(&self, item: &NSMenuItem) -> bool {
+            item.action() == Some(sel!(paste:)) && self.external_stt_pasteboard_text().is_some()
+        }
+    }
 
     impl RdpView {
         #[unsafe(method(acceptsFirstResponder))]
@@ -48,12 +62,23 @@ define_class!(
 
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
-            self.send(vec![InputEvent::Key { keycode: event.keyCode(), down: true }]);
+            let (events, external_paste) = self.ivars().input_routing.borrow_mut().key_down(
+                event.keyCode(),
+                self.ivars().external_stt_paste_enabled.get(),
+            );
+            self.send(events);
+            if external_paste {
+                self.submit_external_stt_paste();
+            }
         }
 
         #[unsafe(method(keyUp:))]
         fn key_up(&self, event: &NSEvent) {
-            self.send(vec![InputEvent::Key { keycode: event.keyCode(), down: false }]);
+            let events = self.ivars().input_routing.borrow_mut().key_up(
+                event.keyCode(),
+                self.ivars().external_stt_paste_enabled.get(),
+            );
+            self.send(events);
         }
 
         #[unsafe(method(flagsChanged:))]
@@ -63,22 +88,33 @@ define_class!(
                 return;
             };
             let flags = event.modifierFlags().0;
-            let mut pressed = self.ivars().pressed_modifiers.borrow_mut();
+            let mut routing = self.ivars().input_routing.borrow_mut();
             let down = if flags & DEVICE_MODIFIER_MASKS != 0 {
                 flags & device_mask != 0
             } else if flags & family_mask == 0 {
                 false
             } else {
-                !pressed.contains(&keycode)
+                !routing.is_pressed(keycode)
             };
-            let changed = if down {
-                pressed.insert(keycode)
-            } else {
-                pressed.remove(&keycode)
-            };
-            drop(pressed);
-            if changed {
-                self.send(vec![InputEvent::Key { keycode, down }]);
+            let events = routing.modifier_changed(
+                keycode,
+                down,
+                self.ivars().external_stt_paste_enabled.get(),
+            );
+            drop(routing);
+            self.send(events);
+        }
+
+        #[unsafe(method(paste:))]
+        fn paste(&self, _sender: Option<&AnyObject>) {
+            let (events, submit) = self
+                .ivars()
+                .input_routing
+                .borrow_mut()
+                .paste_invoked(self.ivars().external_stt_paste_enabled.get());
+            self.send(events);
+            if submit {
+                self.submit_external_stt_paste();
             }
         }
 
@@ -151,7 +187,7 @@ define_class!(
                 events.push(InputEvent::Wheel { delta: vx, horizontal: true });
             }
             if !events.is_empty() {
-                self.send(events);
+                self.send_with_deferred_modifiers(events);
             }
         }
 
@@ -168,6 +204,29 @@ impl RdpView {
     pub fn set_session(&self, handle: SessionHandle) {
         *self.ivars().framebuffer.borrow_mut() = Some(handle.framebuffer());
         *self.ivars().handle.borrow_mut() = Some(handle);
+    }
+
+    pub fn set_external_stt_paste_enabled(&self, enabled: bool) {
+        self.ivars().external_stt_paste_enabled.set(enabled);
+    }
+
+    fn external_stt_pasteboard_text(&self) -> Option<String> {
+        let pasteboard = NSPasteboard::generalPasteboard();
+        let text = unsafe { pasteboard.stringForType(NSPasteboardTypeString) };
+        let text = text.as_ref().map(|value| value.to_string());
+        external_stt_paste_text(
+            self.ivars().external_stt_paste_enabled.get(),
+            text.as_deref(),
+        )
+    }
+
+    fn submit_external_stt_paste(&self) {
+        let Some(text) = self.external_stt_pasteboard_text() else {
+            return;
+        };
+        if let Some(handle) = self.ivars().handle.borrow().as_ref() {
+            handle.command(SessionCommand::PasteLocalClipboard(text));
+        }
     }
 
     /// Apply a new server pointer shape (straight-alpha RGBA, remote pixels).
@@ -229,15 +288,28 @@ impl RdpView {
     }
 
     fn send(&self, events: Vec<InputEvent>) {
+        if events.is_empty() {
+            return;
+        }
         if let Some(handle) = self.ivars().handle.borrow().as_ref() {
             handle.command(SessionCommand::Input(events));
         }
     }
 
+    fn send_with_deferred_modifiers(&self, mut events: Vec<InputEvent>) {
+        let mut routed = self
+            .ivars()
+            .input_routing
+            .borrow_mut()
+            .flush_deferred_command_modifiers();
+        routed.append(&mut events);
+        self.send(routed);
+    }
+
     /// Release every held key on the remote when we lose focus, so modifiers
     /// (Hyper key, ⌘Tab, Mission Control) never get stuck on the host.
     pub fn release_all_keys(&self) {
-        self.ivars().pressed_modifiers.borrow_mut().clear();
+        self.ivars().input_routing.borrow_mut().clear();
         if let Some(handle) = self.ivars().handle.borrow().as_ref() {
             handle.command(SessionCommand::ReleaseAllKeys);
         }
@@ -245,13 +317,13 @@ impl RdpView {
 
     fn mouse_button(&self, event: &NSEvent, button: PointerButton, down: bool) {
         if let Some((x, y)) = self.remote_point(event) {
-            self.send(vec![InputEvent::MouseButton { button, down, x, y }]);
+            self.send_with_deferred_modifiers(vec![InputEvent::MouseButton { button, down, x, y }]);
         }
     }
 
     fn mouse_move(&self, event: &NSEvent) {
         if let Some((x, y)) = self.remote_point(event) {
-            self.send(vec![InputEvent::MouseMove { x, y }]);
+            self.send_with_deferred_modifiers(vec![InputEvent::MouseMove { x, y }]);
         }
     }
 
@@ -278,6 +350,171 @@ impl RdpView {
 
 const DEVICE_MODIFIER_MASKS: usize = 0x0000_20ff;
 
+#[derive(Default)]
+struct InputRoutingState {
+    pressed_modifiers: HashSet<u16>,
+    deferred_command_modifiers: HashSet<u16>,
+    suppressed_command_modifiers: HashSet<u16>,
+    suppressed_key_ups: HashSet<u16>,
+    external_paste_active: bool,
+}
+
+impl InputRoutingState {
+    fn is_pressed(&self, keycode: u16) -> bool {
+        self.pressed_modifiers.contains(&keycode)
+    }
+
+    fn modifier_changed(
+        &mut self,
+        keycode: u16,
+        down: bool,
+        external_stt_paste_enabled: bool,
+    ) -> Vec<InputEvent> {
+        let changed = if down {
+            self.pressed_modifiers.insert(keycode)
+        } else {
+            self.pressed_modifiers.remove(&keycode)
+        };
+        if !changed {
+            return Vec::new();
+        }
+        if is_command_key(keycode) {
+            if down && external_stt_paste_enabled {
+                self.deferred_command_modifiers.insert(keycode);
+                return Vec::new();
+            }
+            if !down {
+                if self.suppressed_command_modifiers.remove(&keycode) {
+                    if self.suppressed_command_modifiers.is_empty() {
+                        self.external_paste_active = false;
+                    }
+                    return Vec::new();
+                }
+                if self.deferred_command_modifiers.remove(&keycode) {
+                    return vec![
+                        InputEvent::Key {
+                            keycode,
+                            down: true,
+                        },
+                        InputEvent::Key {
+                            keycode,
+                            down: false,
+                        },
+                    ];
+                }
+            }
+        }
+        vec![InputEvent::Key { keycode, down }]
+    }
+
+    fn key_down(
+        &mut self,
+        keycode: u16,
+        external_stt_paste_enabled: bool,
+    ) -> (Vec<InputEvent>, bool) {
+        if is_command_key(keycode) {
+            return (
+                self.modifier_changed(keycode, true, external_stt_paste_enabled),
+                false,
+            );
+        }
+        if external_stt_paste_enabled
+            && keycode == V_KEYCODE
+            && self
+                .pressed_modifiers
+                .iter()
+                .any(|key| is_command_key(*key))
+        {
+            return self.paste_invoked(true);
+        }
+        let mut events = self.flush_deferred_command_modifiers();
+        events.push(InputEvent::Key {
+            keycode,
+            down: true,
+        });
+        (events, false)
+    }
+
+    fn key_up(&mut self, keycode: u16, external_stt_paste_enabled: bool) -> Vec<InputEvent> {
+        if is_command_key(keycode) {
+            return self.modifier_changed(keycode, false, external_stt_paste_enabled);
+        }
+        if self.suppressed_key_ups.remove(&keycode) {
+            if keycode == V_KEYCODE {
+                self.external_paste_active = false;
+            }
+            return Vec::new();
+        }
+        vec![InputEvent::Key {
+            keycode,
+            down: false,
+        }]
+    }
+
+    fn paste_invoked(&mut self, external_stt_paste_enabled: bool) -> (Vec<InputEvent>, bool) {
+        if !external_stt_paste_enabled {
+            return (Vec::new(), false);
+        }
+        let command_keys: Vec<_> = self
+            .pressed_modifiers
+            .iter()
+            .copied()
+            .filter(|key| is_command_key(*key))
+            .collect();
+        if !command_keys.is_empty() {
+            self.suppressed_key_ups.insert(V_KEYCODE);
+        }
+        let submit = !self.external_paste_active;
+        if !command_keys.is_empty() {
+            self.external_paste_active = true;
+        }
+
+        let mut events = Vec::new();
+        for keycode in command_keys {
+            if self.deferred_command_modifiers.remove(&keycode) {
+                self.suppressed_command_modifiers.insert(keycode);
+            } else if !self.suppressed_command_modifiers.contains(&keycode) {
+                // The setting may have been enabled while Command was already
+                // held. Release that forwarded modifier immediately.
+                self.suppressed_command_modifiers.insert(keycode);
+                events.push(InputEvent::Key {
+                    keycode,
+                    down: false,
+                });
+            }
+        }
+        (events, submit)
+    }
+
+    fn flush_deferred_command_modifiers(&mut self) -> Vec<InputEvent> {
+        let mut keycodes: Vec<_> = self.deferred_command_modifiers.drain().collect();
+        keycodes.sort_unstable();
+        keycodes
+            .into_iter()
+            .map(|keycode| InputEvent::Key {
+                keycode,
+                down: true,
+            })
+            .collect()
+    }
+
+    fn clear(&mut self) {
+        self.pressed_modifiers.clear();
+        self.deferred_command_modifiers.clear();
+        self.suppressed_command_modifiers.clear();
+        self.suppressed_key_ups.clear();
+        self.external_paste_active = false;
+    }
+}
+
+const LEFT_COMMAND_KEYCODE: u16 = 0x37;
+const RIGHT_COMMAND_KEYCODE: u16 = 0x36;
+const V_KEYCODE: u16 = 0x09;
+
+fn is_command_key(keycode: u16) -> bool {
+    matches!(keycode, LEFT_COMMAND_KEYCODE | RIGHT_COMMAND_KEYCODE)
+}
+
 fn modifier_masks(keycode: u16) -> Option<(usize, usize)> {
     Some(match keycode {
         0x3b => (0x0000_0001, 0x0004_0000), // left control
@@ -293,9 +530,18 @@ fn modifier_masks(keycode: u16) -> Option<(usize, usize)> {
     })
 }
 
+fn external_stt_paste_text(enabled: bool, text: Option<&str>) -> Option<String> {
+    enabled
+        .then_some(text)
+        .flatten()
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::modifier_masks;
+    use super::{external_stt_paste_text, modifier_masks, InputRoutingState};
+    use rdp123_core::InputEvent;
 
     #[test]
     fn modifier_keycodes_use_distinct_device_masks() {
@@ -308,5 +554,144 @@ mod tests {
             modifier_masks(0x36).unwrap().0
         );
         assert_eq!(modifier_masks(0x00), None);
+    }
+
+    #[test]
+    fn external_stt_paste_requires_the_global_setting_and_text() {
+        assert_eq!(external_stt_paste_text(false, Some("dictated text")), None);
+        assert_eq!(external_stt_paste_text(true, None), None);
+        assert_eq!(external_stt_paste_text(true, Some("")), None);
+        assert_eq!(
+            external_stt_paste_text(true, Some("dictated text")),
+            Some("dictated text".to_string())
+        );
+    }
+
+    #[test]
+    fn external_stt_paste_shortcut_never_reaches_windows() {
+        let mut routing = InputRoutingState::default();
+        let mut remote_events = routing.modifier_changed(0x37, true, true);
+        let (paste_events, submit) = routing.paste_invoked(true);
+        remote_events.extend(paste_events);
+        remote_events.extend(routing.key_up(0x09, true));
+        remote_events.extend(routing.modifier_changed(0x37, false, true));
+
+        assert!(submit);
+        assert!(
+            remote_events.is_empty(),
+            "the macOS Command+V shortcut leaked into the remote session"
+        );
+    }
+
+    #[test]
+    fn stt_runtime_regression_synthetic_command_key_events_never_reach_windows() {
+        let mut routing = InputRoutingState::default();
+        let (mut remote_events, _) = routing.key_down(0x37, true);
+        let (paste_events, submit) = routing.paste_invoked(true);
+        remote_events.extend(paste_events);
+        remote_events.extend(routing.key_up(0x09, true));
+        remote_events.extend(routing.key_up(0x37, true));
+
+        assert!(submit);
+        assert!(
+            remote_events.is_empty(),
+            "synthetic Command down/up leaked into the remote session"
+        );
+    }
+
+    #[test]
+    fn ordinary_command_shortcuts_still_reach_windows() {
+        let mut routing = InputRoutingState::default();
+        assert!(routing.modifier_changed(0x37, true, true).is_empty());
+
+        let (events, external_paste) = routing.key_down(0x08, true);
+
+        assert!(!external_paste);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                InputEvent::Key {
+                    keycode: 0x37,
+                    down: true
+                },
+                InputEvent::Key {
+                    keycode: 0x08,
+                    down: true
+                }
+            ]
+        ));
+        assert!(matches!(
+            routing.modifier_changed(0x37, false, true).as_slice(),
+            [InputEvent::Key {
+                keycode: 0x37,
+                down: false
+            }]
+        ));
+    }
+
+    #[test]
+    fn command_input_is_unchanged_when_external_stt_paste_is_disabled() {
+        let mut routing = InputRoutingState::default();
+
+        assert!(matches!(
+            routing.modifier_changed(0x37, true, false).as_slice(),
+            [InputEvent::Key {
+                keycode: 0x37,
+                down: true
+            }]
+        ));
+        assert!(matches!(
+            routing.modifier_changed(0x37, false, false).as_slice(),
+            [InputEvent::Key {
+                keycode: 0x37,
+                down: false
+            }]
+        ));
+    }
+
+    #[test]
+    fn command_tap_is_preserved_when_external_stt_paste_is_enabled() {
+        let mut routing = InputRoutingState::default();
+        assert!(routing.modifier_changed(0x37, true, true).is_empty());
+
+        assert!(matches!(
+            routing.modifier_changed(0x37, false, true).as_slice(),
+            [
+                InputEvent::Key {
+                    keycode: 0x37,
+                    down: true
+                },
+                InputEvent::Key {
+                    keycode: 0x37,
+                    down: false
+                }
+            ]
+        ));
+    }
+
+    #[test]
+    fn duplicate_key_and_menu_paste_dispatch_submits_only_once() {
+        let mut routing = InputRoutingState::default();
+        routing.modifier_changed(0x37, true, true);
+
+        let (_, key_dispatch_submits) = routing.key_down(0x09, true);
+        let (_, menu_dispatch_submits) = routing.paste_invoked(true);
+
+        assert!(key_dispatch_submits);
+        assert!(!menu_dispatch_submits);
+    }
+
+    #[test]
+    fn command_release_finishes_paste_when_appkit_consumes_v_key_up() {
+        let mut routing = InputRoutingState::default();
+        routing.modifier_changed(0x37, true, true);
+        let (_, first_submits) = routing.paste_invoked(true);
+        routing.modifier_changed(0x37, false, true);
+
+        routing.modifier_changed(0x37, true, true);
+        let (_, second_submits) = routing.paste_invoked(true);
+
+        assert!(first_submits);
+        assert!(second_submits);
     }
 }

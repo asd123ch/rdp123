@@ -84,6 +84,17 @@ const COMMAND_QUEUE_CAPACITY: usize = 256;
 const CLIPBOARD_QUEUE_CAPACITY: usize = 32;
 const OUTPUT_QUEUE_CAPACITY: usize = 64;
 const MAX_CLIPBOARD_TEXT_BYTES: usize = 16 * 1024 * 1024;
+const CLIPBOARD_RETRY_DELAYS: [Duration; 6] = [
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+];
+/// Stop reserving the dictated clipboard if the remote application never
+/// requests its data after the injected Ctrl+V.
+const EXTERNAL_PASTE_DATA_TIMEOUT: Duration = Duration::from_secs(10);
 /// Cap on the number of files offered to the remote clipboard in one copy
 /// (folders are walked recursively; a runaway selection is truncated).
 const MAX_CLIPBOARD_FILES: usize = 4096;
@@ -97,6 +108,10 @@ const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
 /// Set-1 scancode for F15 (not extended). No mainstream application reacts to
 /// it, so the injected tap resets the remote idle timer with no visible effect.
 const KEEP_ALIVE_SCANCODE: u8 = 0x66;
+/// Set-1 scancodes used to insert clipboard text into Windows after CLIPRDR
+/// confirms that the remote side accepted the matching clipboard generation.
+const LEFT_CTRL_SCANCODE: u8 = 0x1d;
+const V_SCANCODE: u8 = 0x2f;
 
 /// What the local (macOS) clipboard currently offers to the remote session.
 #[derive(Debug, Default)]
@@ -105,6 +120,185 @@ enum LocalClip {
     Empty,
     Text(String),
     Files(Vec<LocalClipFile>),
+}
+
+#[derive(Debug)]
+enum LocalClipboardOffer {
+    Text(Vec<ClipboardFormat>),
+    Files(Vec<FileDescriptor>),
+}
+
+/// Clipboard contents plus the acknowledgement state for the current CLIPRDR
+/// connection. Windows may transiently reject a FormatList, so an offer is not
+/// considered delivered until its matching response is `Ok`.
+#[derive(Debug, Default)]
+struct LocalClipboardState {
+    clip: LocalClip,
+    /// Latest ordinary macOS clipboard update observed while a confirmed STT
+    /// paste still needs the dictated text to remain active remotely.
+    deferred_clip: Option<LocalClip>,
+    generation: u64,
+    /// CLIPRDR FormatListResponse carries no correlation id. Track only the
+    /// newest offer: Windows can omit the initialization response and reply
+    /// only after a later format list replaces it.
+    in_flight: Option<u64>,
+    accepted_generation: Option<u64>,
+    retry_attempts: usize,
+    pending_paste_generation: Option<u64>,
+    serving_paste_generation: Option<u64>,
+    requested_paste_generation: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalClipboardOfferResult {
+    None,
+    Retry { generation: u64, delay: Duration },
+    PasteReady { generation: u64 },
+    AdvertiseCurrent { generation: u64 },
+}
+
+impl LocalClipboardState {
+    fn replace(&mut self, clip: LocalClip) -> u64 {
+        if self.protects_current_paste() {
+            self.deferred_clip = Some(clip);
+            return self.generation;
+        }
+        self.deferred_clip = None;
+        self.replace_now(clip)
+    }
+
+    fn replace_now(&mut self, clip: LocalClip) -> u64 {
+        self.clip = clip;
+        self.generation = self.generation.wrapping_add(1);
+        self.accepted_generation = None;
+        self.retry_attempts = 0;
+        self.pending_paste_generation = None;
+        self.serving_paste_generation = None;
+        self.requested_paste_generation = None;
+        self.generation
+    }
+
+    fn replace_for_paste(&mut self, text: String) -> u64 {
+        // An explicit Paste action must remain repeatable even when the new STT
+        // result is byte-for-byte identical to the previous one.
+        self.pending_paste_generation = None;
+        let generation = self.replace_now(LocalClip::Text(text));
+        self.pending_paste_generation = Some(generation);
+        generation
+    }
+
+    fn reset_connection(&mut self) {
+        self.in_flight = None;
+        self.accepted_generation = None;
+        self.retry_attempts = 0;
+        self.pending_paste_generation = None;
+        self.serving_paste_generation = None;
+        self.requested_paste_generation = None;
+        if let Some(clip) = self.deferred_clip.take() {
+            self.replace_now(clip);
+        }
+    }
+
+    fn current_generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn begin_offer(&mut self, generation: u64) -> Option<LocalClipboardOffer> {
+        if generation != self.generation
+            || self.accepted_generation == Some(generation)
+            || self.in_flight == Some(generation)
+        {
+            return None;
+        }
+        let offer = match &self.clip {
+            LocalClip::Files(files) => LocalClipboardOffer::Files(to_file_descriptors(files)),
+            LocalClip::Empty | LocalClip::Text(_) => {
+                LocalClipboardOffer::Text(vec![ClipboardFormat::new(
+                    ClipboardFormatId::CF_UNICODETEXT,
+                )])
+            }
+        };
+        self.in_flight = Some(generation);
+        Some(offer)
+    }
+
+    fn complete_offer(&mut self, ok: bool) -> LocalClipboardOfferResult {
+        let Some(generation) = self.in_flight.take() else {
+            tracing::warn!("clipboard: received a FormatList response with no offer in flight");
+            return LocalClipboardOfferResult::None;
+        };
+        if generation != self.generation {
+            return LocalClipboardOfferResult::AdvertiseCurrent {
+                generation: self.generation,
+            };
+        }
+        if ok {
+            self.accepted_generation = Some(generation);
+            self.retry_attempts = 0;
+            if self.pending_paste_generation == Some(generation) {
+                return LocalClipboardOfferResult::PasteReady { generation };
+            }
+            return LocalClipboardOfferResult::None;
+        }
+        let Some(delay) = CLIPBOARD_RETRY_DELAYS.get(self.retry_attempts).copied() else {
+            tracing::warn!(
+                "clipboard: Windows repeatedly rejected the current clipboard offer; \
+                 waiting for the next local clipboard change"
+            );
+            self.pending_paste_generation = None;
+            if let Some(generation) = self.apply_deferred_clip() {
+                return LocalClipboardOfferResult::AdvertiseCurrent { generation };
+            }
+            return LocalClipboardOfferResult::None;
+        };
+        self.retry_attempts += 1;
+        LocalClipboardOfferResult::Retry { generation, delay }
+    }
+
+    fn consume_confirmed_paste(&mut self, generation: u64) -> bool {
+        let confirmed = self.generation == generation
+            && self.accepted_generation == Some(generation)
+            && self.pending_paste_generation == Some(generation);
+        if confirmed {
+            self.pending_paste_generation = None;
+            self.serving_paste_generation = Some(generation);
+            self.requested_paste_generation = None;
+        }
+        confirmed
+    }
+
+    fn protects_current_paste(&self) -> bool {
+        let current = Some(self.generation);
+        self.pending_paste_generation == current || self.serving_paste_generation == current
+    }
+
+    fn begin_paste_data_response(&mut self) -> Option<u64> {
+        let generation =
+            (self.serving_paste_generation == Some(self.generation)).then_some(self.generation)?;
+        self.requested_paste_generation = Some(generation);
+        Some(generation)
+    }
+
+    fn finish_serving_paste(&mut self, generation: u64) -> Option<u64> {
+        if self.serving_paste_generation != Some(generation) || self.generation != generation {
+            return None;
+        }
+        self.serving_paste_generation = None;
+        self.requested_paste_generation = None;
+        self.apply_deferred_clip()
+    }
+
+    fn expire_unrequested_paste(&mut self, generation: u64) -> Option<u64> {
+        if self.requested_paste_generation == Some(generation) {
+            return None;
+        }
+        self.finish_serving_paste(generation)
+    }
+
+    fn apply_deferred_clip(&mut self) -> Option<u64> {
+        let clip = self.deferred_clip.take()?;
+        Some(self.replace_now(clip))
+    }
 }
 
 /// One local file (or directory) offered to the remote clipboard.
@@ -118,7 +312,7 @@ struct LocalClipFile {
     is_dir: bool,
 }
 
-type LocalClipState = Arc<Mutex<LocalClip>>;
+type LocalClipState = Arc<Mutex<LocalClipboardState>>;
 
 /// Walk the copied selection into the flat, relative-path list the Windows
 /// clipboard expects. Unreadable entries and non-UTF-8 names are skipped.
@@ -519,6 +713,9 @@ pub enum SessionCommand {
         scale: Option<u32>,
     },
     LocalClipboard(String),
+    /// Synchronize text from an external macOS STT tool, then paste it at the
+    /// active remote Windows caret once CLIPRDR acknowledges the offer.
+    PasteLocalClipboard(String),
     /// The user copied files in Finder; offer them to the remote clipboard.
     LocalClipboardFiles(Vec<std::path::PathBuf>),
     /// Finder redeemed a file promise: pull `name` (and its descendants) from
@@ -666,10 +863,15 @@ struct PendingCommands {
 impl SessionHandle {
     /// Send a command; ignored if the session has already ended.
     pub fn command(&self, cmd: SessionCommand) {
+        let _ = self.try_command(cmd);
+    }
+
+    /// Try to queue a command. Clipboard polling uses the return value to keep
+    /// an unsent pasteboard change pending instead of silently losing it.
+    pub fn try_command(&self, cmd: SessionCommand) -> bool {
         if let SessionCommand::Input(events) = &cmd {
             if let [InputEvent::MouseMove { x, y }] = events.as_slice() {
-                self.queue_mouse_move(*x, *y);
-                return;
+                return self.queue_mouse_move(*x, *y);
             }
         }
         match cmd {
@@ -681,14 +883,19 @@ impl SessionHandle {
             SessionCommand::ReleaseAllKeys => {
                 self.pending.release_all_keys.store(true, Ordering::Release);
                 let _ = self.command_tx.try_send(SessionCommand::ReleaseAllKeys);
+                true
             }
             SessionCommand::Shutdown => {
                 self.pending.shutdown.store(true, Ordering::Release);
                 let _ = self.command_tx.try_send(SessionCommand::Shutdown);
+                true
             }
             command => {
                 if let Err(error) = self.command_tx.try_send(command) {
                     tracing::warn!("session command queue is full or closed: {error}");
+                    false
+                } else {
+                    true
                 }
             }
         }
@@ -698,7 +905,7 @@ impl SessionHandle {
         self.framebuffer.clone()
     }
 
-    fn queue_mouse_move(&self, x: u16, y: u16) {
+    fn queue_mouse_move(&self, x: u16, y: u16) -> bool {
         let should_signal = {
             let mut pending = self.pending.mouse_move.lock().unwrap();
             pending.value = Some((x, y));
@@ -709,17 +916,20 @@ impl SessionHandle {
                 true
             }
         };
-        if should_signal
-            && self
-                .command_tx
-                .try_send(SessionCommand::Input(vec![InputEvent::MouseMove { x, y }]))
-                .is_err()
-        {
+        if !should_signal {
+            return true;
+        }
+        let queued = self
+            .command_tx
+            .try_send(SessionCommand::Input(vec![InputEvent::MouseMove { x, y }]))
+            .is_ok();
+        if !queued {
             self.pending.mouse_move.lock().unwrap().queued = false;
         }
+        queued
     }
 
-    fn queue_resize(&self, width: u16, height: u16, scale: Option<u32>) {
+    fn queue_resize(&self, width: u16, height: u16, scale: Option<u32>) -> bool {
         let should_signal = {
             let mut pending = self.pending.resize.lock().unwrap();
             pending.value = Some((width, height, scale));
@@ -730,18 +940,21 @@ impl SessionHandle {
                 true
             }
         };
-        if should_signal
-            && self
-                .command_tx
-                .try_send(SessionCommand::Resize {
-                    width,
-                    height,
-                    scale,
-                })
-                .is_err()
-        {
+        if !should_signal {
+            return true;
+        }
+        let queued = self
+            .command_tx
+            .try_send(SessionCommand::Resize {
+                width,
+                height,
+                scale,
+            })
+            .is_ok();
+        if !queued {
             self.pending.resize.lock().unwrap().queued = false;
         }
+        queued
     }
 }
 
@@ -779,9 +992,20 @@ pub fn spawn(config: SessionConfig, event_cb: EventCb) -> SessionHandle {
 
 /// Signals produced by the clipboard backend, drained by the session loop.
 enum ClipSignal {
-    InitiateCopy(Vec<ClipboardFormat>),
-    /// Announce a file copy (FileGroupDescriptorW format list).
-    InitiateFileCopy(Vec<FileDescriptor>),
+    /// Advertise the current local clipboard generation. Stale retries are
+    /// ignored when a newer macOS copy has already replaced it.
+    AdvertiseLocal {
+        generation: u64,
+    },
+    /// Windows accepted the clipboard text prepared for an external STT
+    /// insertion, so it is now safe to inject remote Ctrl+V.
+    PasteAccepted {
+        generation: u64,
+    },
+    /// Windows did not request the dictated clipboard data after Ctrl+V.
+    PasteDataTimedOut {
+        generation: u64,
+    },
     /// Serve one FileContents chunk or size to the remote.
     SubmitFileContents(FileContentsResponse<'static>),
     /// The remote clipboard's file list arrived (parsed FileGroupDescriptorW).
@@ -795,7 +1019,10 @@ enum ClipSignal {
         data: Option<Vec<u8>>,
     },
     InitiatePaste(ClipboardFormatId),
-    SubmitData(OwnedFormatDataResponse),
+    SubmitData {
+        response: OwnedFormatDataResponse,
+        paste_generation: Option<u64>,
+    },
     RemoteText(String),
 }
 
@@ -890,7 +1117,7 @@ async fn run(
     } else {
         None
     };
-    let local_clip: LocalClipState = Arc::new(Mutex::new(LocalClip::Empty));
+    let local_clip: LocalClipState = Arc::new(Mutex::new(LocalClipboardState::default()));
     // One audio player for the whole session (reconnects reuse it). Missing
     // audio is never fatal — the session simply runs silent.
     let audio = if config.audio == AudioMode::ThisComputer {
@@ -1066,7 +1293,7 @@ async fn run(
                 delay,
                 reconnect_attempt,
             } => {
-                if drain_should_stop(&mut command_rx, &pending, &mut config) {
+                if drain_should_stop(&mut command_rx, &pending, &mut config, &local_clip) {
                     break;
                 }
                 if let Some(attempt) = reconnect_attempt {
@@ -1075,7 +1302,8 @@ async fn run(
                         max_attempts: MAX_RECONNECT_FAILURES,
                     });
                 }
-                if wait_for_retry(delay, &mut command_rx, &pending, &mut config).await {
+                if wait_for_retry(delay, &mut command_rx, &pending, &mut config, &local_clip).await
+                {
                     break;
                 }
             }
@@ -1085,16 +1313,38 @@ async fn run(
 
 /// A resize observed while disconnected becomes the size of the next connect,
 /// so the session comes back matching the current window.
-fn absorb_offline_command(command: Option<SessionCommand>, config: &mut SessionConfig) {
-    if let Some(SessionCommand::Resize {
-        width,
-        height,
-        scale,
-    }) = command
-    {
-        config.width = width;
-        config.height = height;
-        config.scale = scale;
+fn absorb_offline_command(
+    command: Option<SessionCommand>,
+    config: &mut SessionConfig,
+    local_clip: &LocalClipState,
+) {
+    match command {
+        Some(SessionCommand::Resize {
+            width,
+            height,
+            scale,
+        }) => {
+            config.width = width;
+            config.height = height;
+            config.scale = scale;
+        }
+        Some(SessionCommand::LocalClipboard(text)) if text.len() <= MAX_CLIPBOARD_TEXT_BYTES => {
+            local_clip.lock().unwrap().replace(LocalClip::Text(text));
+        }
+        Some(SessionCommand::PasteLocalClipboard(text))
+            if text.len() <= MAX_CLIPBOARD_TEXT_BYTES =>
+        {
+            // Keep the dictated text available after reconnecting, but never
+            // perform a delayed paste into a potentially different remote caret.
+            local_clip.lock().unwrap().replace(LocalClip::Text(text));
+        }
+        Some(SessionCommand::LocalClipboardFiles(paths)) => {
+            let files = collect_clipboard_files(&paths);
+            if !files.is_empty() {
+                local_clip.lock().unwrap().replace(LocalClip::Files(files));
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1103,6 +1353,7 @@ async fn wait_for_retry(
     command_rx: &mut Receiver<SessionCommand>,
     pending: &PendingCommands,
     config: &mut SessionConfig,
+    local_clip: &LocalClipState,
 ) -> bool {
     let deadline = tokio::time::Instant::now() + delay;
     loop {
@@ -1115,7 +1366,11 @@ async fn wait_for_retry(
             command = command_rx.recv() => match command {
                 Some(SessionCommand::Shutdown) | None => return true,
                 Some(command) => {
-                    absorb_offline_command(resolve_pending_command(command, pending), config);
+                    absorb_offline_command(
+                        resolve_pending_command(command, pending),
+                        config,
+                        local_clip,
+                    );
                 }
             }
         }
@@ -1129,6 +1384,7 @@ fn drain_should_stop(
     command_rx: &mut Receiver<SessionCommand>,
     pending: &PendingCommands,
     config: &mut SessionConfig,
+    local_clip: &LocalClipState,
 ) -> bool {
     use tokio::sync::mpsc::error::TryRecvError;
     if pending.shutdown.swap(false, Ordering::AcqRel) {
@@ -1138,7 +1394,11 @@ fn drain_should_stop(
         match command_rx.try_recv() {
             Ok(SessionCommand::Shutdown) => return true,
             Ok(command) => {
-                absorb_offline_command(resolve_pending_command(command, pending), config);
+                absorb_offline_command(
+                    resolve_pending_command(command, pending),
+                    config,
+                    local_clip,
+                );
             }
             Err(TryRecvError::Empty) => return false,
             Err(TryRecvError::Disconnected) => return true,
@@ -1267,8 +1527,27 @@ async fn run_session(
             sig = clip_rx.recv(), if clip_open => {
                 match sig {
                     Some(sig) => {
-                        if let Err(e) = handle_clip_signal(sig, &out_tx, &mut active_stage, &mut remote_clip, event_cb).await {
-                            tracing::warn!("clipboard: {e}");
+                        let is_external_paste = matches!(sig, ClipSignal::PasteAccepted { .. });
+                        match handle_clip_signal(
+                            sig,
+                            &mut reader,
+                            &out_tx,
+                            &mut active_stage,
+                            &mut image,
+                            &mut input_db,
+                            framebuffer,
+                            local_clip,
+                            &mut remote_clip,
+                            event_cb,
+                        ).await {
+                            Ok(true) => break SessionEnd::Disconnected(REMOTE_ENDED.to_string()),
+                            Ok(false) => {
+                                if is_external_paste {
+                                    last_input = tokio::time::Instant::now();
+                                    keys_down = 0;
+                                }
+                            }
+                            Err(e) => tracing::warn!("clipboard: {e}"),
                         }
                     }
                     None => clip_open = false,
@@ -1439,6 +1718,7 @@ async fn connect(
 
     // Only register clipboard redirection when it is enabled.
     if config.clipboard.enabled() {
+        local_clip.lock().unwrap().reset_connection();
         let backend = MacClipboardBackend {
             tx: clip_tx,
             local_clip,
@@ -1690,19 +1970,34 @@ async fn handle_command(
                 );
                 return Ok(false);
             }
-            *local_clip.lock().unwrap() = LocalClip::Text(text);
-            let formats = vec![ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
-            send_cliprdr(active_stage, out_tx, |c| c.initiate_copy(&formats)).await?;
+            let generation = local_clip.lock().unwrap().replace(LocalClip::Text(text));
+            advertise_local_clipboard(generation, local_clip, active_stage, out_tx).await?;
+        }
+        SessionCommand::PasteLocalClipboard(text) => {
+            if !config.clipboard.allow_local_to_remote() {
+                tracing::debug!(
+                    "external STT paste ignored because local-to-remote clipboard is disabled"
+                );
+                return Ok(false);
+            }
+            if text.is_empty() || text.len() > MAX_CLIPBOARD_TEXT_BYTES {
+                tracing::warn!(
+                    "external STT paste text is empty or too large ({} bytes)",
+                    text.len()
+                );
+                return Ok(false);
+            }
+            let generation = local_clip.lock().unwrap().replace_for_paste(text);
+            advertise_local_clipboard(generation, local_clip, active_stage, out_tx).await?;
         }
         SessionCommand::LocalClipboardFiles(paths) => {
             let files = collect_clipboard_files(&paths);
             if files.is_empty() {
                 return Ok(false);
             }
-            let descriptors = to_file_descriptors(&files);
             tracing::debug!("clipboard: offering {} file entries", files.len());
-            *local_clip.lock().unwrap() = LocalClip::Files(files);
-            send_cliprdr(active_stage, out_tx, |c| c.initiate_file_copy(descriptors)).await?;
+            let generation = local_clip.lock().unwrap().replace(LocalClip::Files(files));
+            advertise_local_clipboard(generation, local_clip, active_stage, out_tx).await?;
         }
         SessionCommand::FetchRemoteClipItem { name, dest, done } => {
             if let Some(job) = plan_fetch_job(remote_clip, &name, &dest, done) {
@@ -1742,30 +2037,92 @@ async fn handle_command(
 
 async fn handle_clip_signal(
     sig: ClipSignal,
+    reader: &mut SessionReader,
     out_tx: &OutSender,
     active_stage: &mut ActiveStage,
+    image: &mut DecodedImage,
+    input_db: &mut Database,
+    framebuffer: &SharedFramebuffer,
+    local_clip: &LocalClipState,
     remote_clip: &mut RemoteClipboard,
     event_cb: &EventCb,
-) -> Result<()> {
+) -> Result<bool> {
     match sig {
-        ClipSignal::InitiateCopy(formats) => {
-            send_cliprdr(active_stage, out_tx, |c| c.initiate_copy(&formats)).await
+        ClipSignal::AdvertiseLocal { generation } => {
+            advertise_local_clipboard(generation, local_clip, active_stage, out_tx).await?;
+            Ok(false)
         }
-        ClipSignal::InitiateFileCopy(descriptors) => {
-            send_cliprdr(active_stage, out_tx, |c| c.initiate_file_copy(descriptors)).await
+        ClipSignal::PasteAccepted { generation } => {
+            if !local_clip
+                .lock()
+                .unwrap()
+                .consume_confirmed_paste(generation)
+            {
+                tracing::debug!(generation, "clipboard: cancelled stale external STT paste");
+                return Ok(false);
+            }
+            tracing::debug!(
+                generation,
+                "clipboard: remote accepted external STT text; injecting Ctrl+V"
+            );
+            let ended = send_remote_clipboard_paste(
+                reader,
+                out_tx,
+                active_stage,
+                image,
+                input_db,
+                framebuffer,
+                event_cb,
+            )
+            .await?;
+            Ok(ended)
+        }
+        ClipSignal::PasteDataTimedOut { generation } => {
+            let deferred_generation = local_clip
+                .lock()
+                .unwrap()
+                .expire_unrequested_paste(generation);
+            if let Some(deferred_generation) = deferred_generation {
+                tracing::debug!(
+                    generation,
+                    "clipboard: external STT data request timed out; restoring deferred clipboard"
+                );
+                advertise_local_clipboard(deferred_generation, local_clip, active_stage, out_tx)
+                    .await?;
+            }
+            Ok(false)
         }
         ClipSignal::SubmitFileContents(response) => {
-            send_cliprdr(active_stage, out_tx, |c| c.submit_file_contents(response)).await
+            send_cliprdr(active_stage, out_tx, |c| c.submit_file_contents(response)).await?;
+            Ok(false)
         }
         ClipSignal::InitiatePaste(format) => {
-            send_cliprdr(active_stage, out_tx, |c| c.initiate_paste(format)).await
+            send_cliprdr(active_stage, out_tx, |c| c.initiate_paste(format)).await?;
+            Ok(false)
         }
-        ClipSignal::SubmitData(response) => {
-            send_cliprdr(active_stage, out_tx, |c| c.submit_format_data(response)).await
+        ClipSignal::SubmitData {
+            response,
+            paste_generation,
+        } => {
+            send_cliprdr(active_stage, out_tx, |c| c.submit_format_data(response)).await?;
+            if let Some(generation) = paste_generation {
+                let deferred_generation =
+                    local_clip.lock().unwrap().finish_serving_paste(generation);
+                if let Some(deferred_generation) = deferred_generation {
+                    advertise_local_clipboard(
+                        deferred_generation,
+                        local_clip,
+                        active_stage,
+                        out_tx,
+                    )
+                    .await?;
+                }
+            }
+            Ok(false)
         }
         ClipSignal::RemoteText(text) => {
             event_cb(SessionEvent::ClipboardText(text));
-            Ok(())
+            Ok(false)
         }
         ClipSignal::RemoteFileList { files, data_id } => {
             remote_clip.files = files;
@@ -1782,11 +2139,30 @@ async fn handle_clip_signal(
             if !items.is_empty() {
                 event_cb(SessionEvent::ClipboardFiles(items));
             }
-            Ok(())
+            Ok(false)
         }
         ClipSignal::RemoteFileContents { stream_id, data } => {
-            handle_remote_file_contents(remote_clip, stream_id, data, active_stage, out_tx).await
+            handle_remote_file_contents(remote_clip, stream_id, data, active_stage, out_tx).await?;
+            Ok(false)
         }
+    }
+}
+
+async fn advertise_local_clipboard(
+    generation: u64,
+    local_clip: &LocalClipState,
+    active_stage: &mut ActiveStage,
+    out_tx: &OutSender,
+) -> Result<()> {
+    let offer = local_clip.lock().unwrap().begin_offer(generation);
+    match offer {
+        Some(LocalClipboardOffer::Text(formats)) => {
+            send_cliprdr(active_stage, out_tx, |c| c.initiate_copy(&formats)).await
+        }
+        Some(LocalClipboardOffer::Files(descriptors)) => {
+            send_cliprdr(active_stage, out_tx, |c| c.initiate_file_copy(descriptors)).await
+        }
+        None => Ok(()),
     }
 }
 
@@ -2000,6 +2376,48 @@ async fn send_keepalive_tap(
     if fp_events.is_empty() {
         return Ok(false);
     }
+    let outputs = active_stage.process_fastpath_input(image, &fp_events)?;
+    drain_outputs(
+        outputs,
+        reader,
+        out_tx,
+        active_stage,
+        image,
+        framebuffer,
+        event_cb,
+    )
+    .await
+}
+
+fn remote_clipboard_paste_operations() -> [Operation; 4] {
+    let ctrl = Scancode::from_u8(false, LEFT_CTRL_SCANCODE);
+    let v = Scancode::from_u8(false, V_SCANCODE);
+    [
+        Operation::KeyPressed(ctrl),
+        Operation::KeyPressed(v),
+        Operation::KeyReleased(v),
+        Operation::KeyReleased(ctrl),
+    ]
+}
+
+fn remote_clipboard_paste_input_events(input_db: &mut Database) -> Vec<FastPathInputEvent> {
+    let mut events: Vec<_> = input_db.release_all().into_iter().collect();
+    events.extend(input_db.apply(remote_clipboard_paste_operations()));
+    events
+}
+
+/// Release any physical modifiers still held by the macOS paste shortcut, then
+/// inject an isolated remote Ctrl+V. This prevents ⌘ from becoming Win+Ctrl+V.
+async fn send_remote_clipboard_paste(
+    reader: &mut SessionReader,
+    out_tx: &OutSender,
+    active_stage: &mut ActiveStage,
+    image: &mut DecodedImage,
+    input_db: &mut Database,
+    framebuffer: &SharedFramebuffer,
+    event_cb: &EventCb,
+) -> Result<bool> {
+    let fp_events = remote_clipboard_paste_input_events(input_db);
     let outputs = active_stage.process_fastpath_input(image, &fp_events)?;
     drain_outputs(
         outputs,
@@ -2294,6 +2712,12 @@ struct MacClipboardBackend {
 }
 
 impl MacClipboardBackend {
+    fn queue_signal(&self, signal: ClipSignal) {
+        if let Err(error) = self.tx.try_send(signal) {
+            tracing::warn!("clipboard: signal queue is full or closed: {error}");
+        }
+    }
+
     /// Serve one FileContents request from the offered files snapshot.
     fn file_contents_response(
         &self,
@@ -2306,7 +2730,7 @@ impl MacClipboardBackend {
             return error;
         }
         let clip = self.local_clip.lock().unwrap();
-        let LocalClip::Files(files) = &*clip else {
+        let LocalClip::Files(files) = &clip.clip else {
             return error;
         };
         let Some(file) = usize::try_from(request.index)
@@ -2377,22 +2801,53 @@ impl CliprdrBackend for MacClipboardBackend {
             | ClipboardGeneralCapabilityFlags::HUGE_FILE_SUPPORT_ENABLED
     }
 
-    fn on_ready(&mut self) {}
+    fn on_ready(&mut self) {
+        // FormatListResponse::Ok follows immediately and is the authoritative
+        // acknowledgement. Re-advertising here would create a duplicate offer.
+    }
 
     fn on_request_format_list(&mut self) {
         // Advertise our clipboard only if local -> remote is allowed.
         if !self.mode.allow_local_to_remote() {
             return;
         }
-        match &*self.local_clip.lock().unwrap() {
-            LocalClip::Files(files) => {
-                let _ = self
-                    .tx
-                    .try_send(ClipSignal::InitiateFileCopy(to_file_descriptors(files)));
+        let generation = self.local_clip.lock().unwrap().current_generation();
+        self.queue_signal(ClipSignal::AdvertiseLocal { generation });
+    }
+
+    fn on_format_list_response(&mut self, ok: bool) {
+        let result = self.local_clip.lock().unwrap().complete_offer(ok);
+        match result {
+            LocalClipboardOfferResult::None => {}
+            LocalClipboardOfferResult::PasteReady { generation } => {
+                self.queue_signal(ClipSignal::PasteAccepted { generation });
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(EXTERNAL_PASTE_DATA_TIMEOUT).await;
+                    if tx
+                        .send(ClipSignal::PasteDataTimedOut { generation })
+                        .await
+                        .is_err()
+                    {
+                        tracing::debug!("clipboard: session ended before the STT data timeout");
+                    }
+                });
             }
-            _ => {
-                let formats = vec![ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
-                let _ = self.tx.try_send(ClipSignal::InitiateCopy(formats));
+            LocalClipboardOfferResult::AdvertiseCurrent { generation } => {
+                self.queue_signal(ClipSignal::AdvertiseLocal { generation });
+            }
+            LocalClipboardOfferResult::Retry { generation, delay } => {
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    if tx
+                        .send(ClipSignal::AdvertiseLocal { generation })
+                        .await
+                        .is_err()
+                    {
+                        tracing::debug!("clipboard: session ended before a retry was sent");
+                    }
+                });
             }
         }
     }
@@ -2410,31 +2865,36 @@ impl CliprdrBackend for MacClipboardBackend {
                 .is_some_and(|name| name.value() == "FileGroupDescriptorW")
         });
         if let Some(format) = file_list {
-            let _ = self.tx.try_send(ClipSignal::InitiatePaste(format.id()));
+            self.queue_signal(ClipSignal::InitiatePaste(format.id()));
         } else if available_formats
             .iter()
             .any(|f| f.id == ClipboardFormatId::CF_UNICODETEXT)
         {
-            let _ = self
-                .tx
-                .try_send(ClipSignal::InitiatePaste(ClipboardFormatId::CF_UNICODETEXT));
+            self.queue_signal(ClipSignal::InitiatePaste(ClipboardFormatId::CF_UNICODETEXT));
         }
     }
 
     fn on_format_data_request(&mut self, request: FormatDataRequest) {
-        let response = if self.mode.allow_local_to_remote()
+        let (response, paste_generation) = if self.mode.allow_local_to_remote()
             && request.format == ClipboardFormatId::CF_UNICODETEXT
         {
-            let text = match &*self.local_clip.lock().unwrap() {
+            let mut clip = self.local_clip.lock().unwrap();
+            let text = match &clip.clip {
                 LocalClip::Text(text) => text.clone(),
                 _ => String::new(),
             };
             let crlf = normalize_clipboard_to_crlf(&text);
-            FormatDataResponse::new_unicode_string(&crlf)
+            (
+                FormatDataResponse::new_unicode_string(&crlf),
+                clip.begin_paste_data_response(),
+            )
         } else {
-            FormatDataResponse::new_error()
+            (FormatDataResponse::new_error(), None)
         };
-        let _ = self.tx.try_send(ClipSignal::SubmitData(response));
+        self.queue_signal(ClipSignal::SubmitData {
+            response,
+            paste_generation,
+        });
     }
 
     fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
@@ -2449,15 +2909,13 @@ impl CliprdrBackend for MacClipboardBackend {
                 );
                 return;
             }
-            let _ = self
-                .tx
-                .try_send(ClipSignal::RemoteText(text.replace("\r\n", "\n")));
+            self.queue_signal(ClipSignal::RemoteText(text.replace("\r\n", "\n")));
         }
     }
 
     fn on_file_contents_request(&mut self, request: FileContentsRequest) {
         let response = self.file_contents_response(&request);
-        let _ = self.tx.try_send(ClipSignal::SubmitFileContents(response));
+        self.queue_signal(ClipSignal::SubmitFileContents(response));
     }
 
     fn on_file_contents_response(&mut self, response: FileContentsResponse<'_>) {
@@ -2466,7 +2924,7 @@ impl CliprdrBackend for MacClipboardBackend {
         } else {
             Some(response.data().to_vec())
         };
-        let _ = self.tx.try_send(ClipSignal::RemoteFileContents {
+        self.queue_signal(ClipSignal::RemoteFileContents {
             stream_id: response.stream_id(),
             data,
         });
@@ -2489,7 +2947,7 @@ impl CliprdrBackend for MacClipboardBackend {
                     .is_some_and(|a| a.contains(ClipboardFileAttributes::DIRECTORY)),
             })
             .collect();
-        let _ = self.tx.try_send(ClipSignal::RemoteFileList {
+        self.queue_signal(ClipSignal::RemoteFileList {
             files: entries,
             data_id: clip_data_id,
         });
@@ -2509,16 +2967,21 @@ fn normalize_clipboard_to_crlf(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_config, connector_failure, initial_keyboard_sync_event, mdns_fallback_hostname,
-        normalize_clipboard_to_crlf, resolve_pending_command, update_keys_down,
-        user_facing_disconnect_reason, validate_remote_file_range, InputEvent, PendingCommands,
-        SessionCommand, SessionConfig,
+        absorb_offline_command, build_config, connector_failure, initial_keyboard_sync_event,
+        mdns_fallback_hostname, normalize_clipboard_to_crlf, remote_clipboard_paste_input_events,
+        resolve_pending_command, update_keys_down, user_facing_disconnect_reason,
+        validate_remote_file_range, ClipSignal, InputEvent, LocalClip, LocalClipState,
+        LocalClipboardOfferResult, LocalClipboardState, MacClipboardBackend, PendingCommands,
+        SessionCommand, SessionConfig, SessionHandle, CLIPBOARD_RETRY_DELAYS,
     };
     use crate::profile::{AudioMode, AuthenticationMode, ClipboardMode, GraphicsMode};
+    use ironrdp::cliprdr::backend::CliprdrBackend;
+    use ironrdp::cliprdr::pdu::{ClipboardFormatId, FormatDataRequest};
     use ironrdp::connector::sspi::{Error as SspiError, ErrorKind as SspiErrorKind};
     use ironrdp::connector::{ConnectorError, ConnectorErrorExt};
     use ironrdp::core::{not_enough_bytes_err, DecodeError};
-    use ironrdp::pdu::input::fast_path::{FastPathInputEvent, SynchronizeFlags};
+    use ironrdp::input::{Database, Operation, Scancode};
+    use ironrdp::pdu::input::fast_path::{FastPathInputEvent, KeyboardFlags, SynchronizeFlags};
     use ironrdp::pdu::rdp::client_info::CompressionType;
     use std::sync::atomic::Ordering;
 
@@ -2560,11 +3023,458 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn rejected_local_clipboard_offer_is_retried() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut state = LocalClipboardState::default();
+        let generation = state.replace(LocalClip::Text("retry me".into()));
+        assert!(state.begin_offer(generation).is_some());
+        let local_clip: LocalClipState = std::sync::Arc::new(std::sync::Mutex::new(state));
+        let mut backend = MacClipboardBackend {
+            tx,
+            local_clip,
+            tmp: "/tmp".to_string(),
+            mode: ClipboardMode::Bidirectional,
+        };
+
+        backend.on_format_list_response(false);
+
+        let signal = tokio::time::timeout(std::time::Duration::from_millis(250), rx.recv())
+            .await
+            .expect("a rejected clipboard offer must be retried")
+            .expect("clipboard signal channel must remain open");
+        assert!(matches!(
+            signal,
+            ClipSignal::AdvertiseLocal {
+                generation: retry_generation
+            } if retry_generation == generation
+        ));
+    }
+
+    #[tokio::test]
+    async fn accepted_local_clipboard_offer_is_not_retried() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut state = LocalClipboardState::default();
+        let generation = state.replace(LocalClip::Text("accepted".into()));
+        assert!(state.begin_offer(generation).is_some());
+        let local_clip: LocalClipState = std::sync::Arc::new(std::sync::Mutex::new(state));
+        let mut backend = MacClipboardBackend {
+            tx,
+            local_clip,
+            tmp: "/tmp".to_string(),
+            mode: ClipboardMode::Bidirectional,
+        };
+
+        backend.on_format_list_response(true);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(80), rx.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn stale_clipboard_rejection_does_not_retry_a_newer_copy() {
+        let mut state = LocalClipboardState::default();
+        let old_generation = state.replace(LocalClip::Text("old".into()));
+        assert!(state.begin_offer(old_generation).is_some());
+        let new_generation = state.replace(LocalClip::Text("new".into()));
+
+        assert_eq!(
+            state.complete_offer(false),
+            LocalClipboardOfferResult::AdvertiseCurrent {
+                generation: new_generation
+            }
+        );
+        assert!(state.begin_offer(new_generation).is_some());
+    }
+
+    #[test]
+    fn stt_runtime_regression_tracks_the_latest_format_list_offer() {
+        let mut state = LocalClipboardState::default();
+        let ordinary_generation = state.replace(LocalClip::Text("ordinary clipboard".into()));
+        assert!(state.begin_offer(ordinary_generation).is_some());
+
+        let paste_generation = state.replace_for_paste("dictated text".into());
+
+        assert!(
+            state.begin_offer(paste_generation).is_some(),
+            "a stale initialization offer must not block the explicit STT paste"
+        );
+        assert_eq!(
+            state.complete_offer(true),
+            LocalClipboardOfferResult::PasteReady {
+                generation: paste_generation
+            }
+        );
+    }
+
+    #[test]
+    fn clipboard_retries_are_bounded() {
+        let mut state = LocalClipboardState::default();
+        let generation = state.replace(LocalClip::Text("bounded".into()));
+
+        for _ in CLIPBOARD_RETRY_DELAYS {
+            assert!(state.begin_offer(generation).is_some());
+            assert!(matches!(
+                state.complete_offer(false),
+                LocalClipboardOfferResult::Retry { .. }
+            ));
+        }
+        assert!(state.begin_offer(generation).is_some());
+        assert_eq!(state.complete_offer(false), LocalClipboardOfferResult::None);
+    }
+
+    #[test]
+    fn rejected_external_stt_paste_restores_the_deferred_clipboard() {
+        let mut state = LocalClipboardState::default();
+        let generation = state.replace_for_paste("dictated text".into());
+        assert!(state.begin_offer(generation).is_some());
+        state.replace(LocalClip::Text("restored original".into()));
+
+        for _ in CLIPBOARD_RETRY_DELAYS {
+            assert!(matches!(
+                state.complete_offer(false),
+                LocalClipboardOfferResult::Retry { .. }
+            ));
+            assert!(state.begin_offer(generation).is_some());
+        }
+
+        let result = state.complete_offer(false);
+        let LocalClipboardOfferResult::AdvertiseCurrent {
+            generation: restored_generation,
+        } = result
+        else {
+            panic!("expected the restored clipboard to be advertised");
+        };
+        assert_ne!(restored_generation, generation);
+        assert!(matches!(
+            &state.clip,
+            LocalClip::Text(text) if text == "restored original"
+        ));
+    }
+
+    #[test]
+    fn external_stt_paste_waits_for_clipboard_acceptance() {
+        let mut state = LocalClipboardState::default();
+        let generation = state.replace_for_paste("dictated text".into());
+
+        assert!(state.begin_offer(generation).is_some());
+        assert_eq!(
+            state.complete_offer(true),
+            LocalClipboardOfferResult::PasteReady { generation }
+        );
+        assert!(state.consume_confirmed_paste(generation));
+    }
+
+    #[test]
+    fn newer_clipboard_text_waits_until_external_stt_data_is_sent() {
+        let mut state = LocalClipboardState::default();
+        let generation = state.replace_for_paste("dictated text".into());
+        assert!(state.begin_offer(generation).is_some());
+        assert_eq!(
+            state.complete_offer(true),
+            LocalClipboardOfferResult::PasteReady { generation }
+        );
+
+        state.replace(LocalClip::Text("newer clipboard text".into()));
+
+        assert!(state.consume_confirmed_paste(generation));
+        let deferred_generation = state
+            .finish_serving_paste(generation)
+            .expect("newer clipboard text must remain queued");
+        assert_ne!(deferred_generation, generation);
+        assert!(matches!(
+            &state.clip,
+            LocalClip::Text(text) if text == "newer clipboard text"
+        ));
+    }
+
+    #[test]
+    fn repeated_external_stt_paste_of_same_text_starts_a_fresh_offer() {
+        let mut state = LocalClipboardState::default();
+        let first = state.replace_for_paste("same text".into());
+        assert!(state.begin_offer(first).is_some());
+
+        let second = state.replace_for_paste("same text".into());
+
+        assert_ne!(second, first);
+        assert_eq!(
+            state.complete_offer(true),
+            LocalClipboardOfferResult::AdvertiseCurrent { generation: second }
+        );
+        assert!(state.begin_offer(second).is_some());
+        assert_eq!(
+            state.complete_offer(true),
+            LocalClipboardOfferResult::PasteReady { generation: second }
+        );
+    }
+
+    #[test]
+    fn normal_clipboard_acceptance_does_not_trigger_remote_paste() {
+        let mut state = LocalClipboardState::default();
+        let generation = state.replace(LocalClip::Text("ordinary copy".into()));
+
+        assert!(state.begin_offer(generation).is_some());
+        assert_eq!(state.complete_offer(true), LocalClipboardOfferResult::None);
+    }
+
+    #[test]
+    fn clipboard_poller_cannot_cancel_matching_external_stt_paste() {
+        let mut state = LocalClipboardState::default();
+        let generation = state.replace_for_paste("dictated text".into());
+        assert!(state.begin_offer(generation).is_some());
+
+        let polled_generation = state.replace(LocalClip::Text("dictated text".into()));
+
+        assert_eq!(polled_generation, generation);
+        assert!(state.begin_offer(polled_generation).is_none());
+        assert_eq!(
+            state.complete_offer(true),
+            LocalClipboardOfferResult::PasteReady { generation }
+        );
+    }
+
+    #[test]
+    fn stt_runtime_regression_clipboard_restore_cannot_cancel_pending_paste() {
+        let mut state = LocalClipboardState::default();
+        let generation = state.replace_for_paste("dictated text".into());
+        assert!(state.begin_offer(generation).is_some());
+
+        let polled_generation = state.replace(LocalClip::Text("restored original".into()));
+
+        assert_eq!(polled_generation, generation);
+        assert_eq!(
+            state.complete_offer(true),
+            LocalClipboardOfferResult::PasteReady { generation }
+        );
+        assert!(state.consume_confirmed_paste(generation));
+        state
+            .finish_serving_paste(generation)
+            .expect("the original clipboard must be restored after the paste");
+        assert!(matches!(
+            &state.clip,
+            LocalClip::Text(text) if text == "restored original"
+        ));
+    }
+
+    #[test]
+    fn stt_runtime_regression_dictated_text_survives_until_remote_data_request() {
+        let mut state = LocalClipboardState::default();
+        let generation = state.replace_for_paste("dictated text".into());
+        assert!(state.begin_offer(generation).is_some());
+        assert_eq!(
+            state.complete_offer(true),
+            LocalClipboardOfferResult::PasteReady { generation }
+        );
+        assert!(state.consume_confirmed_paste(generation));
+
+        let polled_generation = state.replace(LocalClip::Text("restored original".into()));
+
+        assert_eq!(polled_generation, generation);
+        assert!(matches!(
+            &state.clip,
+            LocalClip::Text(text) if text == "dictated text"
+        ));
+        let restored_generation = state
+            .finish_serving_paste(generation)
+            .expect("the original clipboard must be restored after serving the dictated text");
+        assert_ne!(restored_generation, generation);
+        assert!(matches!(
+            &state.clip,
+            LocalClip::Text(text) if text == "restored original"
+        ));
+    }
+
+    #[test]
+    fn external_stt_timeout_restores_clipboard_only_without_a_data_request() {
+        let mut requested = LocalClipboardState::default();
+        let requested_generation = requested.replace_for_paste("requested text".into());
+        assert!(requested.begin_offer(requested_generation).is_some());
+        assert_eq!(
+            requested.complete_offer(true),
+            LocalClipboardOfferResult::PasteReady {
+                generation: requested_generation
+            }
+        );
+        assert!(requested.consume_confirmed_paste(requested_generation));
+        requested.replace(LocalClip::Text("requested original".into()));
+        assert_eq!(
+            requested.begin_paste_data_response(),
+            Some(requested_generation)
+        );
+        assert_eq!(
+            requested.expire_unrequested_paste(requested_generation),
+            None
+        );
+        assert!(matches!(
+            &requested.clip,
+            LocalClip::Text(text) if text == "requested text"
+        ));
+
+        let mut unrequested = LocalClipboardState::default();
+        let unrequested_generation = unrequested.replace_for_paste("unrequested text".into());
+        assert!(unrequested.begin_offer(unrequested_generation).is_some());
+        assert_eq!(
+            unrequested.complete_offer(true),
+            LocalClipboardOfferResult::PasteReady {
+                generation: unrequested_generation
+            }
+        );
+        assert!(unrequested.consume_confirmed_paste(unrequested_generation));
+        unrequested.replace(LocalClip::Text("unrequested original".into()));
+        assert!(unrequested
+            .expire_unrequested_paste(unrequested_generation)
+            .is_some());
+        assert!(matches!(
+            &unrequested.clip,
+            LocalClip::Text(text) if text == "unrequested original"
+        ));
+    }
+
+    #[tokio::test]
+    async fn external_stt_paste_is_signalled_only_after_clipboard_acceptance() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut state = LocalClipboardState::default();
+        let generation = state.replace_for_paste("dictated text".into());
+        assert!(state.begin_offer(generation).is_some());
+        let local_clip: LocalClipState = std::sync::Arc::new(std::sync::Mutex::new(state));
+        let mut backend = MacClipboardBackend {
+            tx,
+            local_clip,
+            tmp: "/tmp".to_string(),
+            mode: ClipboardMode::Bidirectional,
+        };
+
+        backend.on_format_list_response(true);
+
+        let signal = rx
+            .recv()
+            .await
+            .expect("accepted STT paste must be signalled");
+        assert!(matches!(
+            signal,
+            ClipSignal::PasteAccepted {
+                generation: accepted
+            } if accepted == generation
+        ));
+    }
+
+    #[tokio::test]
+    async fn external_stt_data_request_serves_dictated_text_before_restore() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut state = LocalClipboardState::default();
+        let generation = state.replace_for_paste("dictated text".into());
+        assert!(state.begin_offer(generation).is_some());
+        assert_eq!(
+            state.complete_offer(true),
+            LocalClipboardOfferResult::PasteReady { generation }
+        );
+        assert!(state.consume_confirmed_paste(generation));
+        state.replace(LocalClip::Text("restored original".into()));
+        let local_clip: LocalClipState = std::sync::Arc::new(std::sync::Mutex::new(state));
+        let mut backend = MacClipboardBackend {
+            tx,
+            local_clip: local_clip.clone(),
+            tmp: "/tmp".to_string(),
+            mode: ClipboardMode::Bidirectional,
+        };
+
+        backend.on_format_data_request(FormatDataRequest {
+            format: ClipboardFormatId::CF_UNICODETEXT,
+        });
+
+        let signal = rx
+            .recv()
+            .await
+            .expect("the dictated clipboard data must be submitted");
+        let ClipSignal::SubmitData {
+            response,
+            paste_generation,
+        } = signal
+        else {
+            panic!("expected a clipboard data response");
+        };
+        assert_eq!(paste_generation, Some(generation));
+        assert_eq!(
+            response
+                .to_unicode_string()
+                .expect("the response must contain Unicode text"),
+            "dictated text"
+        );
+
+        let restored_generation = local_clip
+            .lock()
+            .unwrap()
+            .finish_serving_paste(generation)
+            .expect("the original clipboard must be restored after the response");
+        assert_ne!(restored_generation, generation);
+        assert!(matches!(
+            &local_clip.lock().unwrap().clip,
+            LocalClip::Text(text) if text == "restored original"
+        ));
+    }
+
+    #[test]
+    fn full_session_queue_reports_clipboard_delivery_failure() {
+        let (command_tx, _command_rx) = tokio::sync::mpsc::channel(1);
+        command_tx
+            .try_send(SessionCommand::Input(Vec::new()))
+            .unwrap();
+        let handle = SessionHandle {
+            command_tx,
+            framebuffer: crate::SharedFramebuffer::new(),
+            pending: std::sync::Arc::new(PendingCommands::default()),
+        };
+
+        assert!(!handle.try_command(SessionCommand::LocalClipboard("must remain pending".into())));
+    }
+
+    #[test]
+    fn clipboard_change_during_reconnect_is_kept_for_the_next_connection() {
+        let mut config = test_session_config(GraphicsMode::Classic, true);
+        let local_clip: LocalClipState =
+            std::sync::Arc::new(std::sync::Mutex::new(LocalClipboardState::default()));
+
+        absorb_offline_command(
+            Some(SessionCommand::LocalClipboard("latest".into())),
+            &mut config,
+            &local_clip,
+        );
+
+        assert!(matches!(
+            &local_clip.lock().unwrap().clip,
+            LocalClip::Text(text) if text == "latest"
+        ));
+    }
+
     #[test]
     fn initial_keyboard_sync_enables_only_num_lock() {
         assert_eq!(
             initial_keyboard_sync_event(),
             FastPathInputEvent::SyncEvent(SynchronizeFlags::NUM_LOCK)
+        );
+    }
+
+    #[test]
+    fn external_stt_paste_releases_held_modifiers_before_ctrl_v() {
+        let mut database = Database::new();
+        let windows_key = Scancode::from_u8(true, 0x5b);
+        let _ = database.apply([Operation::KeyPressed(windows_key)]);
+
+        assert_eq!(
+            remote_clipboard_paste_input_events(&mut database),
+            vec![
+                FastPathInputEvent::KeyboardEvent(
+                    KeyboardFlags::RELEASE | KeyboardFlags::EXTENDED,
+                    0x5b,
+                ),
+                FastPathInputEvent::KeyboardEvent(KeyboardFlags::empty(), 0x1d),
+                FastPathInputEvent::KeyboardEvent(KeyboardFlags::empty(), 0x2f),
+                FastPathInputEvent::KeyboardEvent(KeyboardFlags::RELEASE, 0x2f),
+                FastPathInputEvent::KeyboardEvent(KeyboardFlags::RELEASE, 0x1d),
+            ]
         );
     }
 

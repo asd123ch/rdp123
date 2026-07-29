@@ -94,6 +94,17 @@ pub fn save_window_size(connection_id: &str, width: u16, height: u16) {
     });
 }
 
+/// Apply the global external-STT paste preference to every open RDP window.
+pub fn set_external_stt_paste_enabled(enabled: bool) {
+    DELEGATE.with(|d| {
+        if let Some(delegate) = d.borrow().as_ref() {
+            for controller in delegate.ivars().borrow().windows.values() {
+                controller.set_external_stt_paste_enabled(enabled);
+            }
+        }
+    });
+}
+
 pub struct AppState {
     store: ProfileStore,
     /// Snapshot backing the current menu; menu tags index into this.
@@ -425,23 +436,24 @@ impl AppDelegate {
         };
 
         let controller = WindowController::new(mtm);
+        let global_settings = {
+            let store = self.ivars().borrow().store.clone();
+            store
+                .load_document()
+                .map(|document| document.settings)
+                .unwrap_or_default()
+        };
         controller.setup(
             mtm,
             window_id,
             &connection.id,
             &connection.name,
             &connection.rdp,
+            global_settings.external_stt_paste,
         );
 
         let (width, height, scale) = controller.initial_size();
         let opts = &connection.rdp;
-        let swap_cmd_alt = {
-            let store = self.ivars().borrow().store.clone();
-            store
-                .load_document()
-                .map(|document| document.settings.swap_cmd_alt)
-                .unwrap_or(false)
-        };
         let config = SessionConfig {
             host: connection.host.clone(),
             port: connection.port,
@@ -461,7 +473,7 @@ impl AppDelegate {
             dynamic_resolution: controller.dynamic_resolution(),
             reconnect: opts.reconnect,
             reconnect_per_minute: opts.reconnect_per_minute,
-            swap_cmd_alt,
+            swap_cmd_alt: global_settings.swap_cmd_alt,
             wake_mac: opts.wake_mac.clone(),
             keep_alive: opts.keep_alive,
         };

@@ -414,6 +414,10 @@ pub struct Settings {
     /// to the space bar) and ⌥ sends the Windows key. Off by default.
     #[serde(default)]
     pub swap_cmd_alt: bool,
+    /// Support external speech-to-text tools that paste through macOS. When
+    /// enabled, RDP123 synchronizes the clipboard before sending remote Ctrl+V.
+    #[serde(default)]
+    pub external_stt_paste: bool,
     /// For `TerminalKind::Custom`: a shell command line where `{ssh}` is
     /// replaced by the `ssh …` invocation (also `{host}`, `{port}`, `{user}`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -663,6 +667,25 @@ mod tests {
             document.connections[0].rdp.authentication,
             AuthenticationMode::Password
         );
+    }
+
+    #[test]
+    fn missing_external_stt_paste_setting_defaults_off() {
+        let document: Document =
+            serde_json::from_str(r#"{"version":1,"connections":[],"settings":{}}"#).unwrap();
+
+        assert!(!document.settings.external_stt_paste);
+    }
+
+    #[test]
+    fn external_stt_paste_setting_round_trips() {
+        let mut document = Document::default();
+        document.settings.external_stt_paste = true;
+
+        let json = serde_json::to_string(&document).unwrap();
+        let restored: Document = serde_json::from_str(&json).unwrap();
+
+        assert!(restored.settings.external_stt_paste);
     }
 
     #[test]

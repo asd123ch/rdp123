@@ -36,6 +36,27 @@ const TERMINAL_SHEET_AUTO_CLOSE_SECONDS: f64 = 5.0 * 60.0;
 const DEFAULT_CONTENT_W: f64 = 1280.0;
 const DEFAULT_CONTENT_H: f64 = 800.0;
 
+#[derive(Debug, Default)]
+struct ClipboardChangeTracker {
+    delivered_change_count: Option<isize>,
+}
+
+impl ClipboardChangeTracker {
+    fn is_pending(&self, change_count: isize) -> bool {
+        self.delivered_change_count != Some(change_count)
+    }
+
+    fn record_attempt(&mut self, change_count: isize, delivered: bool) {
+        if delivered {
+            self.delivered_change_count = Some(change_count);
+        }
+    }
+
+    fn acknowledge_local_write(&mut self, change_count: isize) {
+        self.delivered_change_count = Some(change_count);
+    }
+}
+
 #[derive(Default)]
 pub struct WindowControllerIvars {
     window: RefCell<Option<Retained<NSWindow>>>,
@@ -56,7 +77,7 @@ pub struct WindowControllerIvars {
     fixed_resolution: Cell<Option<(u16, u16)>>,
     remember_size: Cell<bool>,
     clipboard_mode: Cell<ClipboardMode>,
-    last_change_count: Cell<isize>,
+    clipboard_tracker: RefCell<ClipboardChangeTracker>,
     /// Keeps promise providers and their (weakly referenced) delegates alive
     /// while the remote file offer sits on the pasteboard.
     promise_holders: RefCell<
@@ -103,6 +124,13 @@ define_class!(
             if let Some(view) = self.ivars().view.borrow().as_ref() {
                 view.release_all_keys();
             }
+        }
+
+        #[unsafe(method(windowDidBecomeKey:))]
+        fn window_did_become_key(&self, _notification: &NSNotification) {
+            // Synchronize before the user can type ⌘V. The periodic timer is
+            // only a fallback for changes made while this window stays active.
+            self.poll_clipboard_impl();
         }
 
         #[unsafe(method(windowWillClose:))]
@@ -164,6 +192,7 @@ impl WindowController {
         connection_id: &str,
         title: &str,
         opts: &RdpOptions,
+        external_stt_paste: bool,
     ) {
         self.ivars().window_id.set(window_id);
         self.ivars().scaling.set(opts.scaling);
@@ -217,6 +246,9 @@ impl WindowController {
         window.setAcceptsMouseMovedEvents(true);
 
         let view = RdpView::new(mtm, ui::rect(content_width, content_height));
+        view.set_external_stt_paste_enabled(
+            external_stt_paste && opts.clipboard.allow_local_to_remote(),
+        );
         view.setWantsLayer(true);
         if let Some(layer) = view.layer() {
             layer.setContentsScale(window.backingScaleFactor());
@@ -321,6 +353,14 @@ impl WindowController {
         *self.ivars().handle.borrow_mut() = Some(handle);
         if self.ivars().clipboard_mode.get().allow_local_to_remote() {
             self.start_clipboard_timer();
+        }
+    }
+
+    pub fn set_external_stt_paste_enabled(&self, enabled: bool) {
+        if let Some(view) = self.ivars().view.borrow().as_ref() {
+            view.set_external_stt_paste_enabled(
+                enabled && self.ivars().clipboard_mode.get().allow_local_to_remote(),
+            );
         }
     }
 
@@ -551,7 +591,10 @@ impl WindowController {
             pasteboard.setString_forType(&NSString::from_str(text), NSPasteboardTypeString)
         };
         let _ = ok;
-        self.ivars().last_change_count.set(pasteboard.changeCount());
+        self.ivars()
+            .clipboard_tracker
+            .borrow_mut()
+            .acknowledge_local_write(pasteboard.changeCount());
     }
 
     /// The remote framebuffer size (and optional server scale %) to request.
@@ -642,13 +685,17 @@ impl WindowController {
             tracing::warn!("clipboard: could not offer remote files to the pasteboard");
         }
         // Don't re-read our own pasteboard write on the next poll.
-        self.ivars().last_change_count.set(pasteboard.changeCount());
+        self.ivars()
+            .clipboard_tracker
+            .borrow_mut()
+            .acknowledge_local_write(pasteboard.changeCount());
         *self.ivars().promise_holders.borrow_mut() = holders;
     }
 
     fn start_clipboard_timer(&self) {
-        let pasteboard = NSPasteboard::generalPasteboard();
-        self.ivars().last_change_count.set(pasteboard.changeCount());
+        // Seed the session with clipboard content that already existed before
+        // the RDP window opened.
+        self.poll_clipboard_impl();
         let timer = unsafe {
             NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
                 CLIPBOARD_POLL_SECONDS,
@@ -662,6 +709,9 @@ impl WindowController {
     }
 
     fn poll_clipboard_impl(&self) {
+        if !self.ivars().clipboard_mode.get().allow_local_to_remote() {
+            return;
+        }
         let is_key = self
             .ivars()
             .window
@@ -674,28 +724,43 @@ impl WindowController {
         }
         let pasteboard = NSPasteboard::generalPasteboard();
         let count = pasteboard.changeCount();
-        if count == self.ivars().last_change_count.get() {
+        if !self.ivars().clipboard_tracker.borrow().is_pending(count) {
             return;
         }
-        self.ivars().last_change_count.set(count);
 
         // Files take precedence over text: a Finder copy also puts the file
         // names on the pasteboard as a string.
         let files = pasteboard_file_paths(&pasteboard);
         if !files.is_empty() {
-            if let Some(handle) = self.ivars().handle.borrow().as_ref() {
-                handle.command(SessionCommand::LocalClipboardFiles(files));
-            }
+            let delivered = self.ivars().handle.borrow().as_ref().is_some_and(|handle| {
+                handle.try_command(SessionCommand::LocalClipboardFiles(files))
+            });
+            self.ivars()
+                .clipboard_tracker
+                .borrow_mut()
+                .record_attempt(count, delivered);
             return;
         }
         if let Some(text) = unsafe { pasteboard.stringForType(NSPasteboardTypeString) } {
             let text = text.to_string();
             if !text.is_empty() {
-                if let Some(handle) = self.ivars().handle.borrow().as_ref() {
-                    handle.command(SessionCommand::LocalClipboard(text));
-                }
+                let delivered =
+                    self.ivars().handle.borrow().as_ref().is_some_and(|handle| {
+                        handle.try_command(SessionCommand::LocalClipboard(text))
+                    });
+                self.ivars()
+                    .clipboard_tracker
+                    .borrow_mut()
+                    .record_attempt(count, delivered);
+                return;
             }
         }
+        // Unsupported or empty clipboard contents cannot be redirected; avoid
+        // polling the same change forever.
+        self.ivars()
+            .clipboard_tracker
+            .borrow_mut()
+            .record_attempt(count, true);
     }
 }
 
@@ -723,4 +788,26 @@ fn pasteboard_file_paths(pasteboard: &NSPasteboard) -> Vec<std::path::PathBuf> {
         }
     }
     paths
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClipboardChangeTracker;
+
+    #[test]
+    fn existing_clipboard_content_is_pending_for_a_new_session() {
+        let tracker = ClipboardChangeTracker::default();
+        assert!(tracker.is_pending(42));
+    }
+
+    #[test]
+    fn failed_clipboard_enqueue_remains_pending_until_delivery() {
+        let mut tracker = ClipboardChangeTracker::default();
+
+        tracker.record_attempt(42, false);
+        assert!(tracker.is_pending(42));
+
+        tracker.record_attempt(42, true);
+        assert!(!tracker.is_pending(42));
+    }
 }

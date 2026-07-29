@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.6.4" src="https://img.shields.io/badge/version-0.6.4-2f81f7">
+  <img alt="Version 0.6.7" src="https://img.shields.io/badge/version-0.6.7-2f81f7">
   <a href="LICENSE"><img alt="GNU AGPL v3.0" src="https://img.shields.io/badge/license-AGPLv3-3da639"></a>
   <img alt="macOS 11 or newer" src="https://img.shields.io/badge/macOS-11%2B-black">
   <img alt="Rust 1.89 or newer" src="https://img.shields.io/badge/Rust-1.89%2B-b7410e">
@@ -72,6 +72,10 @@ implementation and include narrowly scoped fixes for upstream issues.
 - **Clipboard and files** — bidirectional text and file copy/paste, including
   folders. File data streams on demand without an application-imposed size
   limit; clipboard access can be restricted or disabled per connection.
+- **External speech-to-text paste** — enable this option under **Settings →
+  Global** to accept the standard macOS Paste action from dictation tools,
+  wait for Windows to confirm the matching clipboard text, and insert it with
+  remote Ctrl+V.
 - **Remote audio** — play Windows audio on the Mac (default), leave it on the
   remote computer, or disable it per connection.
 - **Reliable keyboard input** — physical scan-code mapping supports non-US
@@ -172,8 +176,9 @@ unnotarized, which is unnecessary when running it on the Mac that built it.
 2. Under **Connection**, add an entry with **+**, configure it, and choose
    **Save**. **Revert** discards edits; switching with unsaved changes asks
    before continuing.
-3. Under **Global**, choose the SSH terminal, optional ⌘/⌥ swap, and whether
-   RDP123 starts at login.
+3. Under **Global**, choose the SSH terminal, optional ⌘/⌥ swap, external STT
+   paste support, and whether RDP123 starts at login. STT paste also requires
+   Local → Remote clipboard access on the connection.
 4. Select a saved connection from the menu:
    - **RDP with Password (NLA):** enter or retrieve the password, trust the new
      server key, and connect.
@@ -290,6 +295,9 @@ UI never speaks RDP.
   RDS farms and gateways may have rough edges.
 - Entra authentication currently targets the public Microsoft cloud; sovereign
   cloud endpoints are not configurable.
+- External speech-to-text shortcuts must not include the macOS modifier mapped
+  to the Windows key inside the session: ⌘ by default, or ⌥ when **Swap ⌘ and
+  ⌥** is enabled. Use a shortcut such as ⌃+⇧+A instead.
 - Experimental RDP 8 graphics can show compositing artifacts; Classic remains
   the reliable default.
 - Clipboard images, microphone input, multi-monitor, and console/admin sessions
