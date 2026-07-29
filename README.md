@@ -221,6 +221,28 @@ already does this.
 For PC key positions inside sessions, enable **Settings → Global → Swap ⌘ and
 ⌥**. Then ⌘ acts as Alt and ⌥ as the Windows key. It is off by default.
 
+### Hyper key opens Microsoft 365 Copilot or Office
+
+A macOS Hyper key commonly sends ⌘+⌃+⌥+⇧. In a Windows session, this becomes
+the Windows+Ctrl+Alt+Shift shortcut reserved for Microsoft Office. If pressing
+Hyper opens Microsoft 365 Copilot or Office, disable that shortcut for the
+current Windows user from PowerShell:
+
+```powershell
+reg add "HKCU\Software\Classes\ms-officeapp\Shell\Open\Command" /t REG_SZ /d rundll32 /f
+```
+
+Restart Windows Explorer, or sign out and back in, for the change to take
+effect. A reboot is not required. To restore the default behavior:
+
+```powershell
+reg delete "HKCU\Software\Classes\ms-officeapp\Shell" /f
+```
+
+Restart Windows Explorer, or sign out and back in, once more. This registry
+workaround is described in
+[Microsoft Q&A](https://learn.microsoft.com/en-us/answers/questions/4331341/disabling-the-office-hotkey-in-windows-10).
+
 ## Security
 
 - **Passwords:** macOS Keychain only; never profiles or logs.
