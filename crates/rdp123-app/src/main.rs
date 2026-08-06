@@ -2,7 +2,6 @@
 
 mod delegate;
 mod login_item;
-mod promise;
 mod settings;
 mod ui;
 mod view;

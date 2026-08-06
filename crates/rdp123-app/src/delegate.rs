@@ -595,7 +595,13 @@ impl AppDelegate {
                 max_attempts,
             } => controller.set_reconnecting(attempt, max_attempts),
             SessionEvent::ClipboardText(text) => controller.set_clipboard(&text),
-            SessionEvent::ClipboardFiles(items) => controller.offer_remote_files(items),
+            SessionEvent::ClipboardFilesPreparing { count } => {
+                controller.prepare_remote_files(count)
+            }
+            SessionEvent::ClipboardFilesReady(paths) => controller.offer_remote_files(paths),
+            SessionEvent::ClipboardFilesFailed(message) => {
+                controller.remote_file_preparation_failed(&message)
+            }
             SessionEvent::CertificateApproval {
                 fingerprint,
                 is_change,
