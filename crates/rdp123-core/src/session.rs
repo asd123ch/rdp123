@@ -28,7 +28,7 @@ use ironrdp::cliprdr::pdu::{
 };
 use ironrdp::cliprdr::{Client, CliprdrClient, CliprdrSvcMessages};
 use ironrdp::connector::connection_activation::{
-    ConnectionActivationSequence, ConnectionActivationState,
+    ConnectionActivationFactory, ConnectionActivationSequence, ConnectionActivationState,
 };
 use ironrdp::connector::sspi::{generator::NetworkRequest, ErrorKind as SspiErrorKind};
 use ironrdp::connector::{
@@ -52,7 +52,7 @@ use ironrdp::pdu::PduResult;
 use ironrdp::rdpdr::{NoopRdpdrBackend, Rdpdr};
 use ironrdp::rdpsnd::client::Rdpsnd;
 use ironrdp::session::image::DecodedImage;
-use ironrdp::session::{ActiveStage, ActiveStageOutput};
+use ironrdp::session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput};
 use ironrdp_tokio::{
     connect_begin, connect_finalize, mark_as_upgraded, single_sequence_step_read,
     split_tokio_framed, FramedWrite as _, NetworkClient, TokioFramed,
@@ -1590,7 +1590,18 @@ async fn run_session(
     }
     framebuffer.resize(width, height);
     let mut image = DecodedImage::new(PIXEL_FORMAT, width, height);
-    let mut active_stage = ActiveStage::new(connection_result);
+    let activation_factory = connection_result.activation_factory;
+    let mut active_stage = ActiveStageBuilder {
+        static_channels: connection_result.static_channels,
+        user_channel_id: connection_result.user_channel_id,
+        io_channel_id: connection_result.io_channel_id,
+        message_channel_id: connection_result.message_channel_id,
+        share_id: connection_result.share_id,
+        compression_type: connection_result.compression_type,
+        enable_server_pointer: connection_result.enable_server_pointer,
+        pointer_software_rendering: connection_result.pointer_software_rendering,
+    }
+    .build();
     let mut input_db = Database::new();
 
     // Split the stream so a write blocked on TCP backpressure can never stall
@@ -1632,6 +1643,7 @@ async fn run_session(
                 &out_tx,
                 &mut active_stage,
                 &mut image,
+                &activation_factory,
                 &mut input_db,
                 framebuffer,
                 local_clip,
@@ -1654,6 +1666,7 @@ async fn run_session(
                         &mut reader,
                         &out_tx,
                         &mut active_stage,
+                        &activation_factory,
                         &mut image,
                         framebuffer,
                         event_cb,
@@ -1682,7 +1695,8 @@ async fn run_session(
                 keys_down = update_keys_down(&cmd, keys_down);
                 match handle_command(
                     cmd, config, &mut reader, &out_tx, &mut active_stage, &mut image,
-                    &mut input_db, framebuffer, local_clip, &mut remote_clip, event_cb,
+                    &activation_factory, &mut input_db, framebuffer, local_clip,
+                    &mut remote_clip, event_cb,
                 ).await {
                     Ok(true) => break SessionEnd::UserQuit,
                     Ok(false) => {}
@@ -1700,6 +1714,7 @@ async fn run_session(
                             &out_tx,
                             &mut active_stage,
                             &mut image,
+                            &activation_factory,
                             &mut input_db,
                             framebuffer,
                             local_clip,
@@ -1749,7 +1764,7 @@ async fn run_session(
             {
                 match send_keepalive_tap(
                     &mut reader, &out_tx, &mut active_stage, &mut image,
-                    &mut input_db, framebuffer, event_cb,
+                    &activation_factory, &mut input_db, framebuffer, event_cb,
                 ).await {
                     Ok(true) => break SessionEnd::Disconnected(REMOTE_ENDED.to_string()),
                     Ok(false) => {}
@@ -1761,7 +1776,16 @@ async fn run_session(
             pdu = reader.read_pdu() => {
                 match pdu {
                     Ok((action, payload)) => match active_stage.process(&mut image, action, &payload) {
-                        Ok(outputs) => match drain_outputs(outputs, &mut reader, &out_tx, &mut active_stage, &mut image, framebuffer, event_cb).await {
+                        Ok(outputs) => match drain_outputs(
+                            outputs,
+                            &mut reader,
+                            &out_tx,
+                            &mut active_stage,
+                            &activation_factory,
+                            &mut image,
+                            framebuffer,
+                            event_cb,
+                        ).await {
                             Ok(true) => break SessionEnd::Disconnected(REMOTE_ENDED.to_string()),
                             Ok(false) => {}
                             Err(e) => break SessionEnd::Disconnected(format!("{e:#}")),
@@ -2092,6 +2116,7 @@ async fn handle_command(
     out_tx: &OutSender,
     active_stage: &mut ActiveStage,
     image: &mut DecodedImage,
+    activation_factory: &ConnectionActivationFactory,
     input_db: &mut Database,
     framebuffer: &SharedFramebuffer,
     local_clip: &LocalClipState,
@@ -2112,6 +2137,7 @@ async fn handle_command(
                     reader,
                     out_tx,
                     active_stage,
+                    activation_factory,
                     image,
                     framebuffer,
                     event_cb,
@@ -2182,6 +2208,7 @@ async fn handle_command(
                     reader,
                     out_tx,
                     active_stage,
+                    activation_factory,
                     image,
                     framebuffer,
                     event_cb,
@@ -2209,6 +2236,7 @@ async fn handle_clip_signal(
     out_tx: &OutSender,
     active_stage: &mut ActiveStage,
     image: &mut DecodedImage,
+    activation_factory: &ConnectionActivationFactory,
     input_db: &mut Database,
     framebuffer: &SharedFramebuffer,
     local_clip: &LocalClipState,
@@ -2245,6 +2273,7 @@ async fn handle_clip_signal(
                 out_tx,
                 active_stage,
                 image,
+                activation_factory,
                 input_db,
                 framebuffer,
                 event_cb,
@@ -2407,6 +2436,7 @@ async fn drain_outputs(
     reader: &mut SessionReader,
     out_tx: &OutSender,
     active_stage: &mut ActiveStage,
+    activation_factory: &ConnectionActivationFactory,
     image: &mut DecodedImage,
     framebuffer: &SharedFramebuffer,
     event_cb: &EventCb,
@@ -2425,9 +2455,9 @@ async fn drain_outputs(
                     height,
                 });
             }
-            ActiveStageOutput::DeactivateAll(cas) => {
+            ActiveStageOutput::DeactivateAll => {
                 reactivate(
-                    cas,
+                    activation_factory.create(),
                     reader,
                     out_tx,
                     active_stage,
@@ -2465,7 +2495,7 @@ async fn drain_outputs(
 /// Drive a Deactivation-Reactivation sequence (e.g. a server-side resolution
 /// change) to completion, then re-size local state to the new desktop.
 async fn reactivate(
-    mut cas: Box<ConnectionActivationSequence>,
+    mut cas: ConnectionActivationSequence,
     reader: &mut SessionReader,
     out_tx: &OutSender,
     active_stage: &mut ActiveStage,
@@ -2473,18 +2503,19 @@ async fn reactivate(
     framebuffer: &SharedFramebuffer,
     event_cb: &EventCb,
 ) -> Result<()> {
-    let (size, share_id) = loop {
+    let (size, share_id, enable_server_pointer) = loop {
         if let ConnectionActivationState::Finalized {
             desktop_size,
             share_id,
+            enable_server_pointer,
             ..
         } = cas.connection_activation_state()
         {
-            break (desktop_size, share_id);
+            break (desktop_size, share_id, enable_server_pointer);
         }
         // Read + step on the read half; queue any response for the writer task.
         let mut buf = WriteBuf::new();
-        single_sequence_step_read(reader, &mut *cas, &mut buf)
+        single_sequence_step_read(reader, &mut cas, &mut buf)
             .await
             .map_err(connector_err)?;
         if !buf.filled().is_empty() {
@@ -2506,6 +2537,7 @@ async fn reactivate(
     *image = DecodedImage::new(PIXEL_FORMAT, size.width, size.height);
     framebuffer.resize(size.width, size.height);
     active_stage.set_share_id(share_id);
+    active_stage.set_enable_server_pointer(enable_server_pointer);
     synchronize_initial_keyboard_state(active_stage, image, out_tx).await?;
     event_cb(SessionEvent::Resized {
         width: size.width,
@@ -2572,6 +2604,7 @@ async fn send_keepalive_tap(
     out_tx: &OutSender,
     active_stage: &mut ActiveStage,
     image: &mut DecodedImage,
+    activation_factory: &ConnectionActivationFactory,
     input_db: &mut Database,
     framebuffer: &SharedFramebuffer,
     event_cb: &EventCb,
@@ -2590,6 +2623,7 @@ async fn send_keepalive_tap(
         reader,
         out_tx,
         active_stage,
+        activation_factory,
         image,
         framebuffer,
         event_cb,
@@ -2621,6 +2655,7 @@ async fn send_remote_clipboard_paste(
     out_tx: &OutSender,
     active_stage: &mut ActiveStage,
     image: &mut DecodedImage,
+    activation_factory: &ConnectionActivationFactory,
     input_db: &mut Database,
     framebuffer: &SharedFramebuffer,
     event_cb: &EventCb,
@@ -2632,6 +2667,7 @@ async fn send_remote_clipboard_paste(
         reader,
         out_tx,
         active_stage,
+        activation_factory,
         image,
         framebuffer,
         event_cb,

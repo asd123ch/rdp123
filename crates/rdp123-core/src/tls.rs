@@ -91,8 +91,8 @@ where
         .ok_or_else(|| io::Error::other("peer certificate is missing"))?;
     let cert = x509_cert::Certificate::from_der(cert_der.as_ref()).map_err(io::Error::other)?;
     let public_key = cert
-        .tbs_certificate
-        .subject_public_key_info
+        .tbs_certificate()
+        .subject_public_key_info()
         .subject_public_key
         .as_bytes()
         .ok_or_else(|| io::Error::other("server certificate public key is not byte-aligned"))?

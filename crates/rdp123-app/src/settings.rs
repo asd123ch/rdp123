@@ -605,7 +605,7 @@ impl SettingsController {
         separator.setBoxType(NSBoxType::Separator);
         parent.addSubview(&separator);
 
-        // Libraries, two centered columns of clickable crates.io links.
+        // Direct runtime libraries, in two compact columns of crates.io links.
         let header = self.centered(mtm, parent, 408.0, 18.0, "Open Source Libraries");
         header.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
         let note = self.centered(
@@ -613,7 +613,7 @@ impl SettingsController {
             parent,
             388.0,
             15.0,
-            "Click a name to view it on crates.io.",
+            "Direct runtime dependencies — click a name to view it on crates.io.",
         );
         note.setFont(Some(&NSFont::systemFontOfSize(11.0)));
         self.muted(&note);
@@ -625,10 +625,11 @@ impl SettingsController {
             .collect();
         let rows = libs.len().div_ceil(2);
         for (i, (name, version)) in libs.iter().enumerate() {
-            let col_x = if i < rows { 130.0 } else { 390.0 };
-            let y = 356.0 - (i % rows) as f64 * 24.0;
-            self.link_button(mtm, parent, rect(col_x, y, 130.0, ROW_H), name);
-            let ver = self.label(mtm, parent, rect(col_x + 136.0, y, 80.0, ROW_H), version);
+            let col_x = if i < rows { 68.0 } else { 374.0 };
+            let y = 356.0 - (i % rows) as f64 * 19.0;
+            self.link_button(mtm, parent, rect(col_x, y, 176.0, 18.0), name);
+            let ver = self.label(mtm, parent, rect(col_x + 182.0, y, 82.0, 18.0), version);
+            ver.setFont(Some(&NSFont::systemFontOfSize(11.0)));
             self.muted(&ver);
         }
 
@@ -1144,6 +1145,7 @@ impl SettingsController {
         b.setFrame(f);
         b.setBordered(false);
         b.setAlignment(NSTextAlignment::Left);
+        b.setFont(Some(&NSFont::systemFontOfSize(11.0)));
         b.setContentTintColor(Some(&NSColor::linkColor()));
         parent.addSubview(&b);
     }

@@ -5,6 +5,7 @@
 //! to ad-hoc `-`). See the README for why a stable self-signed identity is
 //! preferable to ad-hoc for repeated Keychain access.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -82,6 +83,7 @@ fn workspace_root() -> PathBuf {
 
 fn bundle() -> Result<PathBuf> {
     let root = workspace_root();
+    let libraries = runtime_libraries(&root)?;
 
     // Make the app's build script rerun so the About tab's build time and commit
     // reflect this build.
@@ -89,13 +91,10 @@ fn bundle() -> Result<PathBuf> {
         .arg(root.join("crates/rdp123-app/build.rs"))
         .status();
 
-    run(Command::new(env!("CARGO")).current_dir(&root).args([
-        "build",
-        "--release",
-        "-p",
-        "rdp123-app",
-        "--locked",
-    ]))
+    run(Command::new(env!("CARGO"))
+        .current_dir(&root)
+        .args(["build", "--release", "-p", "rdp123-app", "--locked"])
+        .env("RDP123_LIBS", libraries))
     .context("cargo build failed")?;
 
     let bin = root.join("target/release").join(BIN_NAME);
@@ -133,6 +132,62 @@ fn bundle() -> Result<PathBuf> {
     println!("\nBundled: {}", app.display());
     println!("Install: cargo xtask install   (into /Applications, single copy)");
     Ok(app)
+}
+
+fn runtime_libraries(root: &Path) -> Result<String> {
+    let output = Command::new(env!("CARGO"))
+        .current_dir(root)
+        .args([
+            "tree",
+            "--locked",
+            "--edges",
+            "normal",
+            "--prefix",
+            "depth",
+            "--depth",
+            "1",
+            "--no-dedupe",
+            "--format",
+            "{p}",
+            "-p",
+            "rdp123-app",
+            "-p",
+            "rdp123-core",
+        ])
+        .output()
+        .context("running cargo tree for About metadata")?;
+    if !output.status.success() {
+        bail!(
+            "cargo tree failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let tree = String::from_utf8(output.stdout).context("cargo tree output was not UTF-8")?;
+    Ok(parse_runtime_libraries(&tree))
+}
+
+fn parse_runtime_libraries(tree: &str) -> String {
+    let mut libraries = BTreeMap::new();
+    for line in tree.lines() {
+        let Some(package) = line.strip_prefix('1') else {
+            continue;
+        };
+        let mut fields = package.split_whitespace();
+        let (Some(name), Some(version)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if name == "rdp123-core" {
+            continue;
+        }
+        if let Some(version) = version.strip_prefix('v') {
+            libraries.insert(name, version);
+        }
+    }
+    libraries
+        .into_iter()
+        .map(|(name, version)| format!("{name} {version}"))
+        .collect::<Vec<_>>()
+        .join(";")
 }
 
 /// The stable self-signed identity created by `scripts/make-signing-identity.sh`.
@@ -294,4 +349,27 @@ fn run(cmd: &mut Command) -> Result<()> {
         bail!("command {cmd:?} exited with {status}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_libraries_keep_direct_external_packages_once() {
+        let tree = "\
+0rdp123-app v0.6.10 (/workspace/crates/rdp123-app)\n\
+1objc2 v0.6.4\n\
+1rdp123-core v0.6.10 (/workspace/crates/rdp123-core)\n\
+1tokio v1.53.1\n\
+\n\
+0rdp123-core v0.6.10 (/workspace/crates/rdp123-core)\n\
+1anyhow v1.0.104\n\
+1tokio v1.53.1\n";
+
+        assert_eq!(
+            parse_runtime_libraries(tree),
+            "anyhow 1.0.104;objc2 0.6.4;tokio 1.53.1"
+        );
+    }
 }
