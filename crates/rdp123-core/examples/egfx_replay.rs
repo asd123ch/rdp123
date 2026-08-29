@@ -297,7 +297,7 @@ fn write_framebuffer(framebuffer: &SharedFramebuffer, path: &std::path::Path) {
     };
     let mut out = Vec::with_capacity(pixels.len() / 4 * 3 + 32);
     out.extend_from_slice(format!("P6\n{width} {height}\n255\n").as_bytes());
-    for px in pixels.chunks_exact(4) {
+    for px in pixels.as_chunks::<4>().0 {
         out.extend_from_slice(&[px[2], px[1], px[0]]);
     }
     std::fs::write(path, out).expect("write ppm");

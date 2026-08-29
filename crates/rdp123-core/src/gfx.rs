@@ -219,7 +219,7 @@ impl GfxHandler {
         let written = self.framebuffer.with_pixels(|pixels, width, height| {
             let mut out = Vec::with_capacity(pixels.len() / 4 * 3 + 32);
             out.extend_from_slice(format!("P6\n{width} {height}\n255\n").as_bytes());
-            for px in pixels.chunks_exact(4) {
+            for px in pixels.as_chunks::<4>().0 {
                 out.extend_from_slice(&[px[2], px[1], px[0]]);
             }
             std::fs::write(&path, out)
@@ -274,7 +274,12 @@ impl GfxHandler {
         for row in 0..h {
             let src_row = &rgba[row * src_stride..row * src_stride + w * BPP];
             let dst_row = &mut bgra[row * w * BPP..(row + 1) * w * BPP];
-            for (dst, src) in dst_row.chunks_exact_mut(BPP).zip(src_row.chunks_exact(BPP)) {
+            for (dst, src) in dst_row
+                .as_chunks_mut::<BPP>()
+                .0
+                .iter_mut()
+                .zip(src_row.as_chunks::<BPP>().0.iter())
+            {
                 dst[0] = src[2];
                 dst[1] = src[1];
                 dst[2] = src[0];
@@ -466,7 +471,12 @@ impl GfxHandler {
                         }
                         self.planar_regions += 1;
                         let mut bgra = vec![0u8; usize::from(w) * usize::from(h) * BPP];
-                        for (dst, src) in bgra.chunks_exact_mut(BPP).zip(rgb.chunks_exact(3)) {
+                        for (dst, src) in bgra
+                            .as_chunks_mut::<BPP>()
+                            .0
+                            .iter_mut()
+                            .zip(rgb.as_chunks::<3>().0.iter())
+                        {
                             dst[0] = src[2];
                             dst[1] = src[1];
                             dst[2] = src[0];
@@ -733,7 +743,7 @@ impl GraphicsPipelineHandler for GfxHandler {
             let (left, top, right, bottom) = surface.clamp(rect);
             for y in top..bottom {
                 let row = &mut surface.pixels[y * stride + left * BPP..y * stride + right * BPP];
-                for px in row.chunks_exact_mut(BPP) {
+                for px in row.as_chunks_mut::<BPP>().0 {
                     px[0] = b;
                     px[1] = g;
                     px[2] = r;
@@ -953,7 +963,12 @@ impl GraphicsPipelineHandler for GfxHandler {
                         let src_start = ((src_y + row) * TILE + src_x) * BPP;
                         let src = &tile.pixels[src_start..src_start + w * BPP];
                         let dst = &mut bgra[row * w * BPP..(row + 1) * w * BPP];
-                        for (d, s) in dst.chunks_exact_mut(BPP).zip(src.chunks_exact(BPP)) {
+                        for (d, s) in dst
+                            .as_chunks_mut::<BPP>()
+                            .0
+                            .iter_mut()
+                            .zip(src.as_chunks::<BPP>().0.iter())
+                        {
                             d[0] = s[2];
                             d[1] = s[1];
                             d[2] = s[0];

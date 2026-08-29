@@ -26,7 +26,7 @@ pub fn parse_mac(value: &str) -> Option<[u8; 6]> {
 pub fn send_magic_packet(mac: [u8; 6]) -> std::io::Result<()> {
     let mut payload = [0u8; 6 + 16 * 6];
     payload[..6].fill(0xFF);
-    for repeat in payload[6..].chunks_exact_mut(6) {
+    for repeat in payload[6..].as_chunks_mut::<6>().0 {
         repeat.copy_from_slice(&mac);
     }
     let socket = UdpSocket::bind(("0.0.0.0", 0))?;
@@ -62,7 +62,7 @@ mod tests {
         let mac = [1, 2, 3, 4, 5, 6];
         let mut payload = [0u8; 102];
         payload[..6].fill(0xFF);
-        for repeat in payload[6..].chunks_exact_mut(6) {
+        for repeat in payload[6..].as_chunks_mut::<6>().0 {
             repeat.copy_from_slice(&mac);
         }
         assert_eq!(&payload[..6], &[0xFF; 6]);
