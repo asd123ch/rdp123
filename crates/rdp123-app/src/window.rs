@@ -12,11 +12,11 @@ use objc2::{
     define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, Message,
 };
 use objc2_app_kit::{
-    NSAlert, NSAlertStyle, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSFont,
-    NSLineBreakMode, NSModalResponse, NSPasteboard, NSPasteboardItem, NSPasteboardTypeFileURL,
-    NSPasteboardTypeString, NSPasteboardWriting, NSProgressIndicator, NSProgressIndicatorStyle,
-    NSScreen, NSTextField, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow,
-    NSWindowDelegate, NSWindowStyleMask,
+    NSAlert, NSAlertStyle, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSEvent,
+    NSEventModifierFlags, NSFont, NSLineBreakMode, NSModalResponse, NSPasteboard, NSPasteboardItem,
+    NSPasteboardTypeFileURL, NSPasteboardTypeString, NSPasteboardWriting, NSProgressIndicator,
+    NSProgressIndicatorStyle, NSScreen, NSTextField, NSTrackingArea, NSTrackingAreaOptions, NSView,
+    NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{NSNotification, NSObjectProtocol, NSString, NSTimer, NSURL};
 use objc2_quartz_core::kCAFilterLinear;
@@ -35,10 +35,92 @@ const CLIPBOARD_STATUS_SECONDS: f64 = 10.0;
 const TERMINAL_SHEET_AUTO_CLOSE_SECONDS: f64 = 5.0 * 60.0;
 const DEFAULT_CONTENT_W: f64 = 1280.0;
 const DEFAULT_CONTENT_H: f64 = 800.0;
+const TAB_KEYCODE: u16 = 0x30;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionKeyDownAction {
+    AppKit,
+    Forward,
+    Pulse,
+}
+
+fn session_key_down_action(keycode: u16, modifier_flags: usize) -> SessionKeyDownAction {
+    if keycode == TAB_KEYCODE && modifier_flags & NSEventModifierFlags::Control.0 != 0 {
+        SessionKeyDownAction::Forward
+    } else if modifier_flags & NSEventModifierFlags::Command.0 != 0 {
+        SessionKeyDownAction::Pulse
+    } else {
+        SessionKeyDownAction::AppKit
+    }
+}
 
 #[derive(Debug, Default)]
 struct ClipboardChangeTracker {
     delivered_change_count: Option<isize>,
+}
+
+#[derive(Default)]
+struct SessionWindowIvars {
+    view: RefCell<Option<Retained<RdpView>>>,
+}
+
+define_class!(
+    #[unsafe(super(NSWindow))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "RDP123SessionWindow"]
+    #[ivars = SessionWindowIvars]
+    struct SessionWindow;
+
+    impl SessionWindow {
+        #[unsafe(method(sendEvent:))]
+        fn send_event(&self, event: &NSEvent) {
+            // AppKit reserves Control-Tab for key-view focus and may omit key-up
+            // events while Command is held, so handle both cases before super.
+            if event.r#type() == objc2_app_kit::NSEventType::KeyDown {
+                let keycode = event.keyCode();
+                let view = self.ivars().view.borrow().clone();
+                if let Some(view) = view {
+                    match session_key_down_action(keycode, event.modifierFlags().0) {
+                        SessionKeyDownAction::Forward => {
+                            view.forward_key_down(keycode);
+                            return;
+                        }
+                        SessionKeyDownAction::Pulse => {
+                            view.forward_key_pulse(keycode);
+                            return;
+                        }
+                        SessionKeyDownAction::AppKit => {}
+                    }
+                }
+            }
+            unsafe {
+                let _: () = msg_send![super(self), sendEvent: event];
+            }
+        }
+    }
+);
+
+impl SessionWindow {
+    fn new(
+        mtm: MainThreadMarker,
+        frame: objc2_foundation::NSRect,
+        style: NSWindowStyleMask,
+    ) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(SessionWindowIvars::default());
+        unsafe {
+            msg_send![
+                super(this),
+                initWithContentRect: frame,
+                styleMask: style,
+                backing: NSBackingStoreType::Buffered,
+                defer: false
+            ]
+        }
+    }
+
+    fn set_rdp_view(&self, view: &RdpView) {
+        *self.ivars().view.borrow_mut() = Some(view.retain());
+    }
 }
 
 impl ClipboardChangeTracker {
@@ -59,7 +141,7 @@ impl ClipboardChangeTracker {
 
 #[derive(Default)]
 pub struct WindowControllerIvars {
-    window: RefCell<Option<Retained<NSWindow>>>,
+    window: RefCell<Option<Retained<SessionWindow>>>,
     view: RefCell<Option<Retained<RdpView>>>,
     handle: RefCell<Option<SessionHandle>>,
     timer: RefCell<Option<Retained<NSTimer>>>,
@@ -238,20 +320,13 @@ impl WindowController {
             | NSWindowStyleMask::Miniaturizable
             | NSWindowStyleMask::Resizable;
         let frame = ui::rect(content_width, content_height);
-        let window = unsafe {
-            NSWindow::initWithContentRect_styleMask_backing_defer(
-                NSWindow::alloc(mtm),
-                frame,
-                style,
-                NSBackingStoreType::Buffered,
-                false,
-            )
-        };
+        let window = SessionWindow::new(mtm, frame, style);
         window.setTitle(&NSString::from_str(&format!("{title} — connecting…")));
         unsafe { window.setReleasedWhenClosed(false) };
         window.setAcceptsMouseMovedEvents(true);
 
         let view = RdpView::new(mtm, ui::rect(content_width, content_height));
+        window.set_rdp_view(&view);
         view.set_external_stt_paste_enabled(
             external_stt_paste && opts.clipboard.allow_local_to_remote(),
         );
@@ -854,6 +929,39 @@ impl WindowController {
             .clipboard_tracker
             .borrow_mut()
             .record_attempt(count, true);
+    }
+}
+
+#[cfg(test)]
+mod keyboard_tests {
+    use super::{session_key_down_action, SessionKeyDownAction, TAB_KEYCODE};
+    use objc2_app_kit::NSEventModifierFlags;
+
+    #[test]
+    fn control_tab_is_forwarded_before_appkit_changes_focus() {
+        assert_eq!(
+            session_key_down_action(TAB_KEYCODE, NSEventModifierFlags::Control.0),
+            SessionKeyDownAction::Forward
+        );
+        assert_eq!(
+            session_key_down_action(
+                TAB_KEYCODE,
+                NSEventModifierFlags::Control.0 | NSEventModifierFlags::Shift.0,
+            ),
+            SessionKeyDownAction::Forward
+        );
+    }
+
+    #[test]
+    fn command_modified_keys_are_pulsed_before_appkit_drops_key_up() {
+        assert_eq!(
+            session_key_down_action(0x0f, NSEventModifierFlags::Command.0),
+            SessionKeyDownAction::Pulse
+        );
+        assert_eq!(
+            session_key_down_action(0x30, NSEventModifierFlags::Option.0),
+            SessionKeyDownAction::AppKit
+        );
     }
 }
 

@@ -45,7 +45,25 @@ define_class!(
     unsafe impl NSMenuItemValidation for RdpView {
         #[unsafe(method(validateMenuItem:))]
         fn validate_menu_item(&self, item: &NSMenuItem) -> bool {
-            item.action() == Some(sel!(paste:)) && self.external_stt_pasteboard_text().is_some()
+            let action = item.action();
+            if action == Some(sel!(paste:)) {
+                if self.ivars().external_stt_paste_enabled.get() {
+                    self.external_stt_pasteboard_text().is_some()
+                } else {
+                    self.command_modifier_pressed()
+                }
+            } else {
+                self.command_modifier_pressed()
+                    && matches!(
+                        action,
+                        Some(action)
+                            if action == sel!(undo:)
+                                || action == sel!(redo:)
+                                || action == sel!(cut:)
+                                || action == sel!(copy:)
+                                || action == sel!(selectAll:)
+                    )
+            }
         }
     }
 
@@ -62,23 +80,12 @@ define_class!(
 
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
-            let (events, external_paste) = self.ivars().input_routing.borrow_mut().key_down(
-                event.keyCode(),
-                self.ivars().external_stt_paste_enabled.get(),
-            );
-            self.send(events);
-            if external_paste {
-                self.submit_external_stt_paste();
-            }
+            self.forward_key_down(event.keyCode());
         }
 
         #[unsafe(method(keyUp:))]
         fn key_up(&self, event: &NSEvent) {
-            let events = self.ivars().input_routing.borrow_mut().key_up(
-                event.keyCode(),
-                self.ivars().external_stt_paste_enabled.get(),
-            );
-            self.send(events);
+            self.forward_key_up(event.keyCode());
         }
 
         #[unsafe(method(flagsChanged:))]
@@ -107,15 +114,47 @@ define_class!(
 
         #[unsafe(method(paste:))]
         fn paste(&self, _sender: Option<&AnyObject>) {
+            if !self.ivars().external_stt_paste_enabled.get() {
+                self.forward_menu_shortcut(V_KEYCODE);
+                return;
+            }
+            if self.external_stt_pasteboard_text().is_none() {
+                return;
+            }
             let (events, submit) = self
                 .ivars()
                 .input_routing
                 .borrow_mut()
-                .paste_invoked(self.ivars().external_stt_paste_enabled.get());
+                .paste_invoked(true);
             self.send(events);
             if submit {
                 self.submit_external_stt_paste();
             }
+        }
+
+        #[unsafe(method(undo:))]
+        fn undo(&self, _sender: Option<&AnyObject>) {
+            self.forward_menu_shortcut(Z_KEYCODE);
+        }
+
+        #[unsafe(method(redo:))]
+        fn redo(&self, _sender: Option<&AnyObject>) {
+            self.forward_menu_shortcut(Z_KEYCODE);
+        }
+
+        #[unsafe(method(cut:))]
+        fn cut(&self, _sender: Option<&AnyObject>) {
+            self.forward_menu_shortcut(X_KEYCODE);
+        }
+
+        #[unsafe(method(copy:))]
+        fn copy(&self, _sender: Option<&AnyObject>) {
+            self.forward_menu_shortcut(C_KEYCODE);
+        }
+
+        #[unsafe(method(selectAll:))]
+        fn select_all(&self, _sender: Option<&AnyObject>) {
+            self.forward_menu_shortcut(A_KEYCODE);
         }
 
         #[unsafe(method(mouseDown:))]
@@ -208,6 +247,54 @@ impl RdpView {
 
     pub fn set_external_stt_paste_enabled(&self, enabled: bool) {
         self.ivars().external_stt_paste_enabled.set(enabled);
+    }
+
+    pub fn forward_key_down(&self, keycode: u16) {
+        let (events, external_paste) = self
+            .ivars()
+            .input_routing
+            .borrow_mut()
+            .key_down(keycode, self.ivars().external_stt_paste_enabled.get());
+        self.send(events);
+        if external_paste {
+            self.submit_external_stt_paste();
+        }
+    }
+
+    pub fn forward_key_up(&self, keycode: u16) {
+        let events = self
+            .ivars()
+            .input_routing
+            .borrow_mut()
+            .key_up(keycode, self.ivars().external_stt_paste_enabled.get());
+        self.send(events);
+    }
+
+    pub fn forward_key_pulse(&self, keycode: u16) {
+        let (events, external_paste) = self
+            .ivars()
+            .input_routing
+            .borrow_mut()
+            .key_pulse(keycode, self.ivars().external_stt_paste_enabled.get());
+        self.send(events);
+        if external_paste {
+            self.submit_external_stt_paste();
+        }
+    }
+
+    fn command_modifier_pressed(&self) -> bool {
+        self.ivars()
+            .input_routing
+            .borrow()
+            .pressed_modifiers
+            .iter()
+            .any(|keycode| is_command_key(*keycode))
+    }
+
+    fn forward_menu_shortcut(&self, keycode: u16) {
+        if self.command_modifier_pressed() {
+            self.forward_key_pulse(keycode);
+        }
     }
 
     fn external_stt_pasteboard_text(&self) -> Option<String> {
@@ -451,6 +538,16 @@ impl InputRoutingState {
         }]
     }
 
+    fn key_pulse(
+        &mut self,
+        keycode: u16,
+        external_stt_paste_enabled: bool,
+    ) -> (Vec<InputEvent>, bool) {
+        let (mut events, external_paste) = self.key_down(keycode, external_stt_paste_enabled);
+        events.extend(self.key_up(keycode, external_stt_paste_enabled));
+        (events, external_paste)
+    }
+
     fn paste_invoked(&mut self, external_stt_paste_enabled: bool) -> (Vec<InputEvent>, bool) {
         if !external_stt_paste_enabled {
             return (Vec::new(), false);
@@ -509,7 +606,11 @@ impl InputRoutingState {
 
 const LEFT_COMMAND_KEYCODE: u16 = 0x37;
 const RIGHT_COMMAND_KEYCODE: u16 = 0x36;
+const A_KEYCODE: u16 = 0x00;
+const C_KEYCODE: u16 = 0x08;
 const V_KEYCODE: u16 = 0x09;
+const X_KEYCODE: u16 = 0x07;
+const Z_KEYCODE: u16 = 0x06;
 
 fn is_command_key(keycode: u16) -> bool {
     matches!(keycode, LEFT_COMMAND_KEYCODE | RIGHT_COMMAND_KEYCODE)
@@ -617,6 +718,40 @@ mod tests {
                 InputEvent::Key {
                     keycode: 0x08,
                     down: true
+                }
+            ]
+        ));
+        assert!(matches!(
+            routing.modifier_changed(0x37, false, true).as_slice(),
+            [InputEvent::Key {
+                keycode: 0x37,
+                down: false
+            }]
+        ));
+    }
+
+    #[test]
+    fn appkit_command_shortcuts_include_the_missing_key_release() {
+        let mut routing = InputRoutingState::default();
+        assert!(routing.modifier_changed(0x37, true, true).is_empty());
+
+        let (events, external_paste) = routing.key_pulse(0x0f, true);
+
+        assert!(!external_paste);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                InputEvent::Key {
+                    keycode: 0x37,
+                    down: true
+                },
+                InputEvent::Key {
+                    keycode: 0x0f,
+                    down: true
+                },
+                InputEvent::Key {
+                    keycode: 0x0f,
+                    down: false
                 }
             ]
         ));
