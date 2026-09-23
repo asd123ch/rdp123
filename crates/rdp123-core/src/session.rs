@@ -1885,16 +1885,19 @@ async fn connect(
             drdynvc.with_dynamic_channel(crate::audio::RdpsndDvcChannel::new(player.handler()));
     }
     if config.graphics == GraphicsMode::Egfx {
-        // H.264 decode failing to initialize is not fatal: the pipeline still
-        // renders uncompressed updates, and the server prefers AVC only when
-        // the (filtered) capabilities advertise it.
-        let decoder = match ironrdp_egfx::decode::OpenH264Decoder::new() {
-            Ok(d) => Some(Box::new(d) as Box<dyn ironrdp_egfx::decode::H264Decoder>),
-            Err(e) => {
-                tracing::warn!("egfx: H.264 decoder unavailable ({e}); using fallback caps");
-                None
-            }
-        };
+        // H.264 decodes with VideoToolbox (the hardware decoder where there
+        // is one), switching to OpenH264 if VideoToolbox can't decode the
+        // stream. `RDP123_H264=openh264` uses OpenH264 from the start.
+        let decoder: Box<dyn ironrdp_egfx::decode::H264Decoder> =
+            if std::env::var_os("RDP123_H264").is_some_and(|v| v == "openh264") {
+                tracing::info!("egfx: H.264 decoding with OpenH264 (RDP123_H264)");
+                Box::new(
+                    ironrdp_egfx::decode::OpenH264Decoder::new().expect("bundled OpenH264 decoder"),
+                )
+            } else {
+                Box::new(crate::videotoolbox::VideoToolboxDecoder::new())
+            };
+        let decoder = Some(decoder);
         let handler = crate::gfx::GfxHandler::new(framebuffer.clone(), gfx_tx);
         drdynvc = drdynvc.with_dynamic_channel(ironrdp_egfx::client::GraphicsPipelineClient::new(
             Box::new(handler),
