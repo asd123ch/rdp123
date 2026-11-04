@@ -424,6 +424,9 @@ pub struct Settings {
     /// to the space bar) and ⌥ sends the Windows key. Off by default.
     #[serde(default)]
     pub swap_cmd_alt: bool,
+    /// Translate common physical Command shortcuts to Control. Off by default.
+    #[serde(default)]
+    pub mac_shortcuts: bool,
     /// Support external speech-to-text tools that paste through macOS. When
     /// enabled, RDP123 synchronizes the clipboard before sending remote Ctrl+V.
     #[serde(default)]
@@ -588,6 +591,33 @@ impl ProfileStore {
         Ok(())
     }
 
+    /// Preserve fields updated by live sessions while Settings was open.
+    pub fn save_settings_document(
+        &self,
+        original: &Document,
+        edited: &Document,
+    ) -> Result<Document> {
+        let current = self.load_document()?;
+        let mut merged = edited.clone();
+        for connection in &mut merged.connections {
+            let Some(before) = original.connections.iter().find(|c| c.id == connection.id) else {
+                continue;
+            };
+            let latest = current
+                .connections
+                .iter()
+                .find(|c| c.id == connection.id)
+                .context("connection was removed while Settings was open; reopen Settings")?;
+            connection.cert_fingerprint = latest.cert_fingerprint.clone();
+            connection.rdp.last_window_size = latest.rdp.last_window_size;
+            if connection.rdp.password_policy == before.rdp.password_policy {
+                connection.rdp.password_policy = latest.rdp.password_policy;
+            }
+        }
+        self.save_document(&merged)?;
+        Ok(merged)
+    }
+
     /// Load just the connection list.
     pub fn load(&self) -> Result<Vec<Connection>> {
         Ok(self.load_document()?.connections)
@@ -638,6 +668,77 @@ impl ProfileStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remembered_password_survives_settings_saves_until_explicitly_changed() {
+        let (store, dir) = test_store();
+        let mut original = Document::default();
+        let mut connection = Connection::new("Example", ConnectionKind::Rdp);
+        connection.host = "example.test".into();
+        connection.rdp.password_policy = PasswordPolicy::AlwaysAsk;
+        let id = connection.id.clone();
+        original.connections.push(connection);
+        store.save_document(&original).unwrap();
+        store
+            .set_password_policy(&id, PasswordPolicy::Remember)
+            .unwrap();
+
+        let mut edited = original.clone();
+        edited.settings.mac_shortcuts = true;
+        let saved = store.save_settings_document(&original, &edited).unwrap();
+        assert_eq!(
+            saved.connections[0].rdp.password_policy,
+            PasswordPolicy::Remember
+        );
+        let mut renamed = saved.clone();
+        renamed.connections[0].name = "Renamed".into();
+        let saved = store.save_settings_document(&saved, &renamed).unwrap();
+        assert_eq!(
+            saved.connections[0].rdp.password_policy,
+            PasswordPolicy::Remember
+        );
+
+        let mut explicit = saved.clone();
+        explicit.connections[0].rdp.password_policy = PasswordPolicy::AlwaysAsk;
+        let saved = store.save_settings_document(&saved, &explicit).unwrap();
+        assert_eq!(
+            saved.connections[0].rdp.password_policy,
+            PasswordPolicy::AlwaysAsk
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn settings_edits_preserve_session_metadata() {
+        let (store, dir) = test_store();
+        let mut original = Document::default();
+        let mut connection = Connection::new("Example", ConnectionKind::Rdp);
+        connection.host = "example.test".into();
+        let id = connection.id.clone();
+        original.connections.push(connection);
+        store.save_document(&original).unwrap();
+        store.set_fingerprint(&id, "trusted-key").unwrap();
+        store.set_last_window_size(&id, (1400, 900)).unwrap();
+        store
+            .set_password_policy(&id, PasswordPolicy::AlwaysAsk)
+            .unwrap();
+        let mut edited = original.clone();
+        edited.settings.mac_shortcuts = true;
+        edited.connections[0].name = "Renamed".into();
+        let saved = store.save_settings_document(&original, &edited).unwrap();
+        assert_eq!(
+            saved.connections[0].cert_fingerprint.as_deref(),
+            Some("trusted-key")
+        );
+        assert_eq!(saved.connections[0].rdp.last_window_size, Some((1400, 900)));
+        assert_eq!(
+            saved.connections[0].rdp.password_policy,
+            PasswordPolicy::AlwaysAsk
+        );
+        assert_eq!(saved.connections[0].name, "Renamed");
+        assert!(saved.settings.mac_shortcuts);
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn username_preflight_only_requires_a_name_for_password_authentication() {
@@ -815,6 +916,19 @@ mod tests {
         let restored: Document = serde_json::from_str(&json).unwrap();
 
         assert!(restored.settings.external_stt_paste);
+    }
+
+    #[test]
+    fn mac_shortcuts_default_off_and_round_trip_when_enabled() {
+        let mut document: Document =
+            serde_json::from_str(r#"{"version":1,"connections":[],"settings":{}}"#).unwrap();
+        assert!(!document.settings.mac_shortcuts);
+        assert!(!Document::default().settings.mac_shortcuts);
+
+        document.settings.mac_shortcuts = true;
+        let restored: Document =
+            serde_json::from_str(&serde_json::to_string(&document).unwrap()).unwrap();
+        assert!(restored.settings.mac_shortcuts);
     }
 
     #[test]

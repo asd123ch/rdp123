@@ -44,25 +44,31 @@ fn lsregister(args: &[&str]) {
 fn install() -> Result<()> {
     let app = bundle()?;
     let dest = Path::new("/Applications").join(format!("{APP_NAME}.app"));
+    let stage_root = dest
+        .parent()
+        .unwrap()
+        .join(format!(".rdp123-install-{}", std::process::id()));
+    fs::create_dir(&stage_root).context("creating installation staging directory")?;
+    let staged = stage_root.join(format!("{APP_NAME}.app"));
+    let prepared = run(Command::new("cp").arg("-R").arg(&app).arg(&staged))
+        .context("staging the new app")
+        .and_then(|()| {
+            run(Command::new("codesign")
+                .args(["--verify", "--deep", "--strict"])
+                .arg(&staged))
+        });
+    if let Err(error) = prepared {
+        let _ = fs::remove_dir_all(&stage_root);
+        return Err(error.context("the installed app was left unchanged"));
+    }
 
     // Quit a running instance so the copy can replace it.
     let _ = Command::new("pkill")
         .args(["-f", "RDP123.app/Contents/MacOS"])
         .status();
 
-    if dest.exists() {
-        fs::remove_dir_all(&dest).ok();
-    }
-    // `cp -R` would MERGE into a leftover bundle, producing a mixed-version app
-    // with a broken signature — refuse instead.
-    if dest.exists() {
-        bail!(
-            "could not remove the old {} — close the app and remove it manually",
-            dest.display()
-        );
-    }
-    run(Command::new("cp").arg("-R").arg(&app).arg("/Applications/"))
-        .context("copying app into /Applications")?;
+    replace_staged_app(&staged, &dest, &stage_root.join("previous.app"))?;
+    fs::remove_dir_all(&stage_root).context("removing the installation staging directory")?;
 
     // Keep exactly one registered copy.
     lsregister(&["-u", &app.to_string_lossy()]);
@@ -71,6 +77,25 @@ fn install() -> Result<()> {
 
     println!("Installed: {}", dest.display());
     println!("Launch:  open {}", dest.display());
+    Ok(())
+}
+
+fn replace_staged_app(staged: &Path, dest: &Path, backup: &Path) -> Result<()> {
+    let had_previous = dest.exists();
+    if had_previous {
+        fs::rename(dest, backup).context("backing up the installed app")?;
+    }
+    if let Err(error) = fs::rename(staged, dest) {
+        if had_previous {
+            fs::rename(backup, dest).with_context(|| {
+                format!(
+                    "installation failed ({error}); restore the previous app from {}",
+                    backup.display()
+                )
+            })?;
+        }
+        return Err(error).context("installing the staged app; the previous app was preserved");
+    }
     Ok(())
 }
 
@@ -393,6 +418,32 @@ fn run(cmd: &mut Command) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_replacement_restores_the_installed_app() {
+        let root = env::temp_dir().join(format!("rdp123-install-test-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let dest = root.join("installed.app");
+        fs::create_dir(&dest).unwrap();
+        fs::write(dest.join("version"), "previous").unwrap();
+        assert!(
+            replace_staged_app(&root.join("missing.app"), &dest, &root.join("backup.app")).is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(dest.join("version")).unwrap(),
+            "previous"
+        );
+        let staged = root.join("staged.app");
+        fs::create_dir(&staged).unwrap();
+        fs::write(staged.join("version"), "new").unwrap();
+        replace_staged_app(&staged, &dest, &root.join("backup.app")).unwrap();
+        assert_eq!(fs::read_to_string(dest.join("version")).unwrap(), "new");
+        assert_eq!(
+            fs::read_to_string(root.join("backup.app/version")).unwrap(),
+            "previous"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn build_path_remapping_preserves_existing_flags_and_spaces() {

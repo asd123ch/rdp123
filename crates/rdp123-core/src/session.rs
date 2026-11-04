@@ -97,7 +97,7 @@ const CLIPBOARD_TIMEOUT_TICK: Duration = Duration::from_secs(5);
 /// requests its data after the injected Ctrl+V.
 const EXTERNAL_PASTE_DATA_TIMEOUT: Duration = Duration::from_secs(10);
 /// Cap on the number of files offered to the remote clipboard in one copy
-/// (folders are walked recursively; a runaway selection is truncated).
+/// (folders are walked recursively; oversized selections are rejected).
 const MAX_CLIPBOARD_FILES: usize = 4096;
 /// Cap on a single FileContents chunk we are willing to serve.
 const MAX_FILE_CHUNK_BYTES: u32 = 16 * 1024 * 1024;
@@ -105,6 +105,7 @@ const MAX_FILE_CHUNK_BYTES: u32 = 16 * 1024 * 1024;
 /// across all open sessions. Responses wait for queue capacity instead of
 /// being dropped when Windows pipelines multiple requests.
 static LOCAL_FILE_READ_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+static LOCAL_FILE_REQUEST_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(128);
 /// Idle keep-alive: how long a session must be free of real user input before
 /// an invisible F15 tap is injected. 30 s sits well under the one-minute
 /// minimum of a Windows idle-session policy, so the keep-alive always wins the
@@ -125,6 +126,10 @@ enum LocalClip {
     Empty,
     Text(String),
     Files(Vec<LocalClipFile>),
+    PendingFiles {
+        id: uuid::Uuid,
+        paths: Vec<std::path::PathBuf>,
+    },
 }
 
 #[derive(Debug)]
@@ -138,6 +143,8 @@ enum LocalClipboardOffer {
 /// considered delivered until its matching response is `Ok`.
 #[derive(Debug, Default)]
 struct LocalClipboardState {
+    rejected_file_requests: Vec<u32>,
+    remote_file_response_lost: bool,
     clip: LocalClip,
     /// Latest ordinary macOS clipboard update observed while a confirmed STT
     /// paste still needs the dictated text to remain active remotely.
@@ -199,6 +206,8 @@ impl LocalClipboardState {
     }
 
     fn reset_connection(&mut self) {
+        self.rejected_file_requests.clear();
+        self.remote_file_response_lost = false;
         self.in_flight = None;
         self.ready = false;
         self.bootstrap_in_flight = false;
@@ -219,7 +228,10 @@ impl LocalClipboardState {
         if self.ready || self.bootstrap_in_flight || self.in_flight.is_some() {
             return None;
         }
-        if matches!(self.clip, LocalClip::Files(_)) {
+        if matches!(
+            self.clip,
+            LocalClip::Files(_) | LocalClip::PendingFiles { .. }
+        ) {
             self.bootstrap_in_flight = true;
         } else {
             self.in_flight = Some(self.generation);
@@ -245,6 +257,7 @@ impl LocalClipboardState {
             return None;
         }
         let offer = match &self.clip {
+            LocalClip::PendingFiles { .. } => return None,
             LocalClip::Files(files) => LocalClipboardOffer::Files(to_file_descriptors(files)),
             LocalClip::Empty | LocalClip::Text(_) => {
                 LocalClipboardOffer::Text(vec![ClipboardFormat::new(
@@ -367,16 +380,29 @@ struct LocalClipFile {
 type LocalClipState = Arc<Mutex<LocalClipboardState>>;
 
 /// Walk the copied selection into the flat, relative-path list the Windows
-/// clipboard expects. Unreadable entries and non-UTF-8 names are skipped.
-fn collect_clipboard_files(roots: &[std::path::PathBuf]) -> Vec<LocalClipFile> {
-    fn visit(path: &std::path::Path, wire_name: String, out: &mut Vec<LocalClipFile>) {
+/// clipboard expects. Reject incomplete selections rather than losing files.
+fn collect_clipboard_files(roots: &[std::path::PathBuf]) -> Result<Vec<LocalClipFile>> {
+    fn visit(
+        path: &std::path::Path,
+        wire_name: String,
+        out: &mut Vec<LocalClipFile>,
+    ) -> Result<()> {
         if out.len() >= MAX_CLIPBOARD_FILES {
-            return;
+            anyhow::bail!("The selection contains more than {MAX_CLIPBOARD_FILES} entries. Copy it in smaller groups.");
         }
-        let Ok(metadata) = std::fs::metadata(path) else {
-            tracing::warn!("clipboard: skipping unreadable {}", path.display());
-            return;
-        };
+        let metadata = std::fs::symlink_metadata(path).context("Cannot read a selected file")?;
+        anyhow::ensure!(
+            !metadata.is_symlink(),
+            "The selection contains a symbolic link. Copy its target instead."
+        );
+        anyhow::ensure!(
+            metadata.is_dir() || metadata.is_file(),
+            "The selection contains an unsupported file type."
+        );
+        anyhow::ensure!(
+            wire_name.encode_utf16().count() < 260,
+            "A selected path is too long for the remote clipboard."
+        );
         if metadata.is_dir() {
             out.push(LocalClipFile {
                 path: path.to_path_buf(),
@@ -384,15 +410,10 @@ fn collect_clipboard_files(roots: &[std::path::PathBuf]) -> Vec<LocalClipFile> {
                 size: 0,
                 is_dir: true,
             });
-            let Ok(entries) = std::fs::read_dir(path) else {
-                return;
-            };
-            for entry in entries.flatten() {
-                let child = entry.path();
-                let Some(name) = child.file_name().and_then(|n| n.to_str()) else {
-                    continue;
-                };
-                visit(&child, format!("{wire_name}\\{name}"), out);
+            for entry in std::fs::read_dir(path).context("Cannot read a selected folder")? {
+                let child = entry.context("Cannot read a selected folder entry")?.path();
+                let name = clipboard_file_name(&child)?;
+                visit(&child, format!("{wire_name}\\{name}"), out)?;
             }
         } else if metadata.is_file() {
             out.push(LocalClipFile {
@@ -402,19 +423,26 @@ fn collect_clipboard_files(roots: &[std::path::PathBuf]) -> Vec<LocalClipFile> {
                 is_dir: false,
             });
         }
+        Ok(())
     }
 
     let mut out = Vec::new();
     for root in roots {
-        let Some(name) = root.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        visit(root, name.to_string(), &mut out);
+        visit(root, clipboard_file_name(root)?.to_owned(), &mut out)?;
     }
-    if out.len() >= MAX_CLIPBOARD_FILES {
-        tracing::warn!("clipboard: selection truncated at {MAX_CLIPBOARD_FILES} files");
-    }
-    out
+    Ok(out)
+}
+
+fn clipboard_file_name(path: &std::path::Path) -> Result<&str> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("A selected file name is not valid Unicode.")?;
+    anyhow::ensure!(
+        !name.contains(['\\', ':', '*', '?', '"', '<', '>', '|']),
+        "A selected file name is not supported on Windows."
+    );
+    Ok(name)
 }
 
 /// Build the CLIPRDR descriptors for the offered files (wire name is split
@@ -480,9 +508,10 @@ struct FetchJob {
     queue: std::collections::VecDeque<PlannedEntry>,
     current: Option<CurrentFetchFile>,
     cache_dir: std::path::PathBuf,
-    top_level_paths: Vec<std::path::PathBuf>,
+    cache_lease: Option<std::fs::File>,
+    top_level_path: std::path::PathBuf,
     keep_cache: bool,
-    reply: Option<std::sync::mpsc::Sender<std::path::PathBuf>>,
+    reply: Option<std::sync::mpsc::Sender<FetchedFile>>,
 }
 
 impl Drop for FetchJob {
@@ -499,7 +528,7 @@ struct RemoteClipboard {
     generation: u64,
     files: Vec<RemoteFileEntry>,
     data_id: Option<u32>,
-    jobs: std::collections::VecDeque<FetchJob>,
+    job: Option<FetchJob>,
     next_stream_id: u32,
     /// Outstanding request: (stream id, was a SIZE request, requested bytes).
     outstanding: Option<(u32, bool, u32)>,
@@ -525,6 +554,7 @@ impl RemoteClipboard {
             names,
             generation: self.generation,
             tx,
+            leases: Mutex::new(Vec::new()),
         }
     }
 
@@ -532,20 +562,20 @@ impl RemoteClipboard {
         &mut self,
         generation: u64,
         name: String,
-        reply: std::sync::mpsc::Sender<std::path::PathBuf>,
+        reply: std::sync::mpsc::Sender<FetchedFile>,
     ) -> Result<bool, String> {
-        if generation != self.generation || !self.jobs.is_empty() {
+        if generation != self.generation || self.job.is_some() {
             return Ok(false);
         }
         let dir = create_remote_clipboard_cache_dir()?;
-        let mut job = plan_remote_clipboard_cache(self, &[name], dir)?;
+        let mut job = plan_remote_clipboard_cache(self, &name, dir)?;
         job.reply = Some(reply);
-        self.jobs.push_back(job);
+        self.job = Some(job);
         Ok(true)
     }
 
     fn invalidate(&mut self) {
-        self.jobs.clear();
+        self.job = None;
         self.outstanding = None;
         self.files.clear();
         self.data_id = None;
@@ -558,7 +588,7 @@ impl Default for RemoteClipboard {
         Self {
             files: Vec::new(),
             data_id: None,
-            jobs: std::collections::VecDeque::new(),
+            job: None,
             // Some Windows clipboard owners treat zero as an uninitialized
             // correlation ID even though the field is formally an unsigned
             // integer. Start at one and skip zero after wrapping.
@@ -573,7 +603,7 @@ impl Default for RemoteClipboard {
 enum RemoteFetchAction {
     Idle,
     Request(FileContentsRequest),
-    Ready(Vec<std::path::PathBuf>),
+    Ready,
 }
 
 /// Reject a server response that exceeds either the requested range or the
@@ -650,12 +680,79 @@ fn plan_fetch_entries(
 }
 
 fn create_remote_clipboard_cache_dir() -> Result<std::path::PathBuf, String> {
+    #[cfg(not(test))]
     let root = std::env::temp_dir().join("RDP123").join("Clipboard");
+    #[cfg(test)]
+    let root = std::env::temp_dir().join(format!("rdp123-test-cache-{}", std::process::id()));
     std::fs::create_dir_all(&root).map_err(|error| format!("creating clipboard cache: {error}"))?;
-    let cache_dir = root.join(uuid::Uuid::new_v4().to_string());
+    static CLEANER: Once = Once::new();
+    CLEANER.call_once(|| {
+        let root = root.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("rdp-cache-cleanup".into())
+            .spawn(move || loop {
+                cleanup_clipboard_caches(
+                    &root,
+                    std::time::SystemTime::now(),
+                    Duration::from_secs(24 * 60 * 60),
+                );
+                std::thread::park_timeout(Duration::from_secs(60 * 60));
+            })
+        {
+            tracing::warn!("clipboard cache cleanup could not start: {error}");
+        }
+    });
+    let cache_dir = root.join(format!("transfer-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&cache_dir)
         .map_err(|error| format!("creating clipboard cache: {error}"))?;
     Ok(cache_dir)
+}
+
+/// Locks protect downloads and current pasteboard offers; the grace period
+/// also protects Finder copies still running after the clipboard changes.
+fn cleanup_clipboard_caches(
+    root: &std::path::Path,
+    now: std::time::SystemTime,
+    retention: Duration,
+) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let lease = if name.starts_with("owner-") || name.starts_with("transfer-") {
+            let Ok(lease) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path.join(".lease"))
+            else {
+                continue;
+            };
+            if lease.try_lock().is_err() {
+                continue;
+            }
+            Some(lease)
+        } else if uuid::Uuid::parse_str(&name).is_ok() {
+            None
+        } else {
+            continue;
+        };
+        let old = lease
+            .as_ref()
+            .map_or_else(|| entry.metadata(), |file| file.metadata())
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > retention);
+        if old {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
 }
 
 fn remote_top_level_destination(
@@ -674,64 +771,191 @@ fn remote_top_level_destination(
     Ok(cache_dir.join(path))
 }
 
-/// Build a single cache job for the whole copied selection. Publishing only
-/// after this job completes keeps Finder from seeing partially downloaded
-/// files or folders.
+/// Publish a requested file or folder only after all its contents are downloaded.
 fn plan_remote_clipboard_cache(
     remote: &RemoteClipboard,
-    names: &[String],
+    name: &str,
     cache_dir: std::path::PathBuf,
 ) -> Result<FetchJob, String> {
-    let mut queue = std::collections::VecDeque::new();
-    let mut top_level_paths = Vec::with_capacity(names.len());
-    for name in names {
-        let dest = match remote_top_level_destination(&cache_dir, name) {
-            Ok(dest) => dest,
-            Err(reason) => {
-                let _ = std::fs::remove_dir_all(&cache_dir);
-                return Err(reason);
-            }
-        };
-        let entries = match plan_fetch_entries(remote, name, &dest) {
-            Ok(entries) => entries,
-            Err(reason) => {
-                let _ = std::fs::remove_dir_all(&cache_dir);
-                return Err(reason);
-            }
-        };
-        queue.extend(entries);
-        top_level_paths.push(dest);
-    }
+    let plan = (|| {
+        let dest = remote_top_level_destination(&cache_dir.join("files"), name)?;
+        let entries = plan_fetch_entries(remote, name, &dest)?;
+        let lease = std::fs::File::create_new(cache_dir.join(".lease"))
+            .map_err(|error| error.to_string())?;
+        lease.lock().map_err(|error| error.to_string())?;
+        Ok((dest, entries, lease))
+    })();
+    let (top_level_path, queue, lease) = plan.inspect_err(|_: &String| {
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    })?;
     Ok(FetchJob {
         queue,
         current: None,
         cache_dir,
-        top_level_paths,
+        cache_lease: Some(lease),
+        top_level_path,
         keep_cache: false,
         reply: None,
     })
 }
 
-/// Drive the fetch pipeline until it needs the next FileContents response
-/// (or all jobs are drained). Creates directories and files locally and
-/// issues at most one outstanding request.
-async fn advance_remote_fetch(
-    remote: &mut RemoteClipboard,
-    active_stage: &mut ActiveStage,
-    out_tx: &OutSender,
-) -> Result<(), String> {
-    loop {
-        match next_remote_fetch_action(remote)? {
-            RemoteFetchAction::Idle => return Ok(()),
-            RemoteFetchAction::Ready(paths) => {
-                tracing::debug!(items = paths.len(), "clipboard file request complete");
-            }
-            RemoteFetchAction::Request(request) => {
-                return send_cliprdr(active_stage, out_tx, |c| c.request_file_contents(request))
-                    .await
-                    .map_err(|error| format!("requesting remote file data: {error:#}"));
-            }
+/// One bounded disk queue per connection. No filesystem call runs on the RDP loop.
+struct ClipboardFileWorker {
+    queue: Arc<FileWorkQueue>,
+    stopped: Arc<AtomicBool>,
+    generation: u64,
+}
+
+#[derive(Default)]
+struct FileWorkQueue {
+    items: Mutex<std::collections::VecDeque<(u64, ClipSignal)>>,
+    ready: std::sync::Condvar,
+}
+
+impl ClipboardFileWorker {
+    fn start(output: Sender<ClipSignal>) -> Self {
+        let queue = Arc::new(FileWorkQueue::default());
+        let worker_queue = queue.clone();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let thread_stopped = stopped.clone();
+        let result = std::thread::Builder::new()
+            .name("rdp-clipboard-files".into())
+            .spawn(move || {
+                let mut remote = RemoteClipboard::default();
+                loop {
+                    let (generation, signal) = {
+                        let mut items = worker_queue.items.lock().unwrap();
+                        loop {
+                            if thread_stopped.load(Ordering::Acquire) || output.is_closed() {
+                                return;
+                            }
+                            if let Some(work) = items.pop_front() {
+                                break work;
+                            }
+                            items = worker_queue.ready.wait(items).unwrap();
+                        }
+                    };
+                    let result = match signal {
+                        ClipSignal::CollectLocalFiles { id, paths } => {
+                            let result = collect_clipboard_files(&paths)
+                                .map_err(|error| format!("{error:#}"));
+                            if output
+                                .blocking_send(ClipSignal::CollectedLocalFiles { id, result })
+                                .is_err()
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+                        ClipSignal::RemoteFileList { files, data_id, tx } => {
+                            let offer = remote.offer(files, data_id, tx);
+                            if output
+                                .blocking_send(ClipSignal::FileWorkResult {
+                                    generation,
+                                    signal: Box::new(ClipSignal::PreparedRemoteOffer(offer)),
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+                        ClipSignal::InvalidateRemoteFiles => {
+                            remote.invalidate();
+                            continue;
+                        }
+                        ClipSignal::FetchFile {
+                            generation,
+                            name,
+                            reply,
+                        } => remote.request(generation, name, reply).map(|_| ()),
+                        ClipSignal::RemoteFileContents { stream_id, data } => {
+                            apply_remote_file_contents(&mut remote, stream_id, data)
+                        }
+                        _ => unreachable!("only disk work belongs on the file queue"),
+                    };
+                    let result = result.and_then(|()| loop {
+                        if thread_stopped.load(Ordering::Acquire) {
+                            return Ok(());
+                        }
+                        match next_remote_fetch_action(&mut remote)? {
+                            RemoteFetchAction::Idle => return Ok(()),
+                            RemoteFetchAction::Ready => {
+                                tracing::debug!("clipboard file request complete")
+                            }
+                            RemoteFetchAction::Request(request) => {
+                                return output
+                                    .blocking_send(ClipSignal::FileWorkResult {
+                                        generation,
+                                        signal: Box::new(ClipSignal::RequestRemoteFile(request)),
+                                    })
+                                    .map_err(|_| "session ended".into())
+                            }
+                        }
+                    });
+                    if let Err(reason) = result {
+                        remote.outstanding = None;
+                        remote.job = None;
+                        if output
+                            .blocking_send(ClipSignal::FileWorkResult {
+                                generation,
+                                signal: Box::new(ClipSignal::FileTransferFailed(reason)),
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            });
+        if result.is_err() {
+            stopped.store(true, Ordering::Release);
         }
+        Self {
+            queue,
+            stopped,
+            generation: 0,
+        }
+    }
+
+    fn submit(&mut self, signal: ClipSignal) -> Result<()> {
+        let mut items = self.queue.items.lock().unwrap();
+        if self.stopped.load(Ordering::Acquire) {
+            anyhow::bail!("The file clipboard worker is unavailable.");
+        }
+        if matches!(
+            signal,
+            ClipSignal::RemoteFileList { .. } | ClipSignal::InvalidateRemoteFiles
+        ) {
+            self.generation = self.generation.wrapping_add(1);
+            // An obsolete selection must not delay the newest one or retain
+            // Finder requests for files that are no longer on the clipboard.
+            items.clear();
+        }
+        if items.len() >= 16 {
+            anyhow::bail!("The file transfer is busy. Please retry copying the file.");
+        }
+        items.push_back((self.generation, signal));
+        self.queue.ready.notify_one();
+        Ok(())
+    }
+
+    fn current_result(&self, signal: ClipSignal) -> Option<ClipSignal> {
+        match signal {
+            ClipSignal::FileWorkResult { generation, signal } => {
+                (generation == self.generation).then_some(*signal)
+            }
+            signal => Some(signal),
+        }
+    }
+}
+
+impl Drop for ClipboardFileWorker {
+    fn drop(&mut self) {
+        let mut items = self.queue.items.lock().unwrap();
+        self.stopped.store(true, Ordering::Release);
+        items.clear();
+        self.queue.ready.notify_one();
     }
 }
 
@@ -744,7 +968,7 @@ fn next_remote_fetch_action(remote: &mut RemoteClipboard) -> Result<RemoteFetchA
             return Ok(RemoteFetchAction::Idle);
         }
         let data_id = remote.data_id;
-        let Some(job) = remote.jobs.front_mut() else {
+        let Some(job) = remote.job.as_mut() else {
             return Ok(RemoteFetchAction::Idle);
         };
 
@@ -795,42 +1019,20 @@ fn next_remote_fetch_action(remote: &mut RemoteClipboard) -> Result<RemoteFetchA
                 });
             }
             None => {
-                let Some(mut job) = remote.jobs.pop_front() else {
+                let Some(mut job) = remote.job.take() else {
                     return Ok(RemoteFetchAction::Idle);
                 };
-                job.keep_cache = match job.reply.take() {
-                    Some(reply) => reply.send(job.top_level_paths[0].clone()).is_ok(),
-                    None => true,
-                };
-                return Ok(RemoteFetchAction::Ready(job.top_level_paths.clone()));
+                let lease = job.cache_lease.take().ok_or("missing file cache lease")?;
+                lease
+                    .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()))
+                    .map_err(|error| error.to_string())?;
+                job.keep_cache = job
+                    .reply
+                    .take()
+                    .is_some_and(|reply| reply.send((job.top_level_path.clone(), lease)).is_ok());
+                return Ok(RemoteFetchAction::Ready);
             }
         }
-    }
-}
-
-fn fail_front_job(remote: &mut RemoteClipboard, reason: String, event_cb: &EventCb) {
-    remote.outstanding = None;
-    if remote.jobs.pop_front().is_some() {
-        tracing::warn!("clipboard: file fetch failed: {reason}");
-        event_cb(SessionEvent::ClipboardFilesFailed(reason));
-    }
-}
-
-/// Apply one FileContents response to the fetch pipeline.
-async fn handle_remote_file_contents(
-    remote: &mut RemoteClipboard,
-    stream_id: u32,
-    data: Option<Vec<u8>>,
-    active_stage: &mut ActiveStage,
-    out_tx: &OutSender,
-    event_cb: &EventCb,
-) {
-    if let Err(reason) = apply_remote_file_contents(remote, stream_id, data) {
-        fail_front_job(remote, reason, event_cb);
-        return;
-    }
-    if let Err(reason) = advance_remote_fetch(remote, active_stage, out_tx).await {
-        fail_front_job(remote, reason, event_cb);
     }
 }
 
@@ -850,7 +1052,7 @@ fn apply_remote_file_contents(
     remote.outstanding = None;
 
     let bytes = data.ok_or("the remote refused the transfer")?;
-    let job = remote.jobs.front_mut().ok_or("no active transfer")?;
+    let job = remote.job.as_mut().ok_or("no active transfer")?;
     let current = job.current.as_mut().ok_or("no file in progress")?;
     if was_size {
         let size: [u8; 8] = bytes
@@ -1063,6 +1265,7 @@ struct PendingCommands {
     resize: Mutex<PendingValue<(u16, u16, Option<u32>)>>,
     release_all_keys: AtomicBool,
     shutdown: AtomicBool,
+    shutdown_notify: tokio::sync::Notify,
 }
 
 impl SessionHandle {
@@ -1092,6 +1295,7 @@ impl SessionHandle {
             }
             SessionCommand::Shutdown => {
                 self.pending.shutdown.store(true, Ordering::Release);
+                self.pending.shutdown_notify.notify_one();
                 let _ = self.command_tx.try_send(SessionCommand::Shutdown);
                 true
             }
@@ -1195,10 +1399,22 @@ pub fn spawn(config: SessionConfig, event_cb: EventCb) -> SessionHandle {
     }
 }
 
+type FetchedFile = (std::path::PathBuf, std::fs::File);
+
 pub struct RemoteFileOffer {
     names: Vec<String>,
     generation: u64,
     tx: Sender<ClipSignal>,
+    leases: Mutex<Vec<std::fs::File>>,
+}
+
+impl Drop for RemoteFileOffer {
+    fn drop(&mut self) {
+        for lease in self.leases.get_mut().unwrap() {
+            let _ = lease
+                .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()));
+        }
+    }
 }
 
 impl RemoteFileOffer {
@@ -1220,15 +1436,32 @@ impl RemoteFileOffer {
                 reply,
             })
             .ok()?;
-        result.recv().ok()
+        let (path, lease) = result.recv().ok()?;
+        self.leases.lock().unwrap().push(lease);
+        Some(path)
     }
 }
 
 enum ClipSignal {
+    FileWorkResult {
+        generation: u64,
+        signal: Box<ClipSignal>,
+    },
+    CollectLocalFiles {
+        id: uuid::Uuid,
+        paths: Vec<std::path::PathBuf>,
+    },
+    CollectedLocalFiles {
+        id: uuid::Uuid,
+        result: Result<Vec<LocalClipFile>, String>,
+    },
+    PreparedRemoteOffer(RemoteFileOffer),
+    RequestRemoteFile(FileContentsRequest),
+    FileTransferFailed(String),
     FetchFile {
         generation: u64,
         name: String,
-        reply: std::sync::mpsc::Sender<std::path::PathBuf>,
+        reply: std::sync::mpsc::Sender<FetchedFile>,
     },
     /// Send the mandatory non-file FormatList that completes CLIPRDR setup.
     InitializeClipboard,
@@ -1281,6 +1514,7 @@ const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
 /// Bound the TCP connect so a Local-Network-blocked LAN connect fails fast with
 /// a clear message rather than hanging on the long OS default.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
+const PROTOCOL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Why a single session attempt ended.
 enum SessionEnd {
@@ -1404,17 +1638,23 @@ async fn run(
             }
         }
         let (clip_tx, clip_rx) = channel::<ClipSignal>(CLIPBOARD_QUEUE_CAPACITY);
-        let outcome = match connect(
-            &config,
-            &mut rdsaad_client,
-            &mut session_trusted,
-            local_clip.clone(),
-            clip_tx,
-            audio.as_ref(),
-            &event_cb,
+        let Some(connection) = cancel_on_shutdown(
+            &pending,
+            connect(
+                &config,
+                &mut rdsaad_client,
+                &mut session_trusted,
+                local_clip.clone(),
+                clip_tx.clone(),
+                audio.as_ref(),
+                &event_cb,
+            ),
         )
         .await
-        {
+        else {
+            break;
+        };
+        let outcome = match connection {
             Ok((connection_result, framed)) => {
                 connected_once = true;
                 failures = 0;
@@ -1444,6 +1684,7 @@ async fn run(
                     &mut command_rx,
                     &pending,
                     clip_rx,
+                    clip_tx,
                     &local_clip,
                     &event_cb,
                 )
@@ -1451,7 +1692,7 @@ async fn run(
                 {
                     SessionEnd::UserQuit => Outcome::Stop,
                     SessionEnd::Disconnected(reason) => {
-                        if config.reconnect {
+                        if config.reconnect && reason != REMOTE_ENDED {
                             Outcome::Retry {
                                 delay: reconnect_delay(&config),
                                 reconnect_attempt: Some(1),
@@ -1578,10 +1819,10 @@ fn absorb_offline_command(
             local_clip.lock().unwrap().replace(LocalClip::Text(text));
         }
         Some(SessionCommand::LocalClipboardFiles(paths)) => {
-            let files = collect_clipboard_files(&paths);
-            if !files.is_empty() {
-                local_clip.lock().unwrap().replace(LocalClip::Files(files));
-            }
+            local_clip.lock().unwrap().replace(LocalClip::PendingFiles {
+                id: uuid::Uuid::new_v4(),
+                paths,
+            });
         }
         _ => {}
     }
@@ -1654,6 +1895,7 @@ async fn run_session(
     command_rx: &mut Receiver<SessionCommand>,
     pending: &PendingCommands,
     mut clip_rx: Receiver<ClipSignal>,
+    clip_tx: Sender<ClipSignal>,
     local_clip: &LocalClipState,
     event_cb: &EventCb,
 ) -> SessionEnd {
@@ -1697,7 +1939,16 @@ async fn run_session(
     // With clipboard disabled the sender is dropped at connect; stop polling the
     // closed channel or the select loop would spin at 100% CPU.
     let mut clip_open = true;
-    let mut remote_clip = RemoteClipboard::default();
+    let mut remote_clip = ClipboardFileWorker::start(clip_tx);
+    {
+        let state = local_clip.lock().unwrap();
+        if let LocalClip::PendingFiles { id, paths } = &state.clip {
+            let _ = remote_clip.submit(ClipSignal::CollectLocalFiles {
+                id: *id,
+                paths: paths.clone(),
+            });
+        }
+    }
     let mut clipboard_timeout_tick = tokio::time::interval_at(
         tokio::time::Instant::now() + CLIPBOARD_TIMEOUT_TICK,
         CLIPBOARD_TIMEOUT_TICK,
@@ -1710,135 +1961,34 @@ async fn run_session(
     let mut last_input = tokio::time::Instant::now();
     let mut keys_down: u32 = 0;
 
-    let end = loop {
-        if pending.shutdown.swap(false, Ordering::AcqRel) {
-            let _ = handle_command(
-                SessionCommand::Shutdown,
-                config,
-                &mut reader,
-                &out_tx,
-                &mut active_stage,
-                &mut image,
-                &activation_factory,
-                &mut input_db,
-                framebuffer,
-                local_clip,
-                &mut remote_clip,
-                event_cb,
-            )
-            .await;
-            break SessionEnd::UserQuit;
-        }
-        if pending.release_all_keys.swap(false, Ordering::AcqRel) {
-            // This path (not the command channel) usually wins the race, so
-            // clear the held-key counter here too or the keep-alive could stay
-            // suppressed after focus is lost while a key was held.
-            keys_down = 0;
-            let fp_events = input_db.release_all();
-            if !fp_events.is_empty() {
-                match active_stage.process_fastpath_input(&mut image, &fp_events) {
-                    Ok(outputs) => match drain_outputs(
-                        outputs,
-                        &mut reader,
-                        &out_tx,
-                        &mut active_stage,
-                        &activation_factory,
-                        &mut image,
-                        framebuffer,
-                        event_cb,
-                    )
-                    .await
-                    {
-                        Ok(true) => {
-                            break SessionEnd::Disconnected(REMOTE_ENDED.to_string());
-                        }
-                        Ok(false) => {}
-                        Err(error) => break SessionEnd::Disconnected(format!("{error:#}")),
-                    },
-                    Err(error) => break SessionEnd::Disconnected(format!("{error:#}")),
-                }
-            }
-        }
-        tokio::select! {
-            cmd = command_rx.recv() => {
-                let Some(cmd) = cmd else { break SessionEnd::UserQuit };
-                let Some(cmd) = resolve_pending_command(cmd, pending) else {
-                    continue;
-                };
-                if matches!(cmd, SessionCommand::Input(_)) {
-                    last_input = tokio::time::Instant::now();
-                }
-                keys_down = update_keys_down(&cmd, keys_down);
-                match handle_command(
-                    cmd, config, &mut reader, &out_tx, &mut active_stage, &mut image,
-                    &activation_factory, &mut input_db, framebuffer, local_clip,
-                    &mut remote_clip, event_cb,
-                ).await {
-                    Ok(true) => break SessionEnd::UserQuit,
-                    Ok(false) => {}
-                    Err(e) => break SessionEnd::Disconnected(format!("{e:#}")),
-                }
-            }
-
-            sig = clip_rx.recv(), if clip_open => {
-                match sig {
-                    Some(sig) => {
-                        let is_external_paste = matches!(sig, ClipSignal::PasteAccepted { .. });
-                        match handle_clip_signal(
-                            sig,
-                            &mut reader,
-                            &out_tx,
-                            &mut active_stage,
-                            &mut image,
-                            &activation_factory,
-                            &mut input_db,
-                            framebuffer,
-                            local_clip,
-                            &mut remote_clip,
-                            event_cb,
-                        ).await {
-                            Ok(true) => break SessionEnd::Disconnected(REMOTE_ENDED.to_string()),
-                            Ok(false) => {
-                                if is_external_paste {
-                                    last_input = tokio::time::Instant::now();
-                                    keys_down = 0;
-                                }
-                            }
-                            Err(e) => tracing::warn!("clipboard: {e}"),
-                        }
-                    }
-                    None => clip_open = false,
-                }
-            }
-
-            _ = clipboard_timeout_tick.tick(), if config.clipboard.enabled() => {
+    let end = cancel_on_shutdown(pending, async {
+        loop {
+            let (rejected, response_lost) = {
+                let mut state = local_clip.lock().unwrap();
+                (std::mem::take(&mut state.rejected_file_requests),
+                 std::mem::take(&mut state.remote_file_response_lost))
+            };
+            for stream_id in rejected {
                 if let Err(error) = send_cliprdr(&mut active_stage, &out_tx, |clipboard| {
-                    clipboard.drive_timeouts()
+                    clipboard.submit_file_contents(FileContentsResponse::new_error(stream_id))
                 }).await {
-                    tracing::warn!("clipboard: timeout maintenance failed: {error:#}");
+                    tracing::warn!("clipboard: could not reject file request: {error:#}");
                 }
             }
-
-            // Idle keep-alive. Disabled unless enabled and no key is held; the
-            // sleep target moves with `last_input`, so any real input reschedules
-            // it and the tap only fires after a full idle interval.
-            _ = tokio::time::sleep_until(last_input + KEEP_ALIVE_INTERVAL),
-                if config.keep_alive && keys_down == 0 =>
-            {
-                match send_keepalive_tap(
-                    &mut reader, &out_tx, &mut active_stage, &mut image,
-                    &activation_factory, &mut input_db, framebuffer, event_cb,
-                ).await {
-                    Ok(true) => break SessionEnd::Disconnected(REMOTE_ENDED.to_string()),
-                    Ok(false) => {}
-                    Err(e) => break SessionEnd::Disconnected(format!("{e:#}")),
-                }
-                last_input = tokio::time::Instant::now();
+            if response_lost {
+                let _ = remote_clip.submit(ClipSignal::InvalidateRemoteFiles);
+                event_cb(SessionEvent::ClipboardFilesFailed(
+                    "The file transfer is busy. Please retry copying the file.".into(),
+                ));
             }
-
-            pdu = reader.read_pdu() => {
-                match pdu {
-                    Ok((action, payload)) => match active_stage.process(&mut image, action, &payload, reader.last_read_at()) {
+            if pending.release_all_keys.swap(false, Ordering::AcqRel) {
+                // This path (not the command channel) usually wins the race, so
+                // clear the held-key counter here too or the keep-alive could stay
+                // suppressed after focus is lost while a key was held.
+                keys_down = 0;
+                let fp_events = input_db.release_all();
+                if !fp_events.is_empty() {
+                    match active_stage.process_fastpath_input(&mut image, &fp_events) {
                         Ok(outputs) => match drain_outputs(
                             outputs,
                             &mut reader,
@@ -1848,16 +1998,146 @@ async fn run_session(
                             &mut image,
                             framebuffer,
                             event_cb,
-                        ).await {
-                            Ok(true) => break SessionEnd::Disconnected(REMOTE_ENDED.to_string()),
+                        )
+                        .await
+                        {
+                            Ok(true) => {
+                                break SessionEnd::Disconnected(REMOTE_ENDED.to_string());
+                            }
                             Ok(false) => {}
+                            Err(error) => break SessionEnd::Disconnected(format!("{error:#}")),
+                        },
+                        Err(error) => break SessionEnd::Disconnected(format!("{error:#}")),
+                    }
+                }
+            }
+            tokio::select! {
+                _ = &mut writer_task => {
+                    break SessionEnd::Disconnected("The connection stopped sending data or timed out.".into());
+                }
+                cmd = command_rx.recv() => {
+                    let Some(cmd) = cmd else { break SessionEnd::UserQuit };
+                    let Some(cmd) = resolve_pending_command(cmd, pending) else {
+                        continue;
+                    };
+                    if matches!(cmd, SessionCommand::Input(_)) {
+                        last_input = tokio::time::Instant::now();
+                    }
+                    keys_down = update_keys_down(&cmd, keys_down);
+                    match handle_command(
+                        cmd, config, &mut reader, &out_tx, &mut active_stage, &mut image,
+                        &activation_factory, &mut input_db, framebuffer, local_clip,
+                        &mut remote_clip, event_cb,
+                    ).await {
+                        Ok(true) => break SessionEnd::UserQuit,
+                        Ok(false) => {}
+                        Err(e) => break SessionEnd::Disconnected(format!("{e:#}")),
+                    }
+                }
+
+                sig = clip_rx.recv(), if clip_open => {
+                    match sig {
+                        Some(sig) => {
+                            let is_external_paste = matches!(sig, ClipSignal::PasteAccepted { .. });
+                            match handle_clip_signal(
+                                sig,
+                                &mut reader,
+                                &out_tx,
+                                &mut active_stage,
+                                &mut image,
+                                &activation_factory,
+                                &mut input_db,
+                                framebuffer,
+                                local_clip,
+                                &mut remote_clip,
+                                event_cb,
+                            ).await {
+                                Ok(true) => break SessionEnd::Disconnected(REMOTE_ENDED.to_string()),
+                                Ok(false) => {
+                                    if is_external_paste {
+                                        last_input = tokio::time::Instant::now();
+                                        keys_down = 0;
+                                    }
+                                }
+                                Err(e) => tracing::warn!("clipboard: {e}"),
+                            }
+                        }
+                        None => clip_open = false,
+                    }
+                }
+
+                _ = clipboard_timeout_tick.tick(), if config.clipboard.enabled() => {
+                    if let Err(error) = send_cliprdr(&mut active_stage, &out_tx, |clipboard| {
+                        clipboard.drive_timeouts()
+                    }).await {
+                        tracing::warn!("clipboard: timeout maintenance failed: {error:#}");
+                    }
+                }
+
+                // Idle keep-alive. Disabled unless enabled and no key is held; the
+                // sleep target moves with `last_input`, so any real input reschedules
+                // it and the tap only fires after a full idle interval.
+                _ = tokio::time::sleep_until(last_input + KEEP_ALIVE_INTERVAL),
+                    if config.keep_alive && keys_down == 0 =>
+                {
+                    match send_keepalive_tap(
+                        &mut reader, &out_tx, &mut active_stage, &mut image,
+                        &activation_factory, &mut input_db, framebuffer, event_cb,
+                    ).await {
+                        Ok(true) => break SessionEnd::Disconnected(REMOTE_ENDED.to_string()),
+                        Ok(false) => {}
+                        Err(e) => break SessionEnd::Disconnected(format!("{e:#}")),
+                    }
+                    last_input = tokio::time::Instant::now();
+                }
+
+                pdu = reader.read_pdu() => {
+                    match pdu {
+                        Ok((action, payload)) => match active_stage.process(&mut image, action, &payload, reader.last_read_at()) {
+                            Ok(outputs) => match drain_outputs(
+                                outputs,
+                                &mut reader,
+                                &out_tx,
+                                &mut active_stage,
+                                &activation_factory,
+                                &mut image,
+                                framebuffer,
+                                event_cb,
+                            ).await {
+                                Ok(true) => break SessionEnd::Disconnected(REMOTE_ENDED.to_string()),
+                                Ok(false) => {}
+                                Err(e) => break SessionEnd::Disconnected(format!("{e:#}")),
+                            },
                             Err(e) => break SessionEnd::Disconnected(format!("{e:#}")),
                         },
                         Err(e) => break SessionEnd::Disconnected(format!("{e:#}")),
-                    },
-                    Err(e) => break SessionEnd::Disconnected(format!("{e:#}")),
+                    }
                 }
             }
+        }
+    }).await;
+    let end = match end {
+        Some(end) => end,
+        None => {
+            let _ = tokio::time::timeout(
+                SHUTDOWN_FLUSH,
+                handle_command(
+                    SessionCommand::Shutdown,
+                    config,
+                    &mut reader,
+                    &out_tx,
+                    &mut active_stage,
+                    &mut image,
+                    &activation_factory,
+                    &mut input_db,
+                    framebuffer,
+                    local_clip,
+                    &mut remote_clip,
+                    event_cb,
+                ),
+            )
+            .await;
+            SessionEnd::UserQuit
         }
     };
 
@@ -1870,6 +2150,20 @@ async fn run_session(
     }
     writer_task.abort();
     end
+}
+
+async fn cancel_on_shutdown<T>(
+    pending: &PendingCommands,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    if pending.shutdown.load(Ordering::Acquire) {
+        return None;
+    }
+    tokio::select! {
+        biased;
+        _ = pending.shutdown_notify.notified() => None,
+        result = work => Some(result),
+    }
 }
 
 fn resolve_pending_command(
@@ -1913,8 +2207,11 @@ fn resolve_pending_command(
 /// blocked write never stalls reads.
 async fn writer_loop(mut writer: SessionWriter, mut out_rx: Receiver<Vec<u8>>) {
     while let Some(bytes) = out_rx.recv().await {
-        if let Err(e) = writer.write_all(&bytes).await {
-            tracing::debug!("write failed, stopping writer: {e}");
+        if !matches!(
+            tokio::time::timeout(PROTOCOL_TIMEOUT, writer.write_all(&bytes)).await,
+            Ok(Ok(()))
+        ) {
+            tracing::debug!("write failed or timed out, stopping writer");
             break;
         }
     }
@@ -1991,18 +2288,26 @@ async fn connect(
     let mut framed = TokioFramed::new(tcp);
 
     // 1. Pre-TLS X.224 negotiation.
-    let should_upgrade = connect_begin(&mut framed, &mut connector)
-        .await
-        .map_err(connector_failure)?;
+    let should_upgrade =
+        tokio::time::timeout(PROTOCOL_TIMEOUT, connect_begin(&mut framed, &mut connector))
+            .await
+            .context("RDP negotiation timed out")
+            .map_err(ConnectFailure::retryable)?
+            .map_err(connector_failure)?;
 
     // 2. TLS handshake. CA/hostname verification is intentionally replaced by
     // TOFU below, but the server must still prove possession of the certificate
     // private key by signing the TLS handshake.
     let (initial_stream, leftover) = framed.into_inner();
-    let (tls_stream, server_public_key) = crate::tls::upgrade(initial_stream, &config.host)
-        .await
-        .context("TLS handshake")
-        .map_err(ConnectFailure::fatal)?;
+    let (tls_stream, server_public_key) = tokio::time::timeout(
+        PROTOCOL_TIMEOUT,
+        crate::tls::upgrade(initial_stream, &config.host),
+    )
+    .await
+    .context("TLS handshake timed out")
+    .map_err(ConnectFailure::retryable)?
+    .context("TLS handshake")
+    .map_err(ConnectFailure::fatal)?;
 
     // 3. Trust-on-first-use gate — before any credentials are sent via CredSSP.
     let fingerprint = fingerprint_hex(&server_public_key);
@@ -2025,16 +2330,21 @@ async fn connect(
             .map_err(ConnectFailure::fatal)?;
     }
     let mut network_client = NoNetworkClient;
-    let result = connect_finalize(
-        upgraded,
-        connector,
-        &mut framed,
-        &mut network_client,
-        ServerName::new(&config.host),
-        server_public_key,
-        None,
+    let result = tokio::time::timeout(
+        PROTOCOL_TIMEOUT,
+        connect_finalize(
+            upgraded,
+            connector,
+            &mut framed,
+            &mut network_client,
+            ServerName::new(&config.host),
+            server_public_key,
+            None,
+        ),
     )
     .await
+    .context("RDP authentication or activation timed out")
+    .map_err(ConnectFailure::retryable)?
     .map_err(connector_failure)?;
 
     match result {
@@ -2184,7 +2494,7 @@ async fn handle_command(
     input_db: &mut Database,
     framebuffer: &SharedFramebuffer,
     local_clip: &LocalClipState,
-    _remote_clip: &mut RemoteClipboard,
+    file_worker: &mut ClipboardFileWorker,
     event_cb: &EventCb,
 ) -> Result<bool> {
     match cmd {
@@ -2234,6 +2544,7 @@ async fn handle_command(
                 );
                 return Ok(false);
             }
+            let _ = file_worker.submit(ClipSignal::InvalidateRemoteFiles);
             let generation = local_clip.lock().unwrap().replace(LocalClip::Text(text));
             advertise_local_clipboard(generation, local_clip, active_stage, out_tx).await?;
         }
@@ -2255,13 +2566,15 @@ async fn handle_command(
             advertise_local_clipboard(generation, local_clip, active_stage, out_tx).await?;
         }
         SessionCommand::LocalClipboardFiles(paths) => {
-            let files = collect_clipboard_files(&paths);
-            if files.is_empty() {
-                return Ok(false);
+            let _ = file_worker.submit(ClipSignal::InvalidateRemoteFiles);
+            let id = uuid::Uuid::new_v4();
+            local_clip.lock().unwrap().replace(LocalClip::PendingFiles {
+                id,
+                paths: paths.clone(),
+            });
+            if let Err(error) = file_worker.submit(ClipSignal::CollectLocalFiles { id, paths }) {
+                event_cb(SessionEvent::ClipboardFilesFailed(error.to_string()));
             }
-            tracing::debug!("clipboard: offering {} file entries", files.len());
-            let generation = local_clip.lock().unwrap().replace(LocalClip::Files(files));
-            advertise_local_clipboard(generation, local_clip, active_stage, out_tx).await?;
         }
         SessionCommand::ReleaseAllKeys => {
             let fp_events = input_db.release_all();
@@ -2304,10 +2617,55 @@ async fn handle_clip_signal(
     input_db: &mut Database,
     framebuffer: &SharedFramebuffer,
     local_clip: &LocalClipState,
-    remote_clip: &mut RemoteClipboard,
+    remote_clip: &mut ClipboardFileWorker,
     event_cb: &EventCb,
 ) -> Result<bool> {
+    let Some(sig) = remote_clip.current_result(sig) else {
+        return Ok(false);
+    };
     match sig {
+        ClipSignal::CollectedLocalFiles { id, result } => {
+            let generation = {
+                let mut state = local_clip.lock().unwrap();
+                let target = if matches!(&state.clip, LocalClip::PendingFiles { id: current, .. } if *current == id)
+                {
+                    Some(&mut state.clip)
+                } else if matches!(&state.deferred_clip, Some(LocalClip::PendingFiles { id: current, .. }) if *current == id)
+                {
+                    state.deferred_clip.as_mut()
+                } else {
+                    None
+                };
+                let Some(target) = target else {
+                    return Ok(false);
+                };
+                *target = match result {
+                    Ok(files) => LocalClip::Files(files),
+                    Err(reason) => {
+                        event_cb(SessionEvent::ClipboardFilesFailed(reason));
+                        LocalClip::Empty
+                    }
+                };
+                state.generation
+            };
+            advertise_local_clipboard(generation, local_clip, active_stage, out_tx).await?;
+            Ok(false)
+        }
+        ClipSignal::PreparedRemoteOffer(offer) => {
+            event_cb(SessionEvent::ClipboardFilesOffered(offer));
+            Ok(false)
+        }
+        ClipSignal::RequestRemoteFile(request) => {
+            send_cliprdr(active_stage, out_tx, |c| c.request_file_contents(request)).await?;
+            Ok(false)
+        }
+        ClipSignal::FileTransferFailed(reason) => {
+            event_cb(SessionEvent::ClipboardFilesFailed(reason));
+            Ok(false)
+        }
+        ClipSignal::CollectLocalFiles { .. } | ClipSignal::FileWorkResult { .. } => {
+            unreachable!("file work is sent to the disk worker")
+        }
         ClipSignal::InitializeClipboard => {
             let formats = local_clip.lock().unwrap().begin_initial_offer();
             if let Some(formats) = formats {
@@ -2365,11 +2723,11 @@ async fn handle_clip_signal(
             Ok(false)
         }
         ClipSignal::InvalidateRemoteFiles => {
-            remote_clip.invalidate();
+            let _ = remote_clip.submit(ClipSignal::InvalidateRemoteFiles);
             Ok(false)
         }
         ClipSignal::InitiatePaste(format) => {
-            remote_clip.invalidate();
+            let _ = remote_clip.submit(ClipSignal::InvalidateRemoteFiles);
             send_cliprdr(active_stage, out_tx, |c| c.initiate_paste(format)).await?;
             Ok(false)
         }
@@ -2397,40 +2755,13 @@ async fn handle_clip_signal(
             event_cb(SessionEvent::ClipboardText(text));
             Ok(false)
         }
-        ClipSignal::RemoteFileList { files, data_id, tx } => {
-            event_cb(SessionEvent::ClipboardFilesOffered(
-                remote_clip.offer(files, data_id, tx),
-            ));
-            Ok(false)
-        }
-        ClipSignal::FetchFile {
-            generation,
-            name,
-            reply,
-        } => {
-            match remote_clip.request(generation, name, reply) {
-                Ok(false) => return Ok(false),
-                Ok(true) => {
-                    if let Err(reason) =
-                        advance_remote_fetch(remote_clip, active_stage, out_tx).await
-                    {
-                        fail_front_job(remote_clip, reason, event_cb);
-                    }
-                }
-                Err(reason) => event_cb(SessionEvent::ClipboardFilesFailed(reason)),
+        signal @ (ClipSignal::RemoteFileList { .. }
+        | ClipSignal::FetchFile { .. }
+        | ClipSignal::RemoteFileContents { .. }) => {
+            if let Err(error) = remote_clip.submit(signal) {
+                let _ = remote_clip.submit(ClipSignal::InvalidateRemoteFiles);
+                event_cb(SessionEvent::ClipboardFilesFailed(error.to_string()));
             }
-            Ok(false)
-        }
-        ClipSignal::RemoteFileContents { stream_id, data } => {
-            handle_remote_file_contents(
-                remote_clip,
-                stream_id,
-                data,
-                active_stage,
-                out_tx,
-                event_cb,
-            )
-            .await;
             Ok(false)
         }
     }
@@ -2462,9 +2793,9 @@ async fn advertise_local_clipboard(
 
 /// Queue a frame for the writer task with bounded backpressure.
 async fn emit(out_tx: &OutSender, bytes: Vec<u8>) -> Result<()> {
-    out_tx
-        .send(bytes)
+    tokio::time::timeout(PROTOCOL_TIMEOUT, out_tx.send(bytes))
         .await
+        .context("session writer timed out")?
         .map_err(|_| anyhow!("session writer stopped"))
 }
 
@@ -2538,7 +2869,12 @@ async fn drain_outputs(
                 )
                 .await?;
             }
-            ActiveStageOutput::Terminate(_reason) => return Ok(true),
+            ActiveStageOutput::Terminate(reason) => {
+                if is_remote_logoff(&reason) {
+                    return Ok(true);
+                }
+                return Err(anyhow!(reason.description()));
+            }
             // Pointer shapes are mirrored onto the native macOS cursor so the
             // remote shape (resize arrows, I-beam, hand) shows without the
             // laggy server-composited cursor.
@@ -2576,6 +2912,23 @@ async fn drain_outputs(
         }
     }
     Ok(false)
+}
+
+fn is_remote_logoff(reason: &ironrdp_session::GracefulDisconnectReason) -> bool {
+    use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
+    use ironrdp_session::GracefulDisconnectReason;
+    match reason {
+        GracefulDisconnectReason::UserInitiated => true,
+        GracefulDisconnectReason::ServerInitiated => false,
+        // IronRDP exposes ErrorInfo as text here. Compare its own descriptions,
+        // not substrings that could also match a shutdown or protocol failure.
+        GracefulDisconnectReason::Other(description) => [
+            ProtocolIndependentCode::LogoffByUser,
+            ProtocolIndependentCode::RpcInitiatedLogoff,
+        ]
+        .iter()
+        .any(|code| *description == ErrorInfo::ProtocolIndependentCode(*code).description()),
+    }
 }
 
 /// Drive a Deactivation-Reactivation sequence (e.g. a server-side resolution
@@ -2623,9 +2976,13 @@ async fn reactivate(
         }
         // Read + step on the read half; queue any response for the writer task.
         let mut buf = WriteBuf::new();
-        single_sequence_step_read(reader, &mut cas, &mut buf)
-            .await
-            .map_err(connector_err)?;
+        tokio::time::timeout(
+            PROTOCOL_TIMEOUT,
+            single_sequence_step_read(reader, &mut cas, &mut buf),
+        )
+        .await
+        .context("desktop reactivation timed out")?
+        .map_err(connector_err)?;
         if !buf.filled().is_empty() {
             emit(out_tx, buf.filled().to_vec()).await?;
         }
@@ -3095,10 +3452,18 @@ impl MacClipboardBackend {
     }
 
     fn queue_file_contents_response(&self, request: FileContentsRequest) {
+        let Ok(admission) = LOCAL_FILE_REQUEST_PERMITS.try_acquire() else {
+            let mut state = self.local_clip.lock().unwrap();
+            if state.rejected_file_requests.len() < 128 {
+                state.rejected_file_requests.push(request.stream_id);
+            }
+            return;
+        };
         let tx = self.tx.clone();
         let file = local_file_for_request(&self.local_clip, self.mode, &request);
         let stream_id = request.stream_id;
         tokio::spawn(async move {
+            let _admission = admission;
             let Ok(permit) = LOCAL_FILE_READ_PERMITS.acquire().await else {
                 return;
             };
@@ -3110,7 +3475,6 @@ impl MacClipboardBackend {
                 tracing::warn!("clipboard: local file read task failed: {error}");
                 FileContentsResponse::new_error(stream_id)
             });
-            drop(permit);
             if tx
                 .send(ClipSignal::SubmitFileContents(response))
                 .await
@@ -3118,6 +3482,7 @@ impl MacClipboardBackend {
             {
                 tracing::debug!("clipboard: session ended before a file response was sent");
             }
+            drop(permit);
         });
     }
 }
@@ -3357,12 +3722,8 @@ impl CliprdrBackend for MacClipboardBackend {
             stream_id: response.stream_id(),
             data,
         };
-        if let Err(tokio::sync::mpsc::error::TrySendError::Full(signal)) = self.tx.try_send(signal)
-        {
-            let tx = self.tx.clone();
-            tokio::spawn(async move {
-                let _ = tx.send(signal).await;
-            });
+        if self.tx.try_send(signal).is_err() {
+            self.local_clip.lock().unwrap().remote_file_response_lost = true;
         }
     }
 
@@ -3403,16 +3764,481 @@ fn normalize_clipboard_to_crlf(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn failed_remote_download_releases_the_paste_waiter() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut worker = super::ClipboardFileWorker::start(tx.clone());
+        worker
+            .submit(ClipSignal::RemoteFileList {
+                tx,
+                files: vec![RemoteFileEntry {
+                    wire_name: "file.txt".into(),
+                    size: Some(4),
+                    is_dir: false,
+                }],
+                data_id: None,
+            })
+            .unwrap();
+        let Some(ClipSignal::PreparedRemoteOffer(offer)) =
+            worker.current_result(rx.recv().await.unwrap())
+        else {
+            panic!("missing offer")
+        };
+        let (reply, result) = std::sync::mpsc::channel();
+        worker
+            .submit(ClipSignal::FetchFile {
+                generation: offer.generation,
+                name: "file.txt".into(),
+                reply,
+            })
+            .unwrap();
+        let Some(ClipSignal::RequestRemoteFile(request)) =
+            worker.current_result(rx.recv().await.unwrap())
+        else {
+            panic!("missing request")
+        };
+        worker
+            .submit(ClipSignal::RemoteFileContents {
+                stream_id: request.stream_id,
+                data: None,
+            })
+            .unwrap();
+        let signal = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            worker.current_result(signal),
+            Some(ClipSignal::FileTransferFailed(_))
+        ));
+        assert!(matches!(
+            result.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[tokio::test]
+    async fn busy_file_worker_keeps_only_the_latest_clipboard_selection() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.send(ClipSignal::RemoteText("occupied".into()))
+            .await
+            .unwrap();
+        let mut worker = super::ClipboardFileWorker::start(tx);
+        let mut latest = uuid::Uuid::nil();
+        for _ in 0..100 {
+            latest = uuid::Uuid::new_v4();
+            worker.submit(ClipSignal::InvalidateRemoteFiles).unwrap();
+            worker
+                .submit(ClipSignal::CollectLocalFiles {
+                    id: latest,
+                    paths: vec![],
+                })
+                .unwrap();
+        }
+        assert!(!worker.stopped.load(Ordering::Acquire));
+        let (other_tx, mut other_rx) = tokio::sync::mpsc::channel(1);
+        let mut other = super::ClipboardFileWorker::start(other_tx);
+        other
+            .submit(ClipSignal::CollectLocalFiles {
+                id: latest,
+                paths: vec![],
+            })
+            .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), other_rx.recv())
+                .await
+                .unwrap(),
+            Some(ClipSignal::CollectedLocalFiles { .. })
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(signal) = rx.recv().await {
+                if matches!(signal, ClipSignal::CollectedLocalFiles { id, .. } if id == latest) {
+                    return;
+                }
+            }
+            panic!("latest clipboard selection was lost");
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_file_worker_results_cannot_replace_a_newer_clipboard() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut worker = super::ClipboardFileWorker::start(tx.clone());
+        worker
+            .submit(ClipSignal::RemoteFileList {
+                tx,
+                files: vec![],
+                data_id: None,
+            })
+            .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        worker.submit(ClipSignal::InvalidateRemoteFiles).unwrap();
+        assert!(worker.current_result(result).is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "exhausts the shared file-request quota; run separately"]
+    async fn file_request_overload_is_bounded() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let local_clip: LocalClipState = Default::default();
+        let backend = MacClipboardBackend {
+            tx,
+            local_clip: local_clip.clone(),
+            tmp: "/tmp".into(),
+            mode: ClipboardMode::Bidirectional,
+        };
+        for stream_id in 0..129 {
+            backend.queue_file_contents_response(FileContentsRequest {
+                stream_id,
+                index: 0,
+                flags: FileContentsFlags::SIZE,
+                position: 0,
+                requested_size: 8,
+                data_id: None,
+            });
+        }
+        assert_eq!(local_clip.lock().unwrap().rejected_file_requests, [128]);
+        assert!(!local_clip.lock().unwrap().remote_file_response_lost);
+        assert_eq!(super::LOCAL_FILE_REQUEST_PERMITS.available_permits(), 0);
+        drop(rx);
+        drop(backend);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while super::LOCAL_FILE_REQUEST_PERMITS.available_permits() != 128 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(super::LOCAL_FILE_READ_PERMITS.available_permits(), 4);
+    }
+
+    #[test]
+    fn selections_are_complete_or_rejected() {
+        let root = std::env::temp_dir().join(format!("rdp123-selection-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let file = root.join("file.txt");
+        std::fs::write(&file, b"data").unwrap();
+        assert!(
+            super::collect_clipboard_files(&vec![file.clone(); super::MAX_CLIPBOARD_FILES]).is_ok()
+        );
+        assert!(super::collect_clipboard_files(&vec![
+            file.clone();
+            super::MAX_CLIPBOARD_FILES + 1
+        ])
+        .is_err());
+        assert!(super::collect_clipboard_files(&[file.clone(), root.join("missing")]).is_err());
+        std::os::unix::fs::symlink(&root, root.join("cycle")).unwrap();
+        assert!(super::collect_clipboard_files(std::slice::from_ref(&root)).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cache_cleanup_expires_individual_and_legacy_transfers() {
+        use std::time::{Duration, SystemTime};
+        let root = std::env::temp_dir().join(format!("rdp123-cleanup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let now = SystemTime::now();
+        let old = now - Duration::from_secs(200);
+        let legacy = root.join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::File::open(&legacy)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        let transfer = root.join("transfer-example");
+        std::fs::create_dir(&transfer).unwrap();
+        let lease = std::fs::File::create(transfer.join(".lease")).unwrap();
+        lease
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        lease.lock().unwrap();
+        super::cleanup_clipboard_caches(&root, now, Duration::from_secs(100));
+        assert!(
+            transfer.exists(),
+            "active downloads and pasteboard URLs must stay usable"
+        );
+        drop(lease);
+        super::cleanup_clipboard_caches(&root, now, Duration::from_secs(100));
+        assert!(
+            !transfer.exists(),
+            "expired individual transfers must be removed without restarting"
+        );
+        assert!(!legacy.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cache_cleanup_preserves_active_and_recent_downloads() {
+        use std::time::{Duration, SystemTime};
+        let root = std::env::temp_dir().join(format!("rdp123-cleanup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let now = SystemTime::now();
+        let mut active = None;
+        for (name, age, locked) in [
+            ("owner-old", 200, false),
+            ("owner-active", 200, true),
+            ("owner-recent", 0, false),
+        ] {
+            let dir = root.join(name);
+            std::fs::create_dir(&dir).unwrap();
+            let lease = std::fs::File::create(dir.join(".lease")).unwrap();
+            lease
+                .set_times(std::fs::FileTimes::new().set_modified(now - Duration::from_secs(age)))
+                .unwrap();
+            if locked {
+                lease.lock().unwrap();
+                active = Some(lease);
+            }
+        }
+        super::cleanup_clipboard_caches(&root, now, Duration::from_secs(100));
+        assert!(!root.join("owner-old").exists());
+        assert!(root.join("owner-active").exists());
+        assert!(root.join("owner-recent").exists());
+        drop(active);
+        super::cleanup_clipboard_caches(&root, now, Duration::from_secs(100));
+        assert!(!root.join("owner-active").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn multiple_file_pastes_keep_cache_leases_until_the_offer_is_replaced() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut worker = super::ClipboardFileWorker::start(tx.clone());
+        let bytes: Vec<u8> = (0..2 * 1024 * 1024 + 13).map(|i| (i % 251) as u8).collect();
+        worker
+            .submit(ClipSignal::RemoteFileList {
+                tx,
+                files: vec![
+                    RemoteFileEntry {
+                        wire_name: ".lease".into(),
+                        size: None,
+                        is_dir: true,
+                    },
+                    RemoteFileEntry {
+                        wire_name: "binary.dat".into(),
+                        size: Some(bytes.len() as u64),
+                        is_dir: false,
+                    },
+                ],
+                data_id: None,
+            })
+            .unwrap();
+        let Some(ClipSignal::PreparedRemoteOffer(offer)) =
+            worker.current_result(rx.recv().await.unwrap())
+        else {
+            panic!("missing offer");
+        };
+        let mut paste = tokio::task::spawn_blocking(move || {
+            let binary = offer.fetch(1).unwrap();
+            let empty = offer.fetch(0).unwrap();
+            (offer, binary, empty)
+        });
+        let (offer, binary, empty) = loop {
+            let signal = tokio::select! {
+                result = &mut paste => break result.unwrap(),
+                signal = rx.recv() => signal.unwrap(),
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => panic!("file paste stalled"),
+            };
+            match worker.current_result(signal).unwrap() {
+                request @ ClipSignal::FetchFile { .. } => worker.submit(request).unwrap(),
+                ClipSignal::RequestRemoteFile(request) => {
+                    assert_eq!(request.index, 1);
+                    let start = request.position as usize;
+                    let end = (start + request.requested_size as usize).min(bytes.len());
+                    worker
+                        .submit(ClipSignal::RemoteFileContents {
+                            stream_id: request.stream_id,
+                            data: Some(bytes[start..end].to_vec()),
+                        })
+                        .unwrap();
+                }
+                _ => panic!("unexpected file signal"),
+            }
+        };
+        assert_eq!(std::fs::read(&binary).unwrap(), bytes);
+        assert!(empty.is_dir());
+        for path in [&binary, &empty] {
+            let probe = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path.parent().unwrap().parent().unwrap().join(".lease"))
+                .unwrap();
+            assert!(
+                probe.try_lock().is_err(),
+                "Finder URLs must remain protected"
+            );
+        }
+        drop(offer);
+        for path in [binary, empty] {
+            let probe = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path.parent().unwrap().parent().unwrap().join(".lease"))
+                .unwrap();
+            assert!(probe.try_lock().is_ok());
+            assert!(
+                probe
+                    .metadata()
+                    .unwrap()
+                    .modified()
+                    .unwrap()
+                    .elapsed()
+                    .unwrap()
+                    .as_secs()
+                    < 5
+            );
+            std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn file_worker_preserves_nested_empty_and_unknown_size_files() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut worker = super::ClipboardFileWorker::start(tx.clone());
+        let files = vec![
+            RemoteFileEntry {
+                wire_name: "folder".into(),
+                size: None,
+                is_dir: true,
+            },
+            RemoteFileEntry {
+                wire_name: "folder\\empty".into(),
+                size: Some(0),
+                is_dir: false,
+            },
+            RemoteFileEntry {
+                wire_name: "folder\\sub\\text.txt".into(),
+                size: None,
+                is_dir: false,
+            },
+        ];
+        worker
+            .submit(ClipSignal::RemoteFileList {
+                tx,
+                files,
+                data_id: None,
+            })
+            .unwrap();
+        let Some(ClipSignal::PreparedRemoteOffer(offer)) =
+            worker.current_result(rx.recv().await.unwrap())
+        else {
+            panic!("missing offer")
+        };
+        let (reply, result) = std::sync::mpsc::channel();
+        worker
+            .submit(ClipSignal::FetchFile {
+                generation: offer.generation,
+                name: "folder".into(),
+                reply,
+            })
+            .unwrap();
+        for data in [3u64.to_le_bytes().to_vec(), b"abc".to_vec()] {
+            let signal = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let Some(ClipSignal::RequestRemoteFile(request)) = worker.current_result(signal) else {
+                panic!("missing request")
+            };
+            worker
+                .submit(ClipSignal::RemoteFileContents {
+                    stream_id: request.stream_id,
+                    data: Some(data),
+                })
+                .unwrap();
+        }
+        let (path, lease) = tokio::task::spawn_blocking(move || {
+            result.recv_timeout(std::time::Duration::from_secs(2))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(std::fs::read(path.join("empty")).unwrap(), b"");
+        assert_eq!(std::fs::read(path.join("sub/text.txt")).unwrap(), b"abc");
+        drop(lease);
+        std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn logoff_stops_but_server_shutdown_remains_reconnectable() {
+        use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
+        use ironrdp_session::GracefulDisconnectReason;
+        for code in [
+            ProtocolIndependentCode::LogoffByUser,
+            ProtocolIndependentCode::RpcInitiatedLogoff,
+        ] {
+            assert!(super::is_remote_logoff(&GracefulDisconnectReason::Other(
+                ErrorInfo::ProtocolIndependentCode(code).description()
+            )));
+        }
+        assert!(!super::is_remote_logoff(&GracefulDisconnectReason::Other(
+            ErrorInfo::ProtocolIndependentCode(ProtocolIndependentCode::ServerShutdown)
+                .description()
+        )));
+        assert!(!super::is_remote_logoff(
+            &GracefulDisconnectReason::ServerInitiated
+        ));
+    }
+
+    #[test]
+    fn shutdown_cancels_a_silent_handshake() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = test_session_config(GraphicsMode::Classic, true);
+        config.host = "127.0.0.1".into();
+        config.port = listener.local_addr().unwrap().port();
+        let session = super::spawn(config, Box::new(|_| {}));
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let mut bytes = [0u8; 4096];
+        assert!(socket.read(&mut bytes).unwrap() > 0);
+        session.command(SessionCommand::Shutdown);
+        let result = socket.read(&mut bytes);
+        drop(socket);
+        assert_eq!(
+            result.unwrap(),
+            0,
+            "shutdown must close the pending handshake"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_work_inside_an_active_session() {
+        let pending = PendingCommands::default();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let stopped = super::cancel_on_shutdown(&pending, async {
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let close = async {
+            ready.await.unwrap();
+            pending.shutdown.store(true, Ordering::Release);
+            pending.shutdown_notify.notify_one();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::join!(stopped, close)
+        })
+        .await
+        .expect("closing must interrupt a blocked reactivation");
+        assert!(result.is_none());
+    }
+
     use super::{
-        absorb_offline_command, apply_remote_file_contents, build_config, connector_failure,
-        initial_keyboard_sync_event, mdns_fallback_hostname, next_remote_fetch_action,
-        normalize_clipboard_to_crlf, plan_remote_clipboard_cache,
+        absorb_offline_command, build_config, connector_failure, initial_keyboard_sync_event,
+        mdns_fallback_hostname, normalize_clipboard_to_crlf, plan_remote_clipboard_cache,
         remote_clipboard_paste_input_events, remote_top_level_destination, resolve_pending_command,
         to_file_descriptors, update_keys_down, user_facing_disconnect_reason,
         validate_remote_file_range, ClipSignal, InputEvent, LocalClip, LocalClipFile,
         LocalClipState, LocalClipboardOfferResult, LocalClipboardState, MacClipboardBackend,
-        PendingCommands, RemoteClipboard, RemoteFetchAction, RemoteFileEntry, SessionCommand,
-        SessionConfig, SessionHandle, CLIPBOARD_RETRY_DELAYS,
+        PendingCommands, RemoteClipboard, RemoteFileEntry, SessionCommand, SessionConfig,
+        SessionHandle, CLIPBOARD_RETRY_DELAYS,
     };
     use crate::profile::{AudioMode, AuthenticationMode, ClipboardMode, GraphicsMode};
     use ironrdp_cliprdr::backend::CliprdrBackend;
@@ -3428,6 +4254,44 @@ mod tests {
     use ironrdp_pdu::rdp::client_info::CompressionType;
     use ironrdp_svc::{StaticVirtualChannel, SvcMessage};
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn dvc_rejects_large_messages_before_collecting_fragments() {
+        use ironrdp_dvc::pdu::{
+            CreateRequestPdu, DataFirstCompressedPdu, DataFirstPdu, DrdynvcDataPdu,
+            DrdynvcServerPdu,
+        };
+        use ironrdp_svc::SvcProcessor;
+        let display = ironrdp_displaycontrol::client::DisplayControlClient::new(|_| Ok(Vec::new()));
+        let mut client = ironrdp_dvc::DrdynvcClient::new().with_dynamic_channel(display);
+        let create = DrdynvcServerPdu::Create(CreateRequestPdu::new(
+            1,
+            "Microsoft::Windows::RDS::DisplayControl".into(),
+        ));
+        client
+            .process(&ironrdp_core::encode_vec(&create).unwrap())
+            .unwrap();
+        for size in [128 * 1024 * 1024 + 1, u32::MAX] {
+            let packet = DrdynvcDataPdu::DataFirst(DataFirstPdu::new(1, size, vec![0]));
+            assert!(client
+                .process(&ironrdp_core::encode_vec(&packet).unwrap())
+                .is_err());
+            let compressed =
+                DrdynvcDataPdu::DataFirstCompressed(DataFirstCompressedPdu::new(1, size, vec![0]));
+            let error = client
+                .process(&ironrdp_core::encode_vec(&compressed).unwrap())
+                .unwrap_err();
+            assert!(
+                format!("{error:?}").contains("128 MiB"),
+                "reject size before decoding compressed data"
+            );
+        }
+        // A 4096x4096 desktop plus protocol overhead must still fit.
+        let packet = DrdynvcDataPdu::DataFirst(DataFirstPdu::new(1, 68 * 1024 * 1024, vec![0]));
+        assert!(client
+            .process(&ironrdp_core::encode_vec(&packet).unwrap())
+            .is_ok());
+    }
 
     #[test]
     fn svc_rejects_oversized_first_fragment_without_waiting_for_the_body() {
@@ -3466,7 +4330,7 @@ mod tests {
         assert!(clipboard
             .request(offer.generation, "folder".into(), reply)
             .unwrap());
-        let dir = clipboard.jobs[0].cache_dir.clone();
+        let dir = clipboard.job.as_ref().unwrap().cache_dir.clone();
         clipboard.invalidate();
         assert!(!dir.exists());
         assert!(result.recv().is_err());
@@ -3741,7 +4605,7 @@ mod tests {
         server_state.replace(LocalClip::Files(vec![source_file.clone()]));
         let server_state: LocalClipState = std::sync::Arc::new(std::sync::Mutex::new(server_state));
         let client = CliprdrClient::new(Box::new(MacClipboardBackend {
-            tx: client_tx,
+            tx: client_tx.clone(),
             local_clip: client_state.clone(),
             tmp: "/tmp".to_string(),
             mode: ClipboardMode::Bidirectional,
@@ -3801,19 +4665,15 @@ mod tests {
         let list_response = deliver_cliprdr(list_request, &mut server);
         let trailing = deliver_cliprdr(list_response, &mut client);
         assert!(trailing.is_empty());
-        let mut remote = RemoteClipboard::default();
-        let offer = match client_rx.recv().await {
-            Some(ClipSignal::RemoteFileList { files, data_id, tx }) => {
-                remote.offer(files, data_id, tx)
-            }
-            _ => panic!("expected remote file list"),
+        let mut worker = super::ClipboardFileWorker::start(client_tx);
+        worker.submit(client_rx.recv().await.unwrap()).unwrap();
+        let Some(ClipSignal::PreparedRemoteOffer(offer)) =
+            worker.current_result(client_rx.recv().await.unwrap())
+        else {
+            panic!("expected prepared file offer")
         };
         assert_eq!(offer.len(), 1);
-        assert!(matches!(
-            next_remote_fetch_action(&mut remote).unwrap(),
-            RemoteFetchAction::Idle
-        ));
-        let paste = tokio::task::spawn_blocking(move || offer.fetch(0));
+        let mut paste = tokio::task::spawn_blocking(move || offer.fetch(0));
         let Some(ClipSignal::FetchFile {
             generation,
             name,
@@ -3822,13 +4682,22 @@ mod tests {
         else {
             panic!("expected paste request")
         };
-        assert!(remote.request(generation, name, reply).unwrap());
+        worker
+            .submit(ClipSignal::FetchFile {
+                generation,
+                name,
+                reply,
+            })
+            .unwrap();
 
-        let ready_paths = loop {
-            match next_remote_fetch_action(&mut remote).unwrap() {
-                RemoteFetchAction::Idle => panic!("download stalled before completion"),
-                RemoteFetchAction::Ready(paths) => break paths,
-                RemoteFetchAction::Request(request) => {
+        let path = loop {
+            let signal = tokio::select! {
+                result = &mut paste => break result.unwrap().unwrap(),
+                signal = client_rx.recv() => signal.unwrap(),
+                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => panic!("download stalled"),
+            };
+            match worker.current_result(signal).unwrap() {
+                ClipSignal::RequestRemoteFile(request) => {
                     assert_ne!(request.stream_id, 0);
                     let request_messages: Vec<_> = client
                         .channel_processor_downcast_mut::<CliprdrClient>()
@@ -3856,16 +4725,16 @@ mod tests {
                         }
                         _ => panic!("expected downloaded file data"),
                     };
-                    apply_remote_file_contents(&mut remote, stream_id, data).unwrap();
+                    worker
+                        .submit(ClipSignal::RemoteFileContents { stream_id, data })
+                        .unwrap();
                 }
+                _ => panic!("unexpected clipboard worker signal"),
             }
         };
-
-        let path = paste.await.unwrap().unwrap();
-        assert_eq!(ready_paths.as_slice(), std::slice::from_ref(&path));
         assert_eq!(path.file_name().unwrap(), "report.txt");
         assert!(std::fs::read(&path).unwrap() == data);
-        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
         let _ = std::fs::remove_file(source);
     }
 
@@ -4557,33 +5426,34 @@ mod tests {
             std::env::temp_dir().join(format!("rdp123-remote-cache-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&cache_dir).unwrap();
 
-        let job = plan_remote_clipboard_cache(
-            &remote,
-            &["report.txt".to_string(), "project".to_string()],
-            cache_dir.clone(),
-        )
-        .unwrap();
-
-        assert_eq!(
-            job.top_level_paths,
-            [cache_dir.join("report.txt"), cache_dir.join("project")]
-        );
-        let destinations: Vec<_> = job
-            .queue
-            .iter()
-            .map(|entry| entry.dest.strip_prefix(&cache_dir).unwrap().to_path_buf())
-            .collect();
-        assert_eq!(
-            destinations,
-            [
-                std::path::PathBuf::from("report.txt"),
-                std::path::PathBuf::from("project"),
-                std::path::PathBuf::from("project/notes.txt"),
-            ]
-        );
-
-        drop(job);
-        assert!(!cache_dir.exists(), "unfinished caches must be removed");
+        for (name, expected) in [
+            ("report.txt", vec!["report.txt"]),
+            ("project", vec!["project", "project/notes.txt"]),
+        ] {
+            std::fs::create_dir_all(&cache_dir).unwrap();
+            let job = plan_remote_clipboard_cache(&remote, name, cache_dir.clone()).unwrap();
+            assert_eq!(job.top_level_path, cache_dir.join("files").join(name));
+            let destinations: Vec<_> = job
+                .queue
+                .iter()
+                .map(|entry| {
+                    entry
+                        .dest
+                        .strip_prefix(cache_dir.join("files"))
+                        .unwrap()
+                        .to_path_buf()
+                })
+                .collect();
+            assert_eq!(
+                destinations,
+                expected
+                    .into_iter()
+                    .map(std::path::PathBuf::from)
+                    .collect::<Vec<_>>()
+            );
+            drop(job);
+            assert!(!cache_dir.exists(), "unfinished caches must be removed");
+        }
     }
 
     #[test]
@@ -4595,8 +5465,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&cache_dir).unwrap();
 
-        let result =
-            plan_remote_clipboard_cache(&remote, &["missing.txt".to_string()], cache_dir.clone());
+        let result = plan_remote_clipboard_cache(&remote, "missing.txt", cache_dir.clone());
 
         assert!(result.is_err());
         assert!(!cache_dir.exists(), "rejected cache plans must be removed");
@@ -4628,7 +5497,7 @@ mod tests {
         std::fs::write(root.join("folder/a.txt"), b"aaa").unwrap();
         std::fs::write(root.join("folder/inner/b.txt"), b"bb").unwrap();
 
-        let files = collect_clipboard_files(&[root.join("folder")]);
+        let files = collect_clipboard_files(&[root.join("folder")]).unwrap();
         let mut names: Vec<&str> = files.iter().map(|f| f.wire_name.as_str()).collect();
         names.sort_unstable();
         assert_eq!(

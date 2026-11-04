@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.6.21" src="https://img.shields.io/badge/version-0.6.21-2f81f7">
+  <img alt="Version 0.6.25" src="https://img.shields.io/badge/version-0.6.25-2f81f7">
   <a href="LICENSE"><img alt="GNU AGPL v3.0" src="https://img.shields.io/badge/license-AGPLv3-3da639"></a>
   <img alt="macOS 11 or newer" src="https://img.shields.io/badge/macOS-11%2B-black">
   <img alt="Rust 1.94 or newer" src="https://img.shields.io/badge/Rust-1.94%2B-b7410e">
@@ -35,66 +35,33 @@ last one closes, the app quietly returns to the menu bar.
 
 ## Why RDP123
 
-**Native and small.** RDP123 is an AppKit application written in Rust with
-`objc2`: no Electron and no bundled browser. Microsoft Entra login uses the
-system WebKit framework only while authenticating. The installed app is about
-10 MB, with a near-zero idle footprint.
+RDP123 is a native AppKit app written in Rust, with no Electron or bundled
+browser. It focuses on everyday remote access rather than enterprise
+management and occupies about 10 MB when installed.
 
 <p align="center">
   <img src="assets/size-comparison.svg" alt="Installed size: RDP123 10 MB, Microsoft Windows App 228 MB, Remote Desktop Manager (Devolutions) 993 MB" width="640">
 </p>
 
 RDP123's size is measured from v0.6.17; comparison app sizes are from mid-2026.
-RDP123 focuses on everyday remote access rather than enterprise-management features.
 
-**Built for low latency.** The first update after an idle period is presented
-immediately. Bursts are coalesced in an 8 ms window, allowing sustained streams
-up to 120 fps on ProMotion displays. Dirty-region tracking moves only changed
-pixels, while pooled IOSurfaces let CoreAnimation present frames without
-per-frame image allocation, full-frame copies, or texture uploads.
-
-**Two graphics pipelines.** Classic RDP 6.1 graphics is the reliable default.
-The selectable, experimental RDP 8 pipeline supports H.264/AVC420, RemoteFX
-Progressive, ClearCodec with NSCodec, Planar, cache-driven compositing, and
-automatic ZGFX compression, using IronRDP's codec decoders.
+Classic RDP 6.1 graphics is the default. Experimental RDP 8 graphics, including
+H.264, can be enabled per connection.
 
 ## Features
 
-- **Native multi-session workflow** — sessions appear individually in the Dock
-  and ⌘-Tab. Right-click the Dock icon to list and raise open sessions; the
-  frontmost session is marked.
-  Selecting an already open RDP connection raises its existing window.
-- **Responsive remote windows** — native title bar, font smoothing, Retina/
-  HiDPI-aware dynamic resizing, fixed resolutions, remembered window size, and
-  full screen.
-- **Native remote cursor** — server resize arrows, I-beam, hand, and other
-  pointer shapes are applied to the macOS cursor without server-drawn lag.
-- **Clipboard and files** — bidirectional text and file copy/paste, including
-  folders. Windows files are fetched when Finder or another app requests their
-  file URLs. Keep the session open until the paste finishes. Files stream in
-  chunks; clipboard access can be restricted or disabled per connection.
-- **External speech-to-text paste** — enable this option under **Settings →
-  Global** to accept the standard macOS Paste action from dictation tools,
-  wait for Windows to confirm the matching clipboard text, and insert it with
-  remote Ctrl+V.
-- **Remote audio** — play Windows audio on the Mac (default), leave it on the
-  remote computer, or disable it per connection.
-- **Reliable keyboard input** — physical scan-code mapping supports non-US
-  layouts such as Swiss German and releases modifiers safely when switching
-  applications.
-- **Wake on LAN and keep-alive** — optionally wake a host by MAC address and
-  prevent idle policy lockouts with an invisible key tap. Both are configured
-  per connection and keep-alive is off by default.
-- **Password or Microsoft Entra authentication** — password-based NLA uses the
-  macOS Keychain. Entra web authentication supports joined Windows 11 hosts and
-  is equivalent to `enablerdsaadauth:i:1`; tokens and the ephemeral
-  proof-of-possession key remain in memory.
-- **Native Settings** — create, duplicate, and manage RDP and SSH entries.
-  Configure display, colour depth, scaling, graphics, compression, clipboard,
-  audio, authentication, reconnect behavior, and password handling. The About
-  tab shows the exact installed version.
-- **SSH shortcuts** — keep SSH hosts beside RDP connections and open them in
-  your preferred terminal using your existing SSH keys and configuration.
+- Manage multiple sessions through native windows, the Dock, and ⌘-Tab.
+- Use Retina-aware resizing, fixed resolutions, remembered window sizes,
+  full screen, and native remote cursors.
+- Copy text, files, and folders in both directions, with per-connection
+  clipboard controls.
+- Paste text from external speech-to-text apps into the active remote app.
+- Play remote audio on the Mac, leave it on the remote computer, or disable it.
+- Use non-US keyboard layouts and optional Mac-style ⌘ shortcuts.
+- Configure automatic reconnect, Wake on LAN, and optional session keep-alive.
+- Sign in with a password or Microsoft Entra web authentication.
+- Create and duplicate RDP or SSH profiles in native Settings.
+- Open SSH connections in your preferred terminal using existing keys and config.
 
 ## Requirements
 
@@ -118,13 +85,8 @@ cargo xtask install                # release build, sign, install in /Applicatio
 open /Applications/RDP123.app
 ```
 
-`cargo xtask install` installs the only app copy at `/Applications/RDP123.app`.
-Use `cargo xtask bundle` to create `dist/RDP123.app` without installing. Both
-commands use the locally generated **RDP123 Local** identity when available and
-otherwise fall back to an ad-hoc signature (`-`). The bundle includes the
-AGPLv3 license under `Contents/Resources`. Bundling replaces home and workspace
-paths with generic build paths and refuses binaries that still contain either
-original path.
+Use `cargo xtask bundle` to create `dist/RDP123.app` without installing.
+Run the signing helper once to keep macOS permissions stable across builds.
 
 <details>
 <summary>Back up before updating and restore a previous build</summary>
@@ -157,7 +119,8 @@ contain private connection details and must never be committed or published.
 
 </details>
 
-### Stable local signing
+<details>
+<summary>Local signing and bundle details</summary>
 
 Running `scripts/make-signing-identity.sh` once is strongly recommended. macOS
 ties the Keychain **Always Allow** decision and **Local Network** permission to
@@ -168,8 +131,10 @@ The script is non-interactive, free, and requires no Apple account. It creates
 a self-signed **RDP123 Local** certificate with a non-extractable private key in
 a dedicated keychain; it never uses your login keychain.
 
-<details>
-<summary>Signing internals, removal, and custom identities</summary>
+Both build commands use **RDP123 Local** when available, otherwise an ad-hoc
+signature (`-`). The bundle includes the AGPLv3 license under
+`Contents/Resources`. Bundling replaces home and workspace paths with generic
+build paths and refuses binaries that still contain either original path.
 
 The signing keychain is
 `~/Library/Keychains/rdp123-signing.keychain-db`. Its random password is kept in
@@ -191,7 +156,8 @@ unnotarized, which is unnecessary when running it on the Mac that built it.
 
 </details>
 
-### First connection prompts
+<details>
+<summary>First connection prompts and Keychain troubleshooting</summary>
 
 - **Local Network:** click **Allow** when macOS asks whether RDP123 may find
   local devices. RDP123 briefly retries TCP reachability after approval, but
@@ -203,38 +169,70 @@ unnotarized, which is unnecessary when running it on the Mac that built it.
   Password for Keychain "login"…*. Choose **Password handling → Always ask**
   to store no password at all.
 
+</details>
+
 ## Usage
 
-1. On first launch there are no saved connections. Open the menu-bar **RDP**
-   item → **Settings…**.
-2. Under **Connection**, add an entry with **+**, configure it, and choose
-   **Save**. **Revert** discards edits; switching with unsaved changes asks
-   before continuing. **Duplicate** copies the selected entry, including any
-   saved password, into an independent profile with a "Copy" suffix.
-   Server-key trust is confirmed separately for the copy.
-3. Under **Global**, choose the SSH terminal, optional ⌘/⌥ swap, external STT
-   paste support, and whether RDP123 starts at login. STT paste also requires
-   Local → Remote clipboard access on the connection.
-4. Select a saved connection from the menu:
-   - **RDP with Password (NLA):** enter or retrieve the password, trust the new
-     server key, and connect.
-   - **RDP with Microsoft Entra web:** trust the server key and complete the
-     Microsoft login and MFA without an RDP password. Use the device hostname.
-   - **SSH:** launch `ssh user@host` in the selected terminal.
-   Selecting an RDP entry that is already open brings that window forward,
-   including while connecting or reconnecting. Duplicate the entry if you
-   need a separate session with the same settings.
+1. Open the menu-bar **RDP** item → **Settings…**.
+2. Under **Connections**, choose **+**, enter the host and login details, and
+   **Save**. Use **Duplicate** to copy an existing profile.
+3. Under **Global**, choose the SSH terminal, optional ⌘/⌥ swap, Mac shortcuts,
+   speech-to-text paste, and whether RDP123 starts at login.
+4. Select a saved connection from the menu to connect. RDP asks you to trust a
+   new server key before signing in; Entra mode opens Microsoft login and MFA.
+
+Selecting an already open RDP connection brings its window forward, including
+while reconnecting. Right-click the Dock icon to list open sessions; the
+frontmost session is marked. Duplicate a profile if you need a second session
+with the same settings.
 
 <p align="center">
-  <img src="assets/screenshot-settings.png" alt="The Settings window with the connection editor" width="560">
+  <img src="assets/screenshot-settings.png" alt="Connection settings with fictional example profiles" width="560">
 </p>
+
+<p align="center">
+  <img src="assets/screenshot-global.png" alt="Global settings for SSH, keyboard shortcuts, speech-to-text paste, and startup" width="560">
+</p>
+
+<details>
+<summary>Connection options and profile editing</summary>
+
+Each RDP profile controls display, colour depth, scaling, graphics, compression,
+clipboard, audio, authentication, reconnect behavior, and password handling.
+Audio plays on the Mac by default. Wake on LAN uses the host's MAC address;
+**Keep session awake**, off by default, sends an invisible key tap while idle.
+
+**Revert** discards edits; switching profiles with unsaved changes asks first.
+**Duplicate** creates an independent profile with a "Copy" suffix, including any
+saved password. The copy requires its own server-key trust confirmation.
+The **About** tab shows the installed version and libraries.
+
+</details>
+
+### Clipboard and speech to text
+
+Copy and paste text, files, and folders between Mac and Windows. Keep the
+session open until file transfers finish. Clipboard direction can be restricted
+or disabled per connection.
+
+For dictation tools, enable **Settings → Global → Allow pasting from
+speech-to-text apps** and allow Mac-to-remote clipboard access on the connection.
+Use a dictation shortcut without the key mapped to Windows, such as ⌃+⇧+A.
+
+<details>
+<summary>Clipboard transfer details</summary>
+
+Windows files are fetched in chunks when Finder or another app requests their
+file URLs. Speech-to-text support accepts the standard macOS Paste action,
+waits for Windows to confirm the matching clipboard text, then sends Ctrl+V.
+
+</details>
 
 ### Local data
 
 - Connection names, hosts, options, and pinned server keys:
   `~/Library/Application Support/ch.asd123.RDP123/connections.json`.
 - Passwords: macOS Keychain service `ch.asd123.rdp123`, never the profile file.
-- A changed server key is flagged before credentials are sent.
 
 ### SSH terminals
 
@@ -255,17 +253,31 @@ SSH entries use your keys and `~/.ssh/config`. Select a terminal under
 
 ### Keyboard and Karabiner
 
-RDP123 sends physical scan codes directly, so Windows shortcuts work without a
-remapping tool. If you use
-[Karabiner-Elements](https://karabiner-elements.pqrs.org), add
-`^ch\.asd123\.rdp123` to rule exclusion lists so sessions receive raw keys. The
-author's [Karabiner configuration](https://github.com/patrickdobler/karabiner-config)
-already does this.
+RDP123 supports physical key mapping, including non-US layouts such as Swiss
+German. [Karabiner-Elements](https://karabiner-elements.pqrs.org) rules also
+affect keys sent to the remote session; excluding RDP123 from a rule disables
+that rule while an RDP123 window is active.
 
 For PC key positions inside sessions, enable **Settings → Global → Swap ⌘ and
 ⌥**. Then ⌘ acts as Alt and ⌥ as the Windows key. It is off by default.
 
-### Hyper key opens Microsoft 365 Copilot or Office
+**Settings → Global → Use ⌘ instead of Ctrl for common shortcuts** optionally sends
+⌘C, ⌘V, ⌘X, ⌘A, ⌘Z, ⌘F and ⌘W as Ctrl shortcuts, including Shift variants.
+It is off by default and also works with the ⌘/⌥ swap enabled. Other ⌘ keys,
+a ⌘ tap, and combinations with Control or Option keep their normal mapping.
+
+<details>
+<summary>Keyboard mapping details</summary>
+
+Shortcut detection follows the Mac keyboard layout, with physical US key
+positions as a fallback for non-Latin layouts. Windows still interprets the
+original physical key using its own layout. External STT paste takes priority
+for ⌘V when enabled. RDP123 releases modifiers when switching applications.
+
+</details>
+
+<details>
+<summary>Hyper key opens Microsoft 365 Copilot or Office</summary>
 
 A macOS Hyper key commonly sends ⌘+⌃+⌥+⇧. In a Windows session, this becomes
 the Windows+Ctrl+Alt+Shift shortcut reserved for Microsoft Office. If pressing
@@ -287,6 +299,8 @@ Restart Windows Explorer, or sign out and back in, once more. This registry
 workaround is described in
 [Microsoft Q&A](https://learn.microsoft.com/en-us/answers/questions/4331341/disabling-the-office-hotkey-in-windows-10).
 
+</details>
+
 ## Security
 
 - **Passwords:** macOS Keychain only; never profiles or logs.
@@ -294,6 +308,8 @@ workaround is described in
   AAD Auth, negotiated before the session starts.
 - **Entra:** access tokens are bound to a fresh 2048-bit RSA
   proof-of-possession key. Tokens and private keys remain in process memory.
+  Web authentication for Entra-joined Windows 11 hosts is equivalent to
+  `enablerdsaadauth:i:1`.
 - **Server identity:** on first connection, RDP123 displays the server public
   key's SHA-256 fingerprint before sending credentials. The key is pinned and a
   later mismatch is reported. Pinning the key rather than the certificate
@@ -308,14 +324,16 @@ workaround is described in
 - No data is sent to the developer. RDP connects only to the configured host;
   SSH invokes the local client; Entra mode contacts
   `login.microsoftonline.com` for Microsoft authentication and its RDP token.
-- Profiles remain in Application Support and passwords in the Keychain.
-  Clipboard and audio move only when enabled for that connection.
+- Clipboard and audio move only when enabled for that connection.
 
 There are intentionally no prebuilt notarized binaries. Review the source and
 dependencies before building any remote-access software. The signing helper
 only provides a stable local identity and never contacts Apple.
 
 ## Architecture
+
+<details>
+<summary>Components, rendering, and graphics codecs</summary>
 
 - **`rdp123-core`:** profiles, Keychain integration, RDP engine, input, resize,
   clipboard, shared framebuffer, and macOS-to-RDP scan-code mapping. It is
@@ -327,6 +345,19 @@ Each session owns a thread with a single-threaded Tokio runtime. Commands move
 to the session over a channel; frame, clipboard, trust, and disconnect events
 return to the main thread through GCD. The session never touches AppKit and the
 UI never speaks RDP.
+
+The first frame after idle is presented immediately. Frame bursts are coalesced
+in an 8 ms window, supporting up to 120 fps on ProMotion displays. Dirty-region
+tracking copies only changed pixels; pooled IOSurfaces and CoreAnimation avoid
+per-frame image allocation, full-frame copies, and texture uploads. Remote
+cursor shapes, including I-beam, hand, and resize arrows, use the native cursor.
+
+The experimental RDP 8 pipeline uses IronRDP's decoders for H.264/AVC420,
+RemoteFX Progressive, ClearCodec with NSCodec, and Planar, with cache-driven
+compositing and ZGFX compression. Microsoft Entra login uses the system WebKit
+framework only while authenticating.
+
+</details>
 
 ## Known limitations
 
@@ -341,6 +372,9 @@ UI never speaks RDP.
   the reliable default.
 - Clipboard images, microphone input, multi-monitor, and console/admin sessions
   are not implemented. Audio is remote-to-local uncompressed PCM only.
+- Mac-to-Windows file copies allow up to 4,096 entries per selection. Symbolic
+  links and paths unsupported by Windows are rejected; archive these selections
+  first or copy them in smaller groups.
 
 ## Development
 
@@ -366,6 +400,12 @@ exception keeps other advisories visible and can be removed after an upstream
 update.
 
 ## Credits
+
+### Contributors
+
+- [willie](https://github.com/willie)
+
+### Open-source libraries
 
 - [IronRDP](https://github.com/Devolutions/IronRDP) — RDP protocol, channels,
   and graphics pipeline.

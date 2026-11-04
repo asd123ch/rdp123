@@ -19,12 +19,8 @@ const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
 
 /// Store or overwrite the password for `account`.
 ///
-/// Recreates the item instead of updating in place: an update keeps the old
-/// item's access list, which may reference an earlier build's code identity and
-/// then prompts on every read. A fresh item is owned by the current app, so
-/// later reads are silent.
+/// Update in place so a failed write cannot delete the previous password.
 pub fn store_password(account: &str, password: &str) -> Result<()> {
-    delete_password(account)?;
     set_generic_password(SERVICE, account, password.as_bytes())?;
     Ok(())
 }

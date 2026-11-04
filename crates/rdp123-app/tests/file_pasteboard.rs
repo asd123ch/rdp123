@@ -1,9 +1,18 @@
 use objc2_app_kit::{NSPasteboard, NSPasteboardTypeFileURL};
 use objc2_foundation::NSString;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+
+struct TestChild(Child);
+
+impl Drop for TestChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 fn app_binary() -> std::path::PathBuf {
     std::env::var_os("RDP123_TEST_BINARY")
@@ -18,18 +27,20 @@ fn stale_file_offer_preserves_a_newer_local_copy() {
     board.clearContents();
     let ty = unsafe { objc2_app_kit::NSPasteboardTypeString };
     board.setString_forType(&NSString::from_str("newer local text"), ty);
-    let mut child = Command::new(app_binary())
-        .args([
-            "--serve-file-offer",
-            &old.to_string(),
-            "1",
-            &board.name().to_string(),
-        ])
-        .stdin(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let _keep_pipe_open = child.stdin.take();
-    assert!(child.wait().unwrap().success());
+    let mut child = TestChild(
+        Command::new(app_binary())
+            .args([
+                "--serve-file-offer",
+                &old.to_string(),
+                "1",
+                &board.name().to_string(),
+            ])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let _keep_pipe_open = child.0.stdin.take();
+    assert!(child.0.wait().unwrap().success());
     assert_eq!(
         board.stringForType(ty).unwrap().to_string(),
         "newer local text"
@@ -40,19 +51,21 @@ fn stale_file_offer_preserves_a_newer_local_copy() {
 fn named_pasteboard_serves_each_file_on_first_read_only() {
     let board = NSPasteboard::pasteboardWithUniqueName();
     let change = board.clearContents();
-    let mut child = Command::new(app_binary())
-        .args([
-            "--serve-file-offer",
-            &change.to_string(),
-            "2",
-            &board.name().to_string(),
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut replies = child.stdin.take().unwrap();
-    let output = child.stdout.take().unwrap();
+    let mut child = TestChild(
+        Command::new(app_binary())
+            .args([
+                "--serve-file-offer",
+                &change.to_string(),
+                "2",
+                &board.name().to_string(),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut replies = child.0.stdin.take().unwrap();
+    let output = child.0.stdout.take().unwrap();
     let (tx, rx) = mpsc::channel();
     let responder = std::thread::spawn(move || {
         for line in BufReader::new(output).lines().map_while(Result::ok) {
@@ -66,7 +79,9 @@ fn named_pasteboard_serves_each_file_on_first_read_only() {
         .types()
         .is_some_and(|types| types.containsObject(&marker))
     {
-        assert!(Instant::now() < deadline, "no native file offer");
+        let status = child.0.try_wait().expect("inspect file-offer helper");
+        assert!(status.is_none(), "file-offer helper exited before publishing: {status:?}; expected pasteboard generation {change}, current {}", board.changeCount());
+        assert!(Instant::now() < deadline, "file-offer helper is still running but no native file offer appeared within 5s; expected pasteboard generation {change}, current {}; types: {:?}", board.changeCount(), board.types());
         std::thread::sleep(Duration::from_millis(20));
     }
     let items = board.pasteboardItems().unwrap();
@@ -94,7 +109,6 @@ fn named_pasteboard_serves_each_file_on_first_read_only() {
         );
     }
     board.clearContents();
-    let _ = child.kill();
-    child.wait().unwrap();
+    drop(child);
     responder.join().unwrap();
 }

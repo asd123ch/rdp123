@@ -136,33 +136,6 @@ impl SharedFramebuffer {
         inner.mark_dirty(left, top, right, bottom);
     }
 
-    /// Write a rectangle from a tightly packed BGRA buffer of exactly
-    /// `width * height` pixels (EGFX surface flushes). Clipped to the
-    /// framebuffer bounds; rows outside are dropped.
-    pub fn write_rect(&self, src: &[u8], left: u32, top: u32, width: u32, height: u32) {
-        let mut inner = self.inner.lock().unwrap();
-        let fb_w = u32::from(inner.width);
-        let fb_h = u32::from(inner.height);
-        let src_stride = width as usize * BYTES_PER_PIXEL;
-        if src.len() < src_stride * height as usize || fb_w == 0 {
-            return;
-        }
-        let right = (left + width).min(fb_w);
-        let bottom = (top + height).min(fb_h);
-        if left >= right || top >= bottom {
-            return;
-        }
-        let fb_stride = fb_w as usize * BYTES_PER_PIXEL;
-        let row_bytes = (right - left) as usize * BYTES_PER_PIXEL;
-        for row in 0..(bottom - top) as usize {
-            let src_start = row * src_stride;
-            let dst_start = (top as usize + row) * fb_stride + left as usize * BYTES_PER_PIXEL;
-            inner.pixels[dst_start..dst_start + row_bytes]
-                .copy_from_slice(&src[src_start..src_start + row_bytes]);
-        }
-        inner.mark_dirty(left as usize, top as usize, right as usize, bottom as usize);
-    }
-
     /// Sync a presentation buffer with the current contents.
     ///
     /// `synced_generation` is the generation returned by the previous call for
@@ -255,25 +228,6 @@ impl SharedFramebuffer {
         }
         Some(result)
     }
-
-    /// Run `f` with a borrow of the current pixels and dimensions.
-    /// Returns `None` if the framebuffer is empty.
-    pub fn with_pixels<R>(&self, f: impl FnOnce(&[u8], u16, u16) -> R) -> Option<R> {
-        let inner = self.inner.lock().unwrap();
-        if inner.pixels.is_empty() {
-            return None;
-        }
-        Some(f(&inner.pixels, inner.width, inner.height))
-    }
-
-    /// Clone the current pixels and dimensions.
-    pub fn snapshot(&self) -> Option<(Vec<u8>, u16, u16)> {
-        let inner = self.inner.lock().unwrap();
-        if inner.pixels.is_empty() {
-            return None;
-        }
-        Some((inner.pixels.clone(), inner.width, inner.height))
-    }
 }
 
 #[cfg(test)]
@@ -304,7 +258,7 @@ mod tests {
         buf[0] = 0x77;
 
         // Dirty only the bottom-right pixel.
-        fb.write_rect(&[1, 2, 3, 4], 3, 3, 1, 1);
+        fb.blit_rect(&[1, 2, 3, 4].repeat(16), 3, 3, 1, 1);
         let (_, _, second_generation) = fb.present_into(&mut buf, first_generation).unwrap();
 
         assert!(second_generation > first_generation);
@@ -346,7 +300,7 @@ mod tests {
 
         buf[0] = 0x99;
         for _ in 0..(MAX_DIRTY_ENTRIES + 1) {
-            fb.write_rect(&[1, 2, 3, 4], 3, 3, 1, 1);
+            fb.blit_rect(&[1, 2, 3, 4].repeat(16), 3, 3, 1, 1);
         }
         fb.present_into(&mut buf, generation).unwrap();
         // Overflow cleared the log, so the presenter full-copied.
@@ -357,7 +311,7 @@ mod tests {
     fn strided_present_respects_destination_stride() {
         let fb = SharedFramebuffer::new();
         fb.resize(2, 2);
-        fb.write_rect(&[1, 2, 3, 4], 1, 1, 1, 1);
+        fb.blit_rect(&[1, 2, 3, 4].repeat(4), 1, 1, 1, 1);
 
         // Destination rows padded to 16 bytes (stride > 2 px * 4).
         let stride = 16;
@@ -371,7 +325,7 @@ mod tests {
 
         // Partial sync: corrupt outside, dirty one pixel, sync again.
         dst[0] = 0x11;
-        fb.write_rect(&[9, 9, 9, 9], 0, 1, 1, 1);
+        fb.blit_rect(&[9, 9, 9, 9].repeat(4), 0, 1, 1, 1);
         fb.present_into_stride(&mut dst, stride, generation)
             .unwrap();
         assert_eq!(dst[0], 0x11);

@@ -2,14 +2,21 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
-  verify:
+  macos:
     runs-on: macos-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -17,6 +24,8 @@ jobs:
           components: rustfmt, clippy
           targets: x86_64-apple-darwin
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: verify
       - name: Format
         run: cargo fmt --all --check
       - name: Test
@@ -29,7 +38,38 @@ jobs:
         env:
           RDP123_SIGN_IDENTITY: "-"
         run: cargo xtask bundle
+
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      AUDIT_VERSION: 0.22.2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: audit-cache
+        with:
+          path: ${{ runner.temp }}/cargo-audit
+          key: cargo-audit-ubuntu-24.04-${{ runner.arch }}-${{ env.AUDIT_VERSION }}-v1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        if: steps.audit-cache.outputs.cache-hit != 'true'
+      - name: Install audit tool
+        if: steps.audit-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-audit --version "$AUDIT_VERSION" --locked --root "$RUNNER_TEMP/cargo-audit"
       - name: Dependency audit
+        run: '"$RUNNER_TEMP/cargo-audit/bin/cargo-audit" audit --ignore RUSTSEC-2023-0071 -D warnings'
+
+  # Keep the existing required check fail-closed when either job fails or is skipped.
+  verify:
+    needs: [macos, audit]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      MACOS_RESULT: ${{ needs.macos.result }}
+      AUDIT_RESULT: ${{ needs.audit.result }}
+    steps:
+      - name: Require all checks
         run: |
-          cargo install cargo-audit --version 0.22.2 --locked
-          cargo audit --ignore RUSTSEC-2023-0071 -D warnings
+          test "$MACOS_RESULT" = success
+          test "$AUDIT_RESULT" = success

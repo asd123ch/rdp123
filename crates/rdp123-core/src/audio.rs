@@ -34,6 +34,8 @@ const FRAME_BYTES: usize = 4;
 
 /// Pending PCM blocks between the session loop and the audio callback.
 const QUEUE_BLOCKS: usize = 64;
+// The RDPSND header has a 16-bit body length.
+const MAX_AUDIO_BLOCK_BYTES: usize = u16::MAX as usize;
 
 /// Cap the callback-side buffer at ~500 ms so a hiccup can't build up latency.
 const MAX_BUFFERED_MS: usize = 500;
@@ -112,7 +114,8 @@ fn pcm_callback(
 ) -> impl FnMut(&mut [f32], &cpal::OutputCallbackInfo) + Send + 'static {
     let mut resampler = Resampler::new(out_rate);
     move |out, _| {
-        while let Ok(block) = rx.try_recv() {
+        for _ in 0..QUEUE_BLOCKS {
+            let Ok(block) = rx.try_recv() else { break };
             resampler.push(&block);
         }
         resampler.fill(out);
@@ -145,12 +148,13 @@ impl Resampler {
     }
 
     fn push(&mut self, block: &[u8]) {
-        self.buffered.extend(block);
-        // Drop the oldest audio if the queue outgrew the latency cap.
-        if self.buffered.len() > self.max_buffered {
-            self.buffered
-                .drain(..self.buffered.len() - self.max_buffered);
+        if !block.len().is_multiple_of(FRAME_BYTES) {
+            return;
         }
+        let block = &block[block.len().saturating_sub(self.max_buffered)..];
+        let discard = (self.buffered.len() + block.len()).saturating_sub(self.max_buffered);
+        self.buffered.drain(..discard);
+        self.buffered.extend(block);
     }
 
     fn fill(&mut self, out: &mut [f32]) {
@@ -204,7 +208,10 @@ impl RdpsndClientHandler for RdpsndBackend {
     }
 
     fn wave(&mut self, format: &AudioFormat, _ts: u32, data: Cow<'_, [u8]>) {
-        if !self.formats.contains(format) {
+        if !self.formats.contains(format)
+            || data.len() > MAX_AUDIO_BLOCK_BYTES
+            || !data.len().is_multiple_of(FRAME_BYTES)
+        {
             return;
         }
         if !self.got_audio {
@@ -349,6 +356,11 @@ impl DvcProcessor for RdpsndDvcChannel {
     }
 
     fn process(&mut self, _channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
+        if payload.len() > MAX_AUDIO_BLOCK_BYTES + 4 {
+            return Err(ironrdp_pdu::pdu_other_err!(
+                "audio packet exceeds the RDPSND size limit"
+            ));
+        }
         let pdu = ServerAudioOutputPdu::decode(&mut ReadCursor::new(payload))
             .map_err(|e| decode_err!(e))?;
 
@@ -441,6 +453,22 @@ impl DvcClientProcessor for RdpsndDvcChannel {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_wave_is_rejected_before_decoding() {
+        let mut channel = training_channel(DvcAudioState::Ready);
+        let mut packet = vec![0x0d, 0, 12, 0];
+        packet.resize(1024 * 1024, 0);
+        assert!(channel.process(5, &packet).is_err());
+    }
+
+    #[test]
+    fn resampler_does_not_allocate_for_discarded_audio() {
+        let mut resampler = Resampler::new(SOURCE_RATE);
+        resampler.push(&vec![0; 1024 * 1024]);
+        assert_eq!(resampler.buffered.len(), 88_200);
+        assert!(resampler.buffered.capacity() <= 88_200 * 2);
+    }
 
     fn training_channel(state: DvcAudioState) -> RdpsndDvcChannel {
         let (tx, _rx) = sync_channel(1);

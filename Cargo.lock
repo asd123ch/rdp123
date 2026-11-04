@@ -1271,8 +1271,6 @@ dependencies = [
 [[package]]
 name = "ironrdp-dvc"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47afd86754e12bebc45f32c9f62d8bb51df50b7bafea8cab7addbcf83c456338"
 dependencies = [
  "ironrdp-bulk",
  "ironrdp-core",
@@ -2450,7 +2448,7 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "rdp123-app"
-version = "0.6.21"
+version = "0.6.25"
 dependencies = [
  "block2",
  "dispatch2",
@@ -2472,7 +2470,7 @@ dependencies = [
 
 [[package]]
 name = "rdp123-core"
-version = "0.6.21"
+version = "0.6.25"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -3912,7 +3910,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.6.21"
+version = "0.6.25"
 dependencies = [
  "anyhow",
 ]

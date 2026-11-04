@@ -21,10 +21,11 @@ use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
     NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSBorderType, NSBox, NSBoxType,
-    NSButton, NSColor, NSControlStateValueOff, NSControlStateValueOn, NSControlTextEditingDelegate,
-    NSFont, NSImageView, NSPasteboard, NSPasteboardTypeString, NSPopUpButton, NSScrollView,
-    NSSecureTextField, NSSegmentSwitchTracking, NSSegmentedControl, NSTableColumn, NSTableView,
-    NSTableViewDataSource, NSTableViewDelegate, NSTextAlignment, NSTextField, NSTextFieldDelegate,
+    NSButton, NSCellImagePosition, NSColor, NSControlStateValueOff, NSControlStateValueOn,
+    NSControlTextEditingDelegate, NSFont, NSImage, NSImageView, NSPasteboard,
+    NSPasteboardTypeString, NSPopUpButton, NSScrollView, NSSecureTextField,
+    NSSegmentSwitchTracking, NSSegmentedControl, NSTableColumn, NSTableView, NSTableViewDataSource,
+    NSTableViewDelegate, NSTextAlignment, NSTextField, NSTextFieldDelegate,
     NSUserInterfaceItemIdentification, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
     NSWorkspace,
 };
@@ -68,22 +69,25 @@ const AUTHENTICATION: [AuthenticationMode; 2] =
     [AuthenticationMode::Password, AuthenticationMode::EntraWeb];
 
 // Window / layout geometry.
-const W: f64 = 720.0;
+const W: f64 = 800.0;
 const H: f64 = 760.0;
 const CH: f64 = 716.0; // container height (below the segmented control)
 const SEG_H: f64 = 24.0;
-const EDIT_TOP: f64 = 690.0; // top of the first editor row
-const FORM_X: f64 = 224.0;
-const LABEL_W: f64 = 150.0;
-const FIELD_X: f64 = 382.0;
-const FIELD_W: f64 = 322.0;
+const FORM_H: f64 = 1040.0;
+const EDIT_TOP: f64 = FORM_H - 32.0;
+const FORM_X: f64 = 16.0;
+const LABEL_W: f64 = 144.0;
+const FIELD_X: f64 = 172.0;
+const FIELD_W: f64 = 350.0;
 const ROW_H: f64 = 22.0;
-const PITCH: f64 = 24.0;
-// Pop-up buttons are 24 points tall, so give their rows a visible gutter.
-const POPUP_PITCH: f64 = 26.0;
-// Checkboxes need less vertical air than bordered form controls.
-const CHECKBOX_PITCH: f64 = 22.0;
-const HDR_PITCH: f64 = 26.0;
+const PITCH: f64 = 32.0;
+const CHECKBOX_PITCH: f64 = 28.0;
+const HDR_PITCH: f64 = 34.0;
+const ABOUT_LIST_HEIGHT: f64 = 344.0;
+
+fn about_library_row_y(row: usize) -> f64 {
+    ABOUT_LIST_HEIGHT - 24.0 - row as f64 * 24.0
+}
 
 struct AboutLibrary<'a> {
     name: String,
@@ -149,6 +153,7 @@ pub struct SettingsIvars {
     table: RefCell<Option<Retained<NSTableView>>>,
     segmented: RefCell<Option<Retained<NSSegmentedControl>>>,
     conn_pane: RefCell<Option<Retained<NSScrollView>>>,
+    connection_form: RefCell<Option<Retained<NSView>>>,
     global_pane: RefCell<Option<Retained<NSScrollView>>>,
     about_pane: RefCell<Option<Retained<NSScrollView>>>,
     save_button: Check,
@@ -192,6 +197,7 @@ pub struct SettingsIvars {
     terminal: Popup,
     custom: Field,
     swap_cmd_alt: Check,
+    mac_shortcuts: Check,
     external_stt_paste: Check,
     /// Launch-at-login. Not persisted in the document: the checkbox mirrors
     /// the system's `SMAppService` status.
@@ -285,7 +291,7 @@ define_class!(
             connection.host = "localhost".to_string();
             document.connections.push(connection);
             let new_index = document.connections.len() as isize - 1;
-            if !self.save_document(&document) {
+            if !self.save_document(&mut document) {
                 return;
             }
             *self.ivars().document.borrow_mut() = document;
@@ -315,12 +321,12 @@ define_class!(
             let Some(index) = document.duplicate_connection(&original.id) else {
                 return;
             };
-            let copy_id = &document.connections[index].id;
+            let copy_id = document.connections[index].id.clone();
             let copied_password = if original.kind == ConnectionKind::Rdp
                 && original.rdp.authentication == AuthenticationMode::Password
                 && original.rdp.password_policy == PasswordPolicy::Remember
             {
-                match secrets::copy_password(&original.id, copy_id) {
+                match secrets::copy_password(&original.id, &copy_id) {
                     Ok(copied) => copied,
                     Err(error) => {
                         ui::show_error(self.mtm(), "Could not duplicate connection", &format!("{error:#}"));
@@ -330,9 +336,9 @@ define_class!(
             } else {
                 false
             };
-            if !self.save_document(&document) {
+            if !self.save_document(&mut document) {
                 if copied_password {
-                    if let Err(error) = secrets::delete_password(copy_id) {
+                    if let Err(error) = secrets::delete_password(&copy_id) {
                         ui::show_error(self.mtm(), "Could not remove copied password", &format!("{error:#}"));
                     }
                 }
@@ -374,7 +380,7 @@ define_class!(
             }
             let mut document = self.ivars().document.borrow().clone();
             document.connections.remove(row as usize);
-            if !self.save_document(&document) {
+            if !self.save_document(&mut document) {
                 return;
             }
             *self.ivars().document.borrow_mut() = document;
@@ -447,8 +453,8 @@ define_class!(
             }
         }
 
-        #[unsafe(method(openLibraryLink:))]
-        fn open_library_link(&self, sender: Option<&AnyObject>) {
+        #[unsafe(method(openLink:))]
+        fn open_link(&self, sender: Option<&AnyObject>) {
             let Some(sender) = sender else { return };
             let url: Option<Retained<NSString>> = unsafe { msg_send![sender, identifier] };
             if let Some(url) = url.and_then(|url| NSURL::URLWithString(&url)) {
@@ -576,8 +582,8 @@ impl SettingsController {
         let conn_scroll =
             NSScrollView::initWithFrame(NSScrollView::alloc(mtm), rect(0.0, 0.0, W, CH));
         conn_scroll.setBorderType(NSBorderType::NoBorder);
-        conn_scroll.setHasVerticalScroller(true);
-        conn_scroll.setHasHorizontalScroller(true);
+        conn_scroll.setHasVerticalScroller(false);
+        conn_scroll.setHasHorizontalScroller(false);
         conn_scroll.setAutohidesScrollers(true);
         conn_scroll.setDrawsBackground(false);
         conn_scroll.setAutoresizingMask(
@@ -588,7 +594,7 @@ impl SettingsController {
             NSScrollView::initWithFrame(NSScrollView::alloc(mtm), rect(0.0, 0.0, W, CH));
         global_scroll.setBorderType(NSBorderType::NoBorder);
         global_scroll.setHasVerticalScroller(true);
-        global_scroll.setHasHorizontalScroller(true);
+        global_scroll.setHasHorizontalScroller(false);
         global_scroll.setAutohidesScrollers(true);
         global_scroll.setDrawsBackground(false);
         global_scroll.setAutoresizingMask(
@@ -599,7 +605,7 @@ impl SettingsController {
         let about_scroll =
             NSScrollView::initWithFrame(NSScrollView::alloc(mtm), rect(0.0, 0.0, W, CH));
         about_scroll.setBorderType(NSBorderType::NoBorder);
-        about_scroll.setHasVerticalScroller(true);
+        about_scroll.setHasVerticalScroller(false);
         about_scroll.setAutohidesScrollers(true);
         about_scroll.setDrawsBackground(false);
         about_scroll.setAutoresizingMask(
@@ -645,18 +651,28 @@ impl SettingsController {
         // App icon, centered.
         if let Some(icon) = NSApplication::sharedApplication(mtm).applicationIconImage() {
             let view = NSImageView::imageViewWithImage(&icon, mtm);
-            view.setFrame(rect((W - 72.0) / 2.0, 628.0, 72.0, 72.0));
+            view.setFrame(rect((W - 48.0) / 2.0, 648.0, 48.0, 48.0));
             parent.addSubview(&view);
         }
 
         // Name + version identity block.
-        let title = self.centered(mtm, parent, 590.0, 32.0, "RDP123");
-        title.setFont(Some(&NSFont::boldSystemFontOfSize(26.0)));
+        let title = self.centered(mtm, parent, 610.0, 28.0, "RDP123");
+        title.setFont(Some(&NSFont::boldSystemFontOfSize(24.0)));
+
+        let website = self.url_button(
+            mtm,
+            parent,
+            rect(W / 2.0 - 100.0, 584.0, 200.0, 22.0),
+            "by asd123.ai",
+            "https://asd123.ai",
+        );
+        website.setAlignment(NSTextAlignment::Center);
+        website.setFont(Some(&NSFont::systemFontOfSize(12.0)));
 
         let version = self.centered(
             mtm,
             parent,
-            564.0,
+            558.0,
             18.0,
             &format!(
                 "Version {} ({})",
@@ -670,7 +686,7 @@ impl SettingsController {
         let built = self.centered(
             mtm,
             parent,
-            544.0,
+            538.0,
             16.0,
             &format!("Built {}", env!("RDP123_BUILD_TIME")),
         );
@@ -678,26 +694,43 @@ impl SettingsController {
         built.setTextColor(Some(&NSColor::tertiaryLabelColor()));
         built.setSelectable(true);
 
-        let copy = self.button_ret(
+        self.button_ret(
             mtm,
             parent,
-            rect((W - 150.0) / 2.0, 506.0, 150.0, 28.0),
+            rect(W / 2.0 - 166.0, 498.0, 150.0, 28.0),
             "Copy Version Info",
             sel!(copyVersionInfo:),
         );
-        let _ = copy;
+        let github = self.url_button(
+            mtm,
+            parent,
+            rect(W / 2.0 - 4.0, 498.0, 170.0, 28.0),
+            "Source on GitHub",
+            "https://github.com/asd123ch/rdp123",
+        );
+        github.setBordered(true);
+        github.setContentTintColor(None);
+        github.setAlignment(NSTextAlignment::Center);
+        github.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+        if let Some(icon) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+            &NSString::from_str("chevron.left.forwardslash.chevron.right"),
+            None,
+        ) {
+            github.setImage(Some(&icon));
+            github.setImagePosition(NSCellImagePosition::ImageLeading);
+        }
 
         // Separator line.
-        let separator = NSBox::initWithFrame(NSBox::alloc(mtm), rect(120.0, 488.0, W - 240.0, 1.0));
+        let separator = NSBox::initWithFrame(NSBox::alloc(mtm), rect(120.0, 480.0, W - 240.0, 1.0));
         separator.setBoxType(NSBoxType::Separator);
         parent.addSubview(&separator);
 
-        let header = self.centered(mtm, parent, 454.0, 18.0, "Open Source Libraries");
+        let header = self.centered(mtm, parent, 450.0, 18.0, "Open Source Libraries");
         header.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
         let note = self.centered(
             mtm,
             parent,
-            430.0,
+            428.0,
             15.0,
             "Direct dependencies. Click for details; hover over a group to see its libraries.",
         );
@@ -706,19 +739,13 @@ impl SettingsController {
 
         let libs = about_libraries(env!("RDP123_LIBS"));
         let rows = libs.len().div_ceil(3);
-        let list_height = (rows as f64 * 24.0).max(346.0);
-        let scroll = NSScrollView::initWithFrame(
-            NSScrollView::alloc(mtm),
-            rect(28.0, 64.0, W - 56.0, 346.0),
+        let list = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            rect(28.0, 64.0, W - 56.0, ABOUT_LIST_HEIGHT),
         );
-        scroll.setBorderType(NSBorderType::NoBorder);
-        scroll.setHasVerticalScroller(true);
-        scroll.setAutohidesScrollers(true);
-        scroll.setDrawsBackground(false);
-        let list = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, W - 56.0, list_height));
         for (i, library) in libs.iter().enumerate() {
-            let col_x = (i / rows) as f64 * 222.0;
-            let y = list_height - 24.0 - (i % rows) as f64 * 24.0;
+            let col_x = (i / rows) as f64 * ((W - 56.0) / 3.0);
+            let y = about_library_row_y(i % rows);
             self.link_button(mtm, &list, rect(col_x, y, 160.0, 20.0), library);
             let ver = self.label(
                 mtm,
@@ -729,9 +756,7 @@ impl SettingsController {
             ver.setFont(Some(&NSFont::systemFontOfSize(11.0)));
             self.muted(&ver);
         }
-        scroll.setDocumentView(Some(&list));
-        list.scrollPoint(CGPoint::new(0.0, list_height - 346.0));
-        parent.addSubview(&scroll);
+        parent.addSubview(&list);
 
         // License line pinned to the bottom.
         let license = self.centered(mtm, parent, 28.0, 15.0, "Open source under GNU AGPL v3.0");
@@ -798,7 +823,7 @@ impl SettingsController {
         let save = self.button_ret(
             mtm,
             parent,
-            rect(596.0, 16.0, 108.0, 30.0),
+            rect(W - 124.0, 16.0, 108.0, 30.0),
             "Save",
             sel!(saveConnection:),
         );
@@ -807,7 +832,7 @@ impl SettingsController {
         let revert = self.button_ret(
             mtm,
             parent,
-            rect(480.0, 16.0, 108.0, 30.0),
+            rect(W - 240.0, 16.0, 108.0, 30.0),
             "Revert",
             sel!(revertConnection:),
         );
@@ -822,12 +847,27 @@ impl SettingsController {
         let empty = self.label(
             mtm,
             parent,
-            rect(FORM_X, CH / 2.0, 460.0, ROW_H),
+            rect(238.0, CH / 2.0, W - 254.0, ROW_H),
             "No connection selected — click + to add one.",
         );
         empty.setAlignment(NSTextAlignment::Center);
         self.muted(&empty);
         *self.ivars().empty_label.borrow_mut() = Some(empty);
+
+        let form_scroll = NSScrollView::initWithFrame(
+            NSScrollView::alloc(mtm),
+            rect(222.0, 56.0, W - 238.0, CH - 64.0),
+        );
+        form_scroll.setBorderType(NSBorderType::NoBorder);
+        form_scroll.setHasVerticalScroller(true);
+        form_scroll.setAutohidesScrollers(true);
+        form_scroll.setDrawsBackground(false);
+        let form = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, W - 238.0, FORM_H));
+        form_scroll.setDocumentView(Some(&form));
+        parent.addSubview(&form_scroll);
+        form.scrollPoint(CGPoint::new(0.0, FORM_H - (CH - 64.0)));
+        *self.ivars().connection_form.borrow_mut() = Some(form.clone());
+        let parent = &*form;
 
         // ---- common fields (hidden while nothing is selected) ----
         let mut common = Vec::new();
@@ -843,7 +883,6 @@ impl SettingsController {
             "Type:",
             &["RDP", "SSH"],
             sel!(typeChanged:),
-            120.0,
             &mut common,
         ));
         let host = self.text_row_g(mtm, parent, &mut y, "Host:", &mut common);
@@ -868,7 +907,6 @@ impl SettingsController {
             "Method:",
             &["Password (NLA)", "Microsoft Entra web"],
             sel!(authenticationChanged:),
-            210.0,
             &mut rdp,
         );
         *self.ivars().authentication.borrow_mut() = Some(authentication);
@@ -892,7 +930,6 @@ impl SettingsController {
             "Password handling:",
             &["Remember (Keychain)", "Always ask"],
             dirty,
-            210.0,
             &mut rdp,
         ));
         *self.ivars().password_auth_group.borrow_mut() = rdp[password_start..].to_vec();
@@ -901,7 +938,7 @@ impl SettingsController {
             mtm,
             parent,
             rect(FIELD_X, password_top, FIELD_W, ROW_H),
-            "Signs in interactively with your Microsoft account.",
+            "Sign in with your Microsoft account.",
         );
         self.muted(&entra_line_1);
         rdp.push(unsafe { Retained::cast_unchecked(entra_line_1.clone()) });
@@ -909,7 +946,7 @@ impl SettingsController {
             mtm,
             parent,
             rect(FIELD_X, password_top - PITCH, FIELD_W, ROW_H),
-            "Hostname required; IP addresses are not supported.",
+            "Use a hostname, not an IP address.",
         );
         self.muted(&entra_line_2);
         rdp.push(unsafe { Retained::cast_unchecked(entra_line_2.clone()) });
@@ -935,7 +972,6 @@ impl SettingsController {
             "Resolution:",
             &["Fit to window", "Fixed"],
             sel!(resModeChanged:),
-            160.0,
             &mut rdp,
         ));
         {
@@ -960,7 +996,6 @@ impl SettingsController {
             "Scaling:",
             &["Auto", "100%", "140%", "180%", "200%"],
             dirty,
-            120.0,
             &mut rdp,
         ));
         *self.ivars().color.borrow_mut() = Some(self.popup_row_g(
@@ -970,7 +1005,6 @@ impl SettingsController {
             "Color quality:",
             &["High (32-bit)", "Medium (16-bit)"],
             dirty,
-            180.0,
             &mut rdp,
         ));
         *self.ivars().graphics.borrow_mut() = Some(self.popup_row_g(
@@ -980,7 +1014,6 @@ impl SettingsController {
             "Graphics:",
             &["RDP 8.0 (Experimental)", "RDP 6.1 (Classic bitmaps)"],
             dirty,
-            240.0,
             &mut rdp,
         ));
         // This controls the outer FastPath/XCRUSH transport layer in either
@@ -1005,7 +1038,7 @@ impl SettingsController {
         *self.ivars().remember_size.borrow_mut() = Some(rs);
         yr -= CHECKBOX_PITCH;
 
-        self.header_g(mtm, parent, &mut yr, "Clipboard, sound & session", &mut rdp);
+        self.header_g(mtm, parent, &mut yr, "Clipboard & sound", &mut rdp);
         *self.ivars().clipboard.borrow_mut() = Some(self.popup_row_g(
             mtm,
             parent,
@@ -1018,7 +1051,6 @@ impl SettingsController {
                 "Remote → Local",
             ],
             dirty,
-            200.0,
             &mut rdp,
         ));
         *self.ivars().audio.borrow_mut() = Some(self.popup_row_g(
@@ -1028,22 +1060,15 @@ impl SettingsController {
             "Play sound:",
             &["On this computer", "Never", "On the remote computer"],
             dirty,
-            220.0,
             &mut rdp,
         ));
-        let re = self.checkbox_fit(
-            mtm,
-            parent,
-            FIELD_X,
-            yr,
-            "Automatically reconnect after connection drops",
-            dirty,
-        );
+        self.header_g(mtm, parent, &mut yr, "Session", &mut rdp);
+        let re = self.checkbox_fit(mtm, parent, FIELD_X, yr, "Reconnect automatically", dirty);
         rdp.push(unsafe { Retained::cast_unchecked(re.clone()) });
         *self.ivars().reconnect.borrow_mut() = Some(re);
         yr -= CHECKBOX_PITCH;
         {
-            let label = self.row_label(mtm, parent, yr, "Max attempts/minute:");
+            let label = self.row_label(mtm, parent, yr, "Retries per minute:");
             rdp.push(unsafe { Retained::cast_unchecked(label) });
             let rate = self.plain_text(mtm, parent, rect(FIELD_X, yr, 60.0, ROW_H));
             rdp.push(unsafe { Retained::cast_unchecked(rate.clone()) });
@@ -1064,7 +1089,7 @@ impl SettingsController {
 
         // ---- SSH group ----
         let mut ssh = Vec::new();
-        let mut ys = group_top;
+        let mut ys = group_top - PITCH;
         self.header_g(mtm, parent, &mut ys, "SSH", &mut ssh);
         // The shared Username row (common group) occupies this first slot.
         ys -= PITCH;
@@ -1092,113 +1117,89 @@ impl SettingsController {
     }
 
     fn build_global_pane(&self, mtm: MainThreadMarker, parent: &NSView) {
-        let gx = 32.0;
-        let gfield = 176.0;
-        let mut y = EDIT_TOP;
-        self.header(mtm, parent, &mut y, "Global settings");
-
-        self.label(mtm, parent, rect(gx, y, 140.0, ROW_H), "SSH terminal:");
+        let gx = 44.0;
+        let gfield = 216.0;
+        let field_width = W - gfield - gx;
+        self.global_heading(mtm, parent, 686.0, "SSH connections");
+        let terminal_label = self.label(mtm, parent, rect(gx, 650.0, 156.0, ROW_H), "Terminal:");
+        terminal_label.setAlignment(NSTextAlignment::Right);
         let terms: Vec<&str> = TerminalKind::ALL.iter().map(|k| k.display_name()).collect();
         let term = self.popup(
             mtm,
             parent,
-            rect(gfield, y, 240.0, ROW_H + 2.0),
+            rect(gfield, 650.0, field_width, ROW_H + 2.0),
             &terms,
             sel!(globalChanged:),
         );
+        term.setToolTip(Some(&NSString::from_str("Used by all SSH connections.")));
         *self.ivars().terminal.borrow_mut() = Some(term);
-        y -= PITCH;
-
-        self.label(mtm, parent, rect(gx, y, 140.0, ROW_H), "Custom command:");
-        let custom = self.plain_text(mtm, parent, rect(gfield, y, 500.0, ROW_H));
+        let custom_label = self.label(
+            mtm,
+            parent,
+            rect(gx, 614.0, 156.0, ROW_H),
+            "Custom command:",
+        );
+        custom_label.setAlignment(NSTextAlignment::Right);
+        let custom = self.plain_text(mtm, parent, rect(gfield, 614.0, field_width, ROW_H));
         custom.setPlaceholderString(Some(&NSString::from_str("e.g. wezterm start -- {ssh}")));
         *self.ivars().custom.borrow_mut() = Some(custom);
-        y -= PITCH + 6.0;
+        self.help_text(mtm, parent, rect(gfield, 570.0, field_width, 34.0),
+            "Custom terminal only. Use {ssh} for the full SSH command,\nor {host}, {port} and {user} for individual values.");
 
-        self.label(
-            mtm,
-            parent,
-            rect(gx, y, 640.0, ROW_H),
-            "Custom command is used only for the “Custom command…” terminal.",
-        );
-        y -= ROW_H + 2.0;
-        self.label(
-            mtm, parent, rect(gx, y, 640.0, ROW_H),
-            "Placeholders: {ssh} = the full ssh command; {host}, {port}, {user} are also available.",
-        );
-        y -= ROW_H + 2.0;
-        self.label(
-            mtm,
-            parent,
-            rect(gx, y, 640.0, ROW_H),
-            "This terminal is shared by every SSH connection.",
-        );
-        y -= PITCH + 10.0;
-
-        let keyboard_header = self.label(mtm, parent, rect(gx, y, 460.0, 20.0), "Keyboard");
-        keyboard_header.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
-        y -= HDR_PITCH;
+        self.global_heading(mtm, parent, 530.0, "RDP keyboard");
         let swap = self.checkbox_fit(
             mtm,
             parent,
             gfield,
-            y,
-            "Swap ⌘ and ⌥ in RDP sessions (⌘ acts as Alt, ⌥ as the Windows key)",
+            498.0,
+            "Swap Command (⌘) and Option (⌥)",
             sel!(globalChanged:),
         );
         *self.ivars().swap_cmd_alt.borrow_mut() = Some(swap);
-        y -= PITCH;
-        self.label(
+        self.help_text(mtm, parent, rect(gfield + 20.0, 460.0, field_width - 20.0, 32.0),
+            "⌘ sends Alt; ⌥ sends the Windows key.\nPlaces Alt next to the space bar, as on a PC keyboard.");
+        let mac_shortcuts = self.checkbox_fit(
             mtm,
             parent,
-            rect(gx, y, 640.0, ROW_H),
-            "Matches the PC key layout: the key next to the space bar is Alt.",
+            gfield,
+            416.0,
+            "Use ⌘ instead of Ctrl for common shortcuts",
+            sel!(globalChanged:),
         );
-        y -= PITCH + 10.0;
+        *self.ivars().mac_shortcuts.borrow_mut() = Some(mac_shortcuts);
+        self.help_text(mtm, parent, rect(gfield + 20.0, 352.0, field_width - 20.0, 54.0),
+            "Use ⌘C / ⌘V to copy and paste remotely, like on your Mac.\nAlso translates ⌘X, ⌘A, ⌘Z, ⌘F and ⌘W, including Shift.\nOther shortcuts and Hyper keep their normal mapping.");
 
-        let stt_header = self.label(mtm, parent, rect(gx, y, 460.0, 20.0), "Speech to text");
-        stt_header.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
-        y -= HDR_PITCH;
+        self.global_heading(mtm, parent, 306.0, "Speech to text");
         let external_stt_paste = self.checkbox_fit(
             mtm,
             parent,
             gfield,
-            y,
-            "Enable external STT paste in RDP sessions",
+            274.0,
+            "Allow pasting from speech-to-text apps",
             sel!(globalChanged:),
         );
         *self.ivars().external_stt_paste.borrow_mut() = Some(external_stt_paste);
-        y -= CHECKBOX_PITCH;
-        let stt_note = self.label(
-            mtm,
-            parent,
-            rect(gx, y, 640.0, ROW_H),
-            "Synchronizes macOS clipboard text before inserting it remotely with Ctrl+V.",
-        );
-        self.muted(&stt_note);
-        y -= PITCH + 10.0;
+        self.help_text(mtm, parent, rect(gfield + 20.0, 232.0, field_width - 20.0, 34.0),
+            "Transfers dictated text from the Mac clipboard into the active remote app.\nRequires clipboard access from Mac to remote.");
 
-        let startup_header = self.label(mtm, parent, rect(gx, y, 460.0, 20.0), "Startup");
-        startup_header.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
-        y -= HDR_PITCH;
+        self.global_heading(mtm, parent, 186.0, "Startup");
         let login = self.checkbox_fit(
             mtm,
             parent,
             gfield,
-            y,
-            "Start RDP123 automatically when you log in",
+            154.0,
+            "Open RDP123 at login",
             sel!(loginItemChanged:),
         );
         if !crate::login_item::is_supported() {
             login.setEnabled(false);
-            y -= PITCH;
-            let note = self.label(
+            self.help_text(
                 mtm,
                 parent,
-                rect(gx, y, 640.0, ROW_H),
+                rect(gfield + 20.0, 126.0, field_width - 20.0, ROW_H),
                 "Requires macOS 13 or newer.",
             );
-            self.muted(&note);
         }
         *self.ivars().launch_at_login.borrow_mut() = Some(login);
     }
@@ -1218,10 +1219,20 @@ impl SettingsController {
         l
     }
 
-    fn header(&self, mtm: MainThreadMarker, parent: &NSView, y: &mut f64, text: &str) {
-        let l = self.label(mtm, parent, rect(FORM_X, *y, 460.0, 20.0), text);
+    fn global_heading(&self, mtm: MainThreadMarker, parent: &NSView, y: f64, text: &str) {
+        let l = self.label(mtm, parent, rect(44.0, y, W - 88.0, 20.0), text);
         l.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
-        *y -= HDR_PITCH;
+        let line = NSBox::initWithFrame(NSBox::alloc(mtm), rect(44.0, y - 6.0, W - 88.0, 1.0));
+        line.setBoxType(NSBoxType::Separator);
+        parent.addSubview(&line);
+    }
+
+    fn help_text(&self, mtm: MainThreadMarker, parent: &NSView, frame: CGRect, text: &str) {
+        let label = NSTextField::wrappingLabelWithString(&NSString::from_str(text), mtm);
+        label.setFrame(frame);
+        label.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+        self.muted(&label);
+        parent.addSubview(&label);
     }
 
     /// A right-aligned label for the form's label column (macOS convention).
@@ -1249,27 +1260,31 @@ impl SettingsController {
         f: CGRect,
         library: &AboutLibrary<'_>,
     ) {
-        let b = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str(&library.name),
-                Some(self.any()),
-                Some(sel!(openLibraryLink:)),
-                mtm,
-            )
-        };
-        b.setFrame(f);
-        b.setBordered(false);
-        b.setAlignment(NSTextAlignment::Left);
-        b.setFont(Some(&NSFont::systemFontOfSize(11.0)));
-        b.setContentTintColor(Some(&NSColor::linkColor()));
         let url = if library.crates.len() > 1 {
             "https://github.com/madsmtm/objc2/tree/main/framework-crates".into()
         } else {
             format!("https://crates.io/crates/{}", library.crates[0])
         };
-        b.setIdentifier(Some(&NSString::from_str(&url)));
+        let b = self.url_button(mtm, parent, f, &library.name, &url);
+        b.setFont(Some(&NSFont::systemFontOfSize(11.0)));
         b.setToolTip(Some(&NSString::from_str(&library.crates.join("\n"))));
-        parent.addSubview(&b);
+    }
+
+    fn url_button(
+        &self,
+        mtm: MainThreadMarker,
+        parent: &NSView,
+        frame: CGRect,
+        title: &str,
+        url: &str,
+    ) -> Retained<NSButton> {
+        let button = self.button_ret(mtm, parent, frame, title, sel!(openLink:));
+        button.setBordered(false);
+        button.setAlignment(NSTextAlignment::Left);
+        button.setContentTintColor(Some(&NSColor::linkColor()));
+        button.setIdentifier(Some(&NSString::from_str(url)));
+        button.setToolTip(Some(&NSString::from_str(url)));
+        button
     }
 
     fn header_g(
@@ -1280,6 +1295,7 @@ impl SettingsController {
         text: &str,
         group: &mut Vec<Retained<NSView>>,
     ) {
+        *y -= 12.0;
         let l = self.label(mtm, parent, rect(FORM_X, *y, 460.0, 20.0), text);
         l.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
         group.push(unsafe { Retained::cast_unchecked(l) });
@@ -1388,20 +1404,19 @@ impl SettingsController {
         label: &str,
         items: &[&str],
         action: Sel,
-        w: f64,
         group: &mut Vec<Retained<NSView>>,
     ) -> Retained<NSPopUpButton> {
         let l = self.row_label(mtm, parent, *y, label);
         let p = self.popup(
             mtm,
             parent,
-            rect(FIELD_X, *y, w, ROW_H + 2.0),
+            rect(FIELD_X, *y, FIELD_W, ROW_H + 2.0),
             items,
             action,
         );
         group.push(unsafe { Retained::cast_unchecked(l) });
         group.push(unsafe { Retained::cast_unchecked(p.clone()) });
-        *y -= POPUP_PITCH;
+        *y -= PITCH;
         p
     }
 
@@ -1440,7 +1455,7 @@ impl SettingsController {
             .unwrap_or(0)
     }
 
-    fn save_document(&self, document: &Document) -> bool {
+    fn save_document(&self, document: &mut Document) -> bool {
         let Some(store) = self.ivars().store.borrow().as_ref().cloned() else {
             ui::show_error(
                 self.mtm(),
@@ -1449,8 +1464,27 @@ impl SettingsController {
             );
             return false;
         };
-        match store.save_document(document) {
-            Ok(()) => true,
+        match store.save_settings_document(&self.ivars().document.borrow(), document) {
+            Ok(merged) => {
+                let original = self.ivars().document.borrow();
+                if let Some(before) = original
+                    .connections
+                    .get(self.ivars().selected.get() as usize)
+                {
+                    if self.popup_index(&self.ivars().pw_policy)
+                        == index_of(&PWPOLICY, &before.rdp.password_policy)
+                    {
+                        if let Some(saved) = merged.connections.iter().find(|c| c.id == before.id) {
+                            self.set_popup(
+                                &self.ivars().pw_policy,
+                                index_of(&PWPOLICY, &saved.rdp.password_policy),
+                            );
+                        }
+                    }
+                }
+                *document = merged;
+                true
+            }
             Err(error) => {
                 ui::show_error(self.mtm(), "Could not save settings", &format!("{error:#}"));
                 false
@@ -1706,6 +1740,11 @@ impl SettingsController {
     fn populate(&self, row: isize) {
         self.ivars().loading.set(true);
         let iv = self.ivars();
+        if iv.selected.get() != row {
+            if let Some(form) = iv.connection_form.borrow().as_ref() {
+                form.scrollPoint(CGPoint::new(0.0, FORM_H - (CH - 64.0)));
+            }
+        }
 
         // Global settings.
         let (term_idx, custom) = {
@@ -1721,8 +1760,13 @@ impl SettingsController {
         };
         self.set_popup(&iv.terminal, term_idx);
         self.set_field(&iv.custom, &custom);
+        if let Some(field) = iv.custom.borrow().as_ref() {
+            field.setEnabled(iv.document.borrow().settings.terminal == TerminalKind::Custom);
+        }
         let swap_cmd_alt = iv.document.borrow().settings.swap_cmd_alt;
         self.set_check(&iv.swap_cmd_alt, swap_cmd_alt);
+        let mac_shortcuts = iv.document.borrow().settings.mac_shortcuts;
+        self.set_check(&iv.mac_shortcuts, mac_shortcuts);
         let external_stt_paste = iv.document.borrow().settings.external_stt_paste;
         self.set_check(&iv.external_stt_paste, external_stt_paste);
         // Reflect the system's login-item state, not a stored flag.
@@ -1915,32 +1959,29 @@ impl SettingsController {
         }
         let connection_id = connection.id.clone();
 
-        if authentication == AuthenticationMode::Password
-            && pw_policy == PasswordPolicy::Remember
-            && !password.is_empty()
-        {
-            if let Err(error) = secrets::store_password(&connection_id, &password) {
-                ui::show_error(self.mtm(), "Could not save password", &format!("{error:#}"));
-                return false;
-            }
-        }
-
-        if !self.save_document(&document) {
+        if !self.save_document(&mut document) {
             return false;
         }
+        let saved = &document.connections[row as usize];
+        let remember_password = saved.rdp.authentication == AuthenticationMode::Password
+            && saved.rdp.password_policy == PasswordPolicy::Remember;
         *iv.document.borrow_mut() = document;
-        self.set_secure(&iv.password, "");
-
-        if authentication == AuthenticationMode::EntraWeb || pw_policy == PasswordPolicy::AlwaysAsk
-        {
-            if let Err(error) = secrets::delete_password(&connection_id) {
-                ui::show_error(
-                    self.mtm(),
-                    "Could not remove saved password",
-                    &format!("{error:#}"),
-                );
-            }
+        let password_result = if !remember_password {
+            secrets::delete_password(&connection_id)
+        } else if !password.is_empty() {
+            secrets::store_password(&connection_id, &password)
+        } else {
+            Ok(())
+        };
+        if let Err(error) = password_result {
+            ui::show_error(
+                self.mtm(),
+                "Could not update saved password",
+                &format!("{error:#}"),
+            );
+            return false;
         }
+        self.set_secure(&iv.password, "");
         true
     }
 
@@ -1959,9 +2000,14 @@ impl SettingsController {
             Some(custom)
         };
         document.settings.swap_cmd_alt = self.check_on(&self.ivars().swap_cmd_alt);
+        document.settings.mac_shortcuts = self.check_on(&self.ivars().mac_shortcuts);
         document.settings.external_stt_paste = self.check_on(&self.ivars().external_stt_paste);
-        if self.save_document(&document) {
+        if self.save_document(&mut document) {
+            if let Some(field) = self.ivars().custom.borrow().as_ref() {
+                field.setEnabled(document.settings.terminal == TerminalKind::Custom);
+            }
             crate::delegate::set_external_stt_paste_enabled(document.settings.external_stt_paste);
+            crate::delegate::set_mac_shortcuts_enabled(document.settings.mac_shortcuts);
             *self.ivars().document.borrow_mut() = document;
         }
     }
@@ -1993,6 +2039,16 @@ where
 mod about_tests {
     use super::about_libraries;
 
+    #[test]
+    fn thirteen_library_rows_fit_without_scrolling() {
+        for row in 0..13 {
+            let y = super::about_library_row_y(row);
+            assert!(
+                y >= 0.0 && y + 20.0 <= super::ABOUT_LIST_HEIGHT,
+                "library row {row} is outside the About pane"
+            );
+        }
+    }
     #[test]
     fn groups_frameworks_without_losing_names_or_versions() {
         let libraries =

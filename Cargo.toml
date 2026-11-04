@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.21"
+version = "0.6.25"
 edition = "2021"
 rust-version = "1.94"
 license = "AGPL-3.0-only"
@@ -105,3 +105,4 @@ strip = true
 [patch.crates-io]
 ironrdp-connector = { path = "vendor/ironrdp-connector" }
 ironrdp-svc = { path = "vendor/ironrdp-svc" }
+ironrdp-dvc = { path = "vendor/ironrdp-dvc" }

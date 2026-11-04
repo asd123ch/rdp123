@@ -80,7 +80,7 @@ define_class!(
 
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
-            self.forward_key_down(event.keyCode());
+            self.forward_key_down(event);
         }
 
         #[unsafe(method(keyUp:))]
@@ -232,7 +232,7 @@ define_class!(
                 events.push(InputEvent::Wheel { delta: vx, horizontal: true });
             }
             if !events.is_empty() {
-                self.send_with_deferred_modifiers(events);
+                self.send_pointer_input(events);
             }
         }
 
@@ -255,24 +255,48 @@ impl RdpView {
         self.ivars().external_stt_paste_enabled.set(enabled);
     }
 
-    pub fn forward_key_down(&self, keycode: u16) {
+    pub fn set_mac_shortcuts_enabled(&self, enabled: bool) {
+        if self.ivars().input_routing.borrow().mac_shortcuts_enabled != enabled {
+            self.release_all_keys();
+            self.ivars()
+                .input_routing
+                .borrow_mut()
+                .mac_shortcuts_enabled = enabled;
+        }
+    }
+
+    pub fn forward_key_down(&self, event: &NSEvent) {
+        let characters = event
+            .charactersIgnoringModifiers()
+            .map(|text| text.to_string());
         let (events, external_paste) = self
             .ivars()
             .input_routing
             .borrow_mut()
-            .key_down(keycode, self.ivars().external_stt_paste_enabled.get());
+            .key_down_with_characters(
+                event.keyCode(),
+                characters.as_deref(),
+                self.ivars().external_stt_paste_enabled.get(),
+            );
         self.send(events);
         if external_paste {
             self.submit_external_stt_paste();
         }
     }
 
-    pub fn forward_key_pulse(&self, keycode: u16) {
+    pub fn forward_key_pulse(&self, event: &NSEvent) {
+        let characters = event
+            .charactersIgnoringModifiers()
+            .map(|text| text.to_string());
         let (events, external_paste) = self
             .ivars()
             .input_routing
             .borrow_mut()
-            .key_pulse(keycode, self.ivars().external_stt_paste_enabled.get());
+            .key_pulse_with_characters(
+                event.keyCode(),
+                characters.as_deref(),
+                self.ivars().external_stt_paste_enabled.get(),
+            );
         self.send(events);
         if external_paste {
             self.submit_external_stt_paste();
@@ -291,8 +315,8 @@ impl RdpView {
     fn forward_menu_shortcut(&self) {
         if self.command_modifier_pressed() {
             let event = NSApplication::sharedApplication(self.mtm()).currentEvent();
-            if let Some(keycode) = menu_shortcut_keycode(event.as_deref()) {
-                self.forward_key_pulse(keycode);
+            if menu_shortcut_keycode(event.as_deref()).is_some() {
+                self.forward_key_pulse(event.as_ref().unwrap());
             }
         }
     }
@@ -383,13 +407,12 @@ impl RdpView {
         }
     }
 
-    fn send_with_deferred_modifiers(&self, mut events: Vec<InputEvent>) {
-        let mut routed = self
+    fn send_pointer_input(&self, events: Vec<InputEvent>) {
+        let routed = self
             .ivars()
             .input_routing
             .borrow_mut()
-            .flush_deferred_command_modifiers();
-        routed.append(&mut events);
+            .pointer_input(events);
         self.send(routed);
     }
 
@@ -404,13 +427,13 @@ impl RdpView {
 
     fn mouse_button(&self, event: &NSEvent, button: PointerButton, down: bool) {
         if let Some((x, y)) = self.remote_point(event) {
-            self.send_with_deferred_modifiers(vec![InputEvent::MouseButton { button, down, x, y }]);
+            self.send_pointer_input(vec![InputEvent::MouseButton { button, down, x, y }]);
         }
     }
 
     fn mouse_move(&self, event: &NSEvent) {
         if let Some((x, y)) = self.remote_point(event) {
-            self.send_with_deferred_modifiers(vec![InputEvent::MouseMove { x, y }]);
+            self.send_pointer_input(vec![InputEvent::MouseMove { x, y }]);
         }
     }
 
@@ -446,6 +469,7 @@ fn menu_shortcut_keycode(event: Option<&NSEvent>) -> Option<u16> {
 
 #[derive(Default)]
 struct InputRoutingState {
+    mac_shortcuts_enabled: bool,
     pressed_modifiers: HashSet<u16>,
     deferred_command_modifiers: HashSet<u16>,
     suppressed_command_modifiers: HashSet<u16>,
@@ -454,6 +478,73 @@ struct InputRoutingState {
 }
 
 impl InputRoutingState {
+    fn key_down_with_characters(
+        &mut self,
+        keycode: u16,
+        characters: Option<&str>,
+        external_stt_paste_enabled: bool,
+    ) -> (Vec<InputEvent>, bool) {
+        if !self.translate_mac_shortcut(keycode, characters, external_stt_paste_enabled) {
+            return self.key_down(keycode, external_stt_paste_enabled);
+        }
+
+        let mut events = self.suppress_command_modifiers();
+        // Command key-up delivery is unreliable in AppKit. Keep the translated
+        // chord balanced within one dispatch, including when the key repeats.
+        events.extend([
+            InputEvent::Key {
+                keycode: 0x3b,
+                down: true,
+            },
+            InputEvent::Key {
+                keycode,
+                down: true,
+            },
+            InputEvent::Key {
+                keycode,
+                down: false,
+            },
+            InputEvent::Key {
+                keycode: 0x3b,
+                down: false,
+            },
+        ]);
+        self.suppressed_key_ups.insert(keycode);
+        (events, false)
+    }
+
+    fn translate_mac_shortcut(
+        &self,
+        keycode: u16,
+        characters: Option<&str>,
+        external_stt_paste_enabled: bool,
+    ) -> bool {
+        self.mac_shortcuts_enabled
+            && !(external_stt_paste_enabled && keycode == V_KEYCODE)
+            && self
+                .pressed_modifiers
+                .iter()
+                .any(|key| is_command_key(*key))
+            && !self
+                .pressed_modifiers
+                .iter()
+                .any(|key| matches!(key, 0x3b | 0x3e | 0x3a | 0x3d))
+            && is_mac_shortcut(keycode, characters)
+    }
+
+    fn key_pulse_with_characters(
+        &mut self,
+        keycode: u16,
+        characters: Option<&str>,
+        external_stt_paste_enabled: bool,
+    ) -> (Vec<InputEvent>, bool) {
+        if self.translate_mac_shortcut(keycode, characters, external_stt_paste_enabled) {
+            self.key_down_with_characters(keycode, characters, external_stt_paste_enabled)
+        } else {
+            self.key_pulse(keycode, external_stt_paste_enabled)
+        }
+    }
+
     fn is_pressed(&self, keycode: u16) -> bool {
         self.pressed_modifiers.contains(&keycode)
     }
@@ -473,7 +564,7 @@ impl InputRoutingState {
             return Vec::new();
         }
         if is_command_key(keycode) {
-            if down && external_stt_paste_enabled {
+            if down && (external_stt_paste_enabled || self.mac_shortcuts_enabled) {
                 self.deferred_command_modifiers.insert(keycode);
                 return Vec::new();
             }
@@ -498,7 +589,14 @@ impl InputRoutingState {
                 }
             }
         }
-        vec![InputEvent::Key { keycode, down }]
+        let mut events =
+            if self.mac_shortcuts_enabled && down && matches!(keycode, 0x3b | 0x3e | 0x3a | 0x3d) {
+                self.flush_deferred_command_modifiers()
+            } else {
+                Vec::new()
+            };
+        events.push(InputEvent::Key { keycode, down });
+        events
     }
 
     fn key_down(
@@ -521,6 +619,7 @@ impl InputRoutingState {
         {
             return self.paste_invoked(true);
         }
+        self.suppressed_key_ups.remove(&keycode);
         let mut events = self.flush_deferred_command_modifiers();
         events.push(InputEvent::Key {
             keycode,
@@ -573,6 +672,17 @@ impl InputRoutingState {
             self.external_paste_active = true;
         }
 
+        (self.suppress_command_modifiers(), submit)
+    }
+
+    fn suppress_command_modifiers(&mut self) -> Vec<InputEvent> {
+        let mut command_keys: Vec<_> = self
+            .pressed_modifiers
+            .iter()
+            .copied()
+            .filter(|key| is_command_key(*key))
+            .collect();
+        command_keys.sort_unstable();
         let mut events = Vec::new();
         for keycode in command_keys {
             if self.deferred_command_modifiers.remove(&keycode) {
@@ -587,11 +697,14 @@ impl InputRoutingState {
                 });
             }
         }
-        (events, submit)
+        events
     }
 
     fn flush_deferred_command_modifiers(&mut self) -> Vec<InputEvent> {
         let mut keycodes: Vec<_> = self.deferred_command_modifiers.drain().collect();
+        if self.mac_shortcuts_enabled {
+            keycodes.extend(self.suppressed_command_modifiers.drain());
+        }
         keycodes.sort_unstable();
         keycodes
             .into_iter()
@@ -600,6 +713,21 @@ impl InputRoutingState {
                 down: true,
             })
             .collect()
+    }
+
+    fn pointer_input(&mut self, mut events: Vec<InputEvent>) -> Vec<InputEvent> {
+        // Moving the pointer must not commit a pending Mac shortcut to Win.
+        // Clicks and scrolling still use the ordinary held modifier mapping.
+        if self.mac_shortcuts_enabled
+            && events
+                .iter()
+                .all(|event| matches!(event, InputEvent::MouseMove { .. }))
+        {
+            return events;
+        }
+        let mut routed = self.flush_deferred_command_modifiers();
+        routed.append(&mut events);
+        routed
     }
 
     fn clear(&mut self) {
@@ -617,6 +745,25 @@ const V_KEYCODE: u16 = 0x09;
 
 fn is_command_key(keycode: u16) -> bool {
     matches!(keycode, LEFT_COMMAND_KEYCODE | RIGHT_COMMAND_KEYCODE)
+}
+
+fn is_mac_shortcut(keycode: u16, characters: Option<&str>) -> bool {
+    if let Some(text) = characters {
+        let mut chars = text.chars();
+        if let Some(character) = chars.next() {
+            if chars.next().is_some() {
+                return false;
+            }
+            if character.is_ascii() {
+                return matches!(
+                    character.to_ascii_lowercase(),
+                    'c' | 'v' | 'x' | 'a' | 'z' | 'f' | 'w'
+                );
+            }
+        }
+    }
+    // Non-Latin layouts use the conventional physical shortcut positions.
+    matches!(keycode, 0x08 | 0x09 | 0x07 | 0x00 | 0x06 | 0x03 | 0x0d)
 }
 
 fn modifier_masks(keycode: u16) -> Option<(usize, usize)> {
@@ -651,6 +798,363 @@ mod tests {
     use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
     use objc2_foundation::{NSPoint, NSString};
     use rdp123_core::InputEvent;
+
+    fn key_events(events: &[InputEvent]) -> Vec<(u16, bool)> {
+        events
+            .iter()
+            .map(|event| match event {
+                InputEvent::Key { keycode, down } => (*keycode, *down),
+                _ => panic!("unexpected non-key event: {event:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mac_copy_shortcut_sends_balanced_control_without_windows_key() {
+        let mut routing = InputRoutingState {
+            mac_shortcuts_enabled: true,
+            ..Default::default()
+        };
+        let mut events = routing.modifier_changed(0x37, true, false);
+        let (shortcut, paste) = routing.key_down_with_characters(0x08, Some("c"), false);
+        events.extend(shortcut);
+        events.extend(routing.key_up(0x08, false));
+        events.extend(routing.modifier_changed(0x37, false, false));
+
+        assert!(!paste);
+        assert_eq!(
+            key_events(&events),
+            [(0x3b, true), (0x08, true), (0x08, false), (0x3b, false)]
+        );
+    }
+
+    #[test]
+    fn mac_shortcuts_preserve_physical_keys_layout_shift_and_repeats() {
+        for (keycode, characters) in [
+            (0x08, "c"),
+            (0x09, "v"),
+            (0x07, "x"),
+            (0x00, "a"),
+            (0x06, "z"),
+            (0x03, "f"),
+            (0x0d, "w"),
+            (0x10, "z"), // QWERTZ
+            (0x06, "w"), // AZERTY
+            (0x08, "с"), // Cyrillic, physical fallback
+        ] {
+            for command in [0x36, 0x37] {
+                for shift in [None, Some(0x38), Some(0x3c)] {
+                    let mut routing = InputRoutingState {
+                        mac_shortcuts_enabled: true,
+                        ..Default::default()
+                    };
+                    if let Some(shift) = shift {
+                        assert_eq!(
+                            key_events(&routing.modifier_changed(shift, true, false)),
+                            [(shift, true)]
+                        );
+                    }
+                    assert!(routing.modifier_changed(command, true, false).is_empty());
+                    for _ in 0..3 {
+                        let (events, paste) =
+                            routing.key_pulse_with_characters(keycode, Some(characters), false);
+                        assert!(!paste);
+                        assert_eq!(
+                            key_events(&events),
+                            [
+                                (0x3b, true),
+                                (keycode, true),
+                                (keycode, false),
+                                (0x3b, false)
+                            ]
+                        );
+                    }
+                    assert!(routing.key_up(keycode, false).is_empty());
+                    assert!(routing.modifier_changed(command, false, false).is_empty());
+                    if let Some(shift) = shift {
+                        assert_eq!(
+                            key_events(&routing.modifier_changed(shift, false, false)),
+                            [(shift, false)]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mac_shortcut_detection_does_not_remap_other_latin_keys() {
+        assert!(!super::is_mac_shortcut(0x00, Some("q"))); // AZERTY Q, not A
+        assert!(!super::is_mac_shortcut(0x06, Some("y"))); // QWERTZ Y, not Z
+        assert!(!super::is_mac_shortcut(0x08, Some("cc")));
+        assert!(!super::is_mac_shortcut(0x30, Some("\t")));
+        assert!(super::is_mac_shortcut(0x08, Some("C")));
+        assert!(super::is_mac_shortcut(0x08, None));
+    }
+
+    #[test]
+    fn mac_shortcuts_are_opt_in_and_require_command_without_control_or_option() {
+        for enabled in [false, true] {
+            for extra in [None, Some(0x3b), Some(0x3e), Some(0x3a), Some(0x3d)] {
+                let mut routing = InputRoutingState {
+                    mac_shortcuts_enabled: enabled,
+                    ..Default::default()
+                };
+                let (plain, _) = routing.key_pulse_with_characters(0x08, Some("c"), false);
+                assert_eq!(key_events(&plain), [(0x08, true), (0x08, false)]);
+                let mut events = routing.modifier_changed(0x37, true, false);
+                if let Some(extra) = extra {
+                    events.extend(routing.modifier_changed(extra, true, false));
+                }
+                events.extend(routing.key_pulse_with_characters(0x08, Some("c"), false).0);
+                events.extend(routing.modifier_changed(0x37, false, false));
+                if let Some(extra) = extra {
+                    events.extend(routing.modifier_changed(extra, false, false));
+                }
+                let events = key_events(&events);
+                if enabled && extra.is_none() {
+                    assert_eq!(
+                        events,
+                        [(0x3b, true), (0x08, true), (0x08, false), (0x3b, false)]
+                    );
+                } else {
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|(key, _)| *key == 0x37)
+                            .copied()
+                            .collect::<Vec<_>>(),
+                        [(0x37, true), (0x37, false)]
+                    );
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|(key, _)| *key == 0x08)
+                            .copied()
+                            .collect::<Vec<_>>(),
+                        [(0x08, true), (0x08, false)]
+                    );
+                    assert_eq!(
+                        events.iter().filter(|(key, _)| *key == 0x3b).count(),
+                        if extra == Some(0x3b) { 2 } else { 0 }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mac_shortcuts_switch_between_windows_and_control_during_one_command_hold() {
+        let mut routing = InputRoutingState {
+            mac_shortcuts_enabled: true,
+            ..Default::default()
+        };
+        assert!(routing.modifier_changed(0x37, true, false).is_empty());
+        assert_eq!(
+            key_events(&routing.key_pulse_with_characters(0x0e, Some("e"), false).0),
+            [(0x37, true), (0x0e, true), (0x0e, false)]
+        );
+        assert_eq!(
+            key_events(&routing.key_pulse_with_characters(0x08, Some("c"), false).0),
+            [
+                (0x37, false),
+                (0x3b, true),
+                (0x08, true),
+                (0x08, false),
+                (0x3b, false)
+            ]
+        );
+        assert_eq!(
+            key_events(&routing.key_pulse_with_characters(0x0f, Some("r"), false).0),
+            [(0x37, true), (0x0f, true), (0x0f, false)]
+        );
+        assert_eq!(
+            key_events(&routing.modifier_changed(0x37, false, false)),
+            [(0x37, false)]
+        );
+    }
+
+    #[test]
+    fn mac_shortcuts_do_not_swallow_key_up_when_option_is_added() {
+        let mut routing = InputRoutingState {
+            mac_shortcuts_enabled: true,
+            ..Default::default()
+        };
+        routing.modifier_changed(0x37, true, false);
+        routing.key_pulse_with_characters(0x08, Some("c"), false);
+        assert_eq!(
+            key_events(&routing.modifier_changed(0x3a, true, false)),
+            [(0x37, true), (0x3a, true)]
+        );
+        assert_eq!(
+            key_events(&routing.key_pulse_with_characters(0x08, Some("c"), false).0),
+            [(0x08, true), (0x08, false)]
+        );
+        assert_eq!(
+            key_events(&routing.modifier_changed(0x37, false, false)),
+            [(0x37, false)]
+        );
+        assert_eq!(
+            key_events(&routing.modifier_changed(0x3a, false, false)),
+            [(0x3a, false)]
+        );
+    }
+
+    #[test]
+    fn mac_shortcuts_suppress_both_command_keys_but_preserve_a_lone_tap() {
+        let mut routing = InputRoutingState {
+            mac_shortcuts_enabled: true,
+            ..Default::default()
+        };
+        routing.modifier_changed(0x36, true, false);
+        routing.modifier_changed(0x37, true, false);
+        routing.key_pulse_with_characters(0x08, Some("c"), false);
+        assert!(routing.modifier_changed(0x36, false, false).is_empty());
+        assert!(routing.modifier_changed(0x37, false, false).is_empty());
+        routing.modifier_changed(0x37, true, false);
+        assert_eq!(
+            key_events(&routing.modifier_changed(0x37, false, false)),
+            [(0x37, true), (0x37, false)]
+        );
+    }
+
+    #[test]
+    fn mac_shortcuts_preserve_stt_paste_priority_and_focus_reset() {
+        let mut routing = InputRoutingState {
+            mac_shortcuts_enabled: true,
+            ..Default::default()
+        };
+        routing.modifier_changed(0x37, true, true);
+        routing.key_pulse_with_characters(0x08, Some("c"), true);
+        let (events, paste) = routing.key_pulse_with_characters(0x09, Some("v"), true);
+        assert!(paste);
+        assert!(events.is_empty());
+        assert!(routing.modifier_changed(0x37, false, true).is_empty());
+
+        routing.modifier_changed(0x37, true, false);
+        routing.key_pulse_with_characters(0x08, Some("c"), false);
+        routing.clear();
+        assert!(routing.mac_shortcuts_enabled);
+        assert!(routing.modifier_changed(0x37, false, false).is_empty());
+        assert_eq!(
+            key_events(&routing.key_pulse_with_characters(0x08, Some("c"), false).0),
+            [(0x08, true), (0x08, false)]
+        );
+    }
+
+    #[test]
+    fn mac_shortcut_control_mapping_is_unaffected_by_command_option_swap() {
+        let mut routing = InputRoutingState {
+            mac_shortcuts_enabled: true,
+            ..Default::default()
+        };
+        routing.modifier_changed(0x37, true, false);
+        let events = routing.key_pulse_with_characters(0x08, Some("c"), false).0;
+        for swap in [false, true] {
+            let scancodes: Vec<_> = key_events(&events)
+                .into_iter()
+                .map(|(key, down)| {
+                    let code = rdp123_core::keymap::mac_keycode_to_scancode(key, swap).unwrap();
+                    (code.code, code.extended, down)
+                })
+                .collect();
+            assert_eq!(
+                scancodes,
+                [
+                    (0x1d, false, true),
+                    (0x2e, false, true),
+                    (0x2e, false, false),
+                    (0x1d, false, false)
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn mac_shortcuts_survive_pointer_movement_but_clicks_restore_command() {
+        let mut routing = InputRoutingState {
+            mac_shortcuts_enabled: true,
+            ..Default::default()
+        };
+        routing.modifier_changed(0x37, true, false);
+        assert!(matches!(
+            routing
+                .pointer_input(vec![InputEvent::MouseMove { x: 1, y: 2 }])
+                .as_slice(),
+            [InputEvent::MouseMove { x: 1, y: 2 }]
+        ));
+        let (events, _) = routing.key_pulse_with_characters(0x08, Some("c"), false);
+        assert_eq!(
+            key_events(&events),
+            [(0x3b, true), (0x08, true), (0x08, false), (0x3b, false)]
+        );
+        assert!(matches!(
+            routing
+                .pointer_input(vec![InputEvent::MouseMove { x: 3, y: 4 }])
+                .as_slice(),
+            [InputEvent::MouseMove { x: 3, y: 4 }]
+        ));
+        assert!(matches!(
+            routing
+                .pointer_input(vec![InputEvent::MouseButton {
+                    button: rdp123_core::PointerButton::Left,
+                    down: true,
+                    x: 3,
+                    y: 4,
+                }])
+                .as_slice(),
+            [
+                InputEvent::Key {
+                    keycode: 0x37,
+                    down: true
+                },
+                InputEvent::MouseButton { .. }
+            ]
+        ));
+        assert_eq!(
+            key_events(&routing.modifier_changed(0x37, false, false)),
+            [(0x37, false)]
+        );
+    }
+
+    #[test]
+    fn pointer_routing_preserves_stt_only_behavior_and_command_scrolling() {
+        let mut routing = InputRoutingState::default();
+        routing.modifier_changed(0x37, true, true);
+        assert!(matches!(
+            routing
+                .pointer_input(vec![InputEvent::MouseMove { x: 1, y: 2 }])
+                .as_slice(),
+            [
+                InputEvent::Key {
+                    keycode: 0x37,
+                    down: true
+                },
+                InputEvent::MouseMove { .. }
+            ]
+        ));
+
+        let mut routing = InputRoutingState {
+            mac_shortcuts_enabled: true,
+            ..Default::default()
+        };
+        routing.modifier_changed(0x37, true, false);
+        assert!(matches!(
+            routing
+                .pointer_input(vec![InputEvent::Wheel {
+                    delta: 120,
+                    horizontal: false
+                }])
+                .as_slice(),
+            [
+                InputEvent::Key {
+                    keycode: 0x37,
+                    down: true
+                },
+                InputEvent::Wheel { .. }
+            ]
+        ));
+    }
 
     fn command_key_event(characters: &str, keycode: u16) -> Retained<NSEvent> {
         let characters = NSString::from_str(characters);

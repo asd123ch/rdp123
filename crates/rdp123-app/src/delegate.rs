@@ -105,6 +105,16 @@ pub fn set_external_stt_paste_enabled(enabled: bool) {
     });
 }
 
+pub fn set_mac_shortcuts_enabled(enabled: bool) {
+    DELEGATE.with(|d| {
+        if let Some(delegate) = d.borrow().as_ref() {
+            for controller in delegate.ivars().borrow().windows.values() {
+                controller.set_mac_shortcuts_enabled(enabled);
+            }
+        }
+    });
+}
+
 pub struct AppState {
     store: ProfileStore,
     /// Snapshot backing the current menu; menu tags index into this.
@@ -386,15 +396,7 @@ impl AppDelegate {
         let remember = connection.rdp.password_policy == PasswordPolicy::Remember;
         if remember {
             match secrets::load_password(&connection.id) {
-                Ok(Some(p)) => {
-                    // Re-create the item so it is owned by the current app
-                    // identity. Items written by an earlier build otherwise
-                    // carry a stale access list and prompt on every read.
-                    if let Err(e) = secrets::store_password(&connection.id, &p) {
-                        tracing::warn!("could not refresh keychain item: {e:#}");
-                    }
-                    return Some(p);
-                }
+                Ok(Some(p)) => return Some(p),
                 Ok(None) => {}
                 Err(e) => ui::show_error(mtm, "Keychain error", &format!("{e:#}")),
             }
@@ -472,6 +474,7 @@ impl AppDelegate {
             &connection.rdp,
             global_settings.external_stt_paste,
         );
+        controller.set_mac_shortcuts_enabled(global_settings.mac_shortcuts);
 
         let (width, height, scale) = controller.initial_size();
         let opts = &connection.rdp;
