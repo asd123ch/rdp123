@@ -416,7 +416,7 @@ impl TerminalKind {
 }
 
 /// Global settings.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
     pub terminal: TerminalKind,
@@ -435,6 +435,26 @@ pub struct Settings {
     /// replaced by the `ssh …` invocation (also `{host}`, `{port}`, `{user}`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_terminal: Option<String>,
+    /// Look for a newer release on GitHub once a day. On by default.
+    #[serde(default = "enabled")]
+    pub check_for_updates: bool,
+}
+
+fn enabled() -> bool {
+    true
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            terminal: TerminalKind::default(),
+            swap_cmd_alt: false,
+            mac_shortcuts: false,
+            external_stt_paste: false,
+            custom_terminal: None,
+            check_for_updates: true,
+        }
+    }
 }
 
 /// The top-level document persisted to disk.

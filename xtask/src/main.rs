@@ -4,6 +4,10 @@
 //! code-signs it. Signing identity comes from `RDP123_SIGN_IDENTITY` (defaults
 //! to ad-hoc `-`). See the README for why a stable self-signed identity is
 //! preferable to ad-hoc for repeated Keychain access.
+//!
+//! `cargo xtask release` builds the Apple Silicon app, signs it with a Developer ID,
+//! notarizes the app and its DMG, and writes the matching Homebrew cask. It
+//! never uploads anything.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -24,9 +28,10 @@ fn main() -> Result<()> {
     match cmd.as_str() {
         "bundle" => bundle().map(|_| ()),
         "install" => install(),
+        "release" => release(env::args().skip(2).any(|arg| arg == "--skip-notarization")),
         other => {
             eprintln!("unknown xtask command: {other:?}");
-            eprintln!("usage: cargo xtask [bundle|install]");
+            eprintln!("usage: cargo xtask [bundle|install|release [--skip-notarization]]");
             std::process::exit(2);
         }
     }
@@ -107,72 +112,107 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn bundle() -> Result<PathBuf> {
-    let root = workspace_root();
-    let libraries = runtime_libraries(&root)?;
-    let home = PathBuf::from(env::var_os("HOME").context("HOME is not set")?);
-    if !home.is_absolute() {
-        bail!("HOME must be an absolute path for build-path remapping");
-    }
-    let rustflags = env::var_os("CARGO_ENCODED_RUSTFLAGS").unwrap_or_else(|| {
-        env::var("RUSTFLAGS")
-            .unwrap_or_default()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join("\x1f")
-            .into()
-    });
+struct BuildEnv {
+    root: PathBuf,
+    rustflags: OsString,
+    libraries: String,
+}
 
-    // Make the app's build script rerun so the About tab's build time and commit
-    // reflect this build.
-    let _ = Command::new("touch")
-        .arg(root.join("crates/rdp123-app/build.rs"))
-        .status();
-
-    run(Command::new(env!("CARGO"))
-        .current_dir(&root)
-        .args(["build", "--release", "-p", "rdp123-app", "--locked"])
-        .env(
-            "CARGO_ENCODED_RUSTFLAGS",
-            remap_build_paths(rustflags, &root, &home),
-        )
-        .env("RDP123_LIBS", libraries))
-    .context("cargo build failed")?;
-
-    let bin = root.join("target/release").join(BIN_NAME);
-    if !bin.exists() {
-        bail!("release binary not found at {}", bin.display());
-    }
-    let binary = fs::read(&bin).context("checking release binary for private build paths")?;
-    for path in [&root, &home] {
-        let prefix = path.as_os_str().as_encoded_bytes();
-        if binary.windows(prefix.len()).any(|window| window == prefix) {
-            bail!("release binary still contains a private build path; refusing to bundle it");
+impl BuildEnv {
+    fn new() -> Result<Self> {
+        let root = workspace_root();
+        let libraries = runtime_libraries(&root)?;
+        let home = PathBuf::from(env::var_os("HOME").context("HOME is not set")?);
+        if !home.is_absolute() {
+            bail!("HOME must be an absolute path for build-path remapping");
         }
+        let rustflags = env::var_os("CARGO_ENCODED_RUSTFLAGS").unwrap_or_else(|| {
+            env::var("RUSTFLAGS")
+                .unwrap_or_default()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join("\x1f")
+                .into()
+        });
+
+        // Make the app's build script rerun so the About tab's build time and
+        // commit reflect this build.
+        let _ = Command::new("touch")
+            .arg(root.join("crates/rdp123-app/build.rs"))
+            .status();
+
+        let rustflags = remap_build_paths(rustflags, &root, &home);
+        Ok(Self {
+            root,
+            rustflags,
+            libraries,
+        })
     }
 
-    let app = root.join("dist").join(format!("{APP_NAME}.app"));
-    if app.exists() {
-        fs::remove_dir_all(&app).ok();
+    /// Build the app binary, for the host or for one target triple.
+    fn build(&self, target: Option<&str>) -> Result<PathBuf> {
+        let mut cargo = Command::new(env!("CARGO"));
+        cargo
+            .current_dir(&self.root)
+            .args(["build", "--release", "-p", "rdp123-app", "--locked"])
+            .env("CARGO_ENCODED_RUSTFLAGS", &self.rustflags)
+            .env("RDP123_LIBS", &self.libraries);
+        let mut out = self.root.join("target");
+        if let Some(target) = target {
+            cargo.args(["--target", target]);
+            out.push(target);
+        }
+        run(&mut cargo).context("cargo build failed")?;
+        let bin = out.join("release").join(BIN_NAME);
+        if !bin.exists() {
+            bail!("release binary not found at {}", bin.display());
+        }
+        Ok(bin)
     }
-    let macos = app.join("Contents/MacOS");
-    let resources = app.join("Contents/Resources");
-    fs::create_dir_all(&macos)?;
-    fs::create_dir_all(&resources)?;
 
-    fs::copy(&bin, macos.join(BIN_NAME)).context("copy binary into bundle")?;
-    fs::write(app.join("Contents/Info.plist"), info_plist())?;
-    fs::write(app.join("Contents/PkgInfo"), "APPL????")?;
-
-    // Optional icon: assets/AppIcon.icns -> Resources/AppIcon.icns
-    let icon = root.join("assets/AppIcon.icns");
-    if icon.exists() {
-        fs::copy(&icon, resources.join("AppIcon.icns"))?;
+    fn check_private_paths(&self, bin: &Path) -> Result<()> {
+        let home = PathBuf::from(env::var_os("HOME").context("HOME is not set")?);
+        let binary = fs::read(bin).context("checking release binary for private build paths")?;
+        for path in [&self.root, &home] {
+            let prefix = path.as_os_str().as_encoded_bytes();
+            if binary.windows(prefix.len()).any(|window| window == prefix) {
+                bail!("release binary still contains a private build path; refusing to bundle it");
+            }
+        }
+        Ok(())
     }
 
-    fs::copy(root.join("LICENSE"), resources.join("LICENSE"))
-        .context("copy LICENSE into bundle")?;
+    /// Assemble `dist/RDP123.app` around an already built binary (unsigned).
+    fn assemble(&self, bin: &Path) -> Result<PathBuf> {
+        self.check_private_paths(bin)?;
+        let app = self.root.join("dist").join(format!("{APP_NAME}.app"));
+        if app.exists() {
+            fs::remove_dir_all(&app).ok();
+        }
+        let macos = app.join("Contents/MacOS");
+        let resources = app.join("Contents/Resources");
+        fs::create_dir_all(&macos)?;
+        fs::create_dir_all(&resources)?;
 
+        fs::copy(bin, macos.join(BIN_NAME)).context("copy binary into bundle")?;
+        fs::write(app.join("Contents/Info.plist"), info_plist())?;
+        fs::write(app.join("Contents/PkgInfo"), "APPL????")?;
+
+        let icon = self.root.join("assets/AppIcon.icns");
+        if icon.exists() {
+            fs::copy(&icon, resources.join("AppIcon.icns"))?;
+        }
+
+        fs::copy(self.root.join("LICENSE"), resources.join("LICENSE"))
+            .context("copy LICENSE into bundle")?;
+        Ok(app)
+    }
+}
+
+fn bundle() -> Result<PathBuf> {
+    let build = BuildEnv::new()?;
+    let bin = build.build(None)?;
+    let app = build.assemble(&bin)?;
     codesign(&app)?;
 
     // Don't let the build copy show up as a second app in Spotlight/Launchpad.
@@ -181,6 +221,242 @@ fn bundle() -> Result<PathBuf> {
     println!("\nBundled: {}", app.display());
     println!("Install: cargo xtask install   (into /Applications, single copy)");
     Ok(app)
+}
+
+const RELEASE_TARGET: &str = "aarch64-apple-darwin";
+
+/// Credentials for `notarytool`, read from the file named by
+/// `RDP123_NOTARIZATION_ENV` (`APPLE_API_KEY`, `APPLE_API_ISSUER`,
+/// `APPLE_API_KEY_PATH`).
+struct Notary {
+    key_id: String,
+    issuer: String,
+    key_path: PathBuf,
+}
+
+impl Notary {
+    fn from_env() -> Result<Self> {
+        let file = env::var_os("RDP123_NOTARIZATION_ENV").context(
+            "set RDP123_NOTARIZATION_ENV to the notarization credentials file \
+             (or pass --skip-notarization for a local test build)",
+        )?;
+        let text = fs::read_to_string(&file)
+            .with_context(|| format!("reading {}", Path::new(&file).display()))?;
+        let home = env::var("HOME").context("HOME is not set")?;
+        let values = parse_env_file(&text, &home);
+        let get = |key: &str| {
+            values
+                .get(key)
+                .filter(|value| !value.is_empty())
+                .cloned()
+                .with_context(|| format!("{key} is missing from the notarization file"))
+        };
+        let notary = Self {
+            key_id: get("APPLE_API_KEY")?,
+            issuer: get("APPLE_API_ISSUER")?,
+            key_path: PathBuf::from(get("APPLE_API_KEY_PATH")?),
+        };
+        if !notary.key_path.is_file() {
+            bail!("APPLE_API_KEY_PATH points to a missing file");
+        }
+        Ok(notary)
+    }
+
+    /// Upload `upload` for notarization, then staple the ticket to `staple`.
+    fn submit(&self, upload: &Path, staple: &Path) -> Result<()> {
+        println!("Notarizing {} …", staple.display());
+        // Report failures without the command line: it names the API key.
+        let status = Command::new("xcrun")
+            .args(["notarytool", "submit"])
+            .arg(upload)
+            .arg("--key")
+            .arg(&self.key_path)
+            .args(["--key-id", &self.key_id, "--issuer", &self.issuer, "--wait"])
+            .status()
+            .context("starting notarytool")?;
+        if !status.success() {
+            bail!("notarization failed ({status}); see the notarytool output above");
+        }
+        run(Command::new("xcrun")
+            .args(["stapler", "staple"])
+            .arg(staple))
+        .context("stapling the notarization ticket failed")?;
+        run(Command::new("xcrun")
+            .args(["stapler", "validate"])
+            .arg(staple))
+    }
+}
+
+/// Parse `KEY=value` lines as written for a POSIX shell, expanding `$HOME`.
+fn parse_env_file(text: &str, home: &str) -> BTreeMap<String, String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| {
+            let line = line.strip_prefix("export ").unwrap_or(line);
+            let (key, value) = line.split_once('=')?;
+            let value = value.trim();
+            let value = value
+                .strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+                .unwrap_or(value);
+            let value = match value.strip_prefix("~/") {
+                Some(rest) => format!("{home}/{rest}"),
+                None => value.replace("${HOME}", home).replace("$HOME", home),
+            };
+            Some((key.trim().to_string(), value))
+        })
+        .collect()
+}
+
+fn developer_id_identity() -> Result<String> {
+    if let Ok(identity) = env::var("RDP123_RELEASE_IDENTITY") {
+        if !identity.trim().is_empty() {
+            return Ok(identity);
+        }
+    }
+    let output = Command::new("security")
+        .args(["find-identity", "-v", "-p", "codesigning"])
+        .output()
+        .context("listing code-signing identities")?;
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let identities: Vec<&str> = listing
+        .lines()
+        .filter_map(|line| line.split('"').nth(1))
+        .filter(|name| name.starts_with("Developer ID Application:"))
+        .collect();
+    match identities.as_slice() {
+        [identity] => Ok((*identity).to_string()),
+        [] => bail!("no Developer ID Application identity found in the keychain"),
+        _ => bail!("several Developer ID identities found; set RDP123_RELEASE_IDENTITY"),
+    }
+}
+
+fn release(skip_notarization: bool) -> Result<()> {
+    let root = workspace_root();
+    let notary = if skip_notarization {
+        None
+    } else {
+        let status = Command::new("git")
+            .current_dir(&root)
+            .args(["status", "--porcelain"])
+            .output()
+            .context("checking the working tree")?;
+        if !status.stdout.is_empty() {
+            bail!("the working tree has uncommitted changes; commit them before a release");
+        }
+        Some(Notary::from_env()?)
+    };
+    let identity = developer_id_identity()?;
+
+    let build = BuildEnv::new()?;
+    let bin = build.build(Some(RELEASE_TARGET))?;
+    let app = build.assemble(&bin)?;
+    run(Command::new("codesign")
+        .args(["--force", "--options", "runtime", "--timestamp", "--sign"])
+        .arg(&identity)
+        .arg(&app))
+    .context("signing the app with the Developer ID")?;
+    run(Command::new("codesign")
+        .args(["--verify", "--deep", "--strict", "--verbose=2"])
+        .arg(&app))?;
+    lsregister(&["-u", &app.to_string_lossy()]);
+
+    let work = root.join("target/release-work");
+    if work.exists() {
+        fs::remove_dir_all(&work).context("clearing the release work directory")?;
+    }
+    fs::create_dir_all(&work)?;
+
+    if let Some(notary) = &notary {
+        let zip = work.join(format!("{APP_NAME}.zip"));
+        run(Command::new("ditto")
+            .args(["-c", "-k", "--keepParent"])
+            .arg(&app)
+            .arg(&zip))?;
+        notary.submit(&zip, &app)?;
+        run(Command::new("spctl")
+            .args(["--assess", "--type", "execute", "--verbose=2"])
+            .arg(&app))
+        .context("Gatekeeper rejected the app")?;
+    }
+
+    let stage = work.join("dmg");
+    fs::create_dir_all(&stage)?;
+    run(Command::new("ditto")
+        .arg(&app)
+        .arg(stage.join(format!("{APP_NAME}.app"))))?;
+    std::os::unix::fs::symlink("/Applications", stage.join("Applications"))
+        .context("adding the Applications link to the DMG")?;
+    let dmg = root.join("dist").join(format!("{APP_NAME}-{VERSION}.dmg"));
+    if dmg.exists() {
+        fs::remove_file(&dmg)?;
+    }
+    run(Command::new("hdiutil")
+        .args(["create", "-quiet", "-volname", APP_NAME, "-srcfolder"])
+        .arg(&stage)
+        .args(["-format", "UDZO"])
+        .arg(&dmg))
+    .context("creating the DMG")?;
+    run(Command::new("codesign")
+        .args(["--force", "--timestamp", "--sign"])
+        .arg(&identity)
+        .arg(&dmg))
+    .context("signing the DMG")?;
+    run(Command::new("hdiutil").args(["verify", "-quiet"]).arg(&dmg))?;
+
+    if let Some(notary) = &notary {
+        notary.submit(&dmg, &dmg)?;
+        run(Command::new("spctl")
+            .args([
+                "--assess",
+                "--type",
+                "open",
+                "--context",
+                "context:primary-signature",
+                "--verbose=2",
+            ])
+            .arg(&dmg))
+        .context("Gatekeeper rejected the DMG")?;
+    }
+    fs::remove_dir_all(&work).ok();
+
+    let sha256 = sha256_of(&dmg)?;
+    println!("\nDMG:     {}", dmg.display());
+    println!("SHA-256: {sha256}");
+    if notary.is_some() {
+        let template = fs::read_to_string(root.join("packaging/rdp123.rb.in"))
+            .context("reading packaging/rdp123.rb.in")?;
+        let cask = root.join("dist/rdp123.rb");
+        fs::write(&cask, render_cask(&template, VERSION, &sha256))?;
+        println!("Cask:    {}", cask.display());
+    } else {
+        println!("Not notarized (--skip-notarization): for local testing only, no cask written.");
+    }
+    Ok(())
+}
+
+fn sha256_of(file: &Path) -> Result<String> {
+    let output = Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(file)
+        .output()
+        .context("running shasum")?;
+    if !output.status.success() {
+        bail!("shasum failed for {}", file.display());
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .map(str::to_string)
+        .context("shasum printed no checksum")
+}
+
+fn render_cask(template: &str, version: &str, sha256: &str) -> String {
+    template
+        .replace("@VERSION@", version)
+        .replace("@SHA256@", sha256)
 }
 
 fn remap_build_paths(mut flags: OsString, root: &Path, home: &Path) -> OsString {
@@ -471,6 +747,27 @@ mod tests {
             flags,
             "--remap-path-prefix=/home/builder=/build/home\x1f\
              --remap-path-prefix=/workspace/RDP123=/build/rdp123"
+        );
+    }
+
+    #[test]
+    fn notarization_file_accepts_shell_syntax() {
+        let values = parse_env_file(
+            "# comment\nexport APPLE_API_KEY=\"ABC123\"\nAPPLE_API_ISSUER='issuer'\n\
+             APPLE_API_KEY_PATH=$HOME/keys/AuthKey.p8\nOTHER=~/x\n",
+            "/Users/me",
+        );
+        assert_eq!(values["APPLE_API_KEY"], "ABC123");
+        assert_eq!(values["APPLE_API_ISSUER"], "issuer");
+        assert_eq!(values["APPLE_API_KEY_PATH"], "/Users/me/keys/AuthKey.p8");
+        assert_eq!(values["OTHER"], "/Users/me/x");
+    }
+
+    #[test]
+    fn cask_template_receives_version_and_checksum() {
+        assert_eq!(
+            render_cask("version \"@VERSION@\"\nsha256 \"@SHA256@\"", "1.2.3", "abc"),
+            "version \"1.2.3\"\nsha256 \"abc\""
         );
     }
 

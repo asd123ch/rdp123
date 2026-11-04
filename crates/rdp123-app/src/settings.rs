@@ -156,6 +156,8 @@ pub struct SettingsIvars {
     connection_form: RefCell<Option<Retained<NSView>>>,
     global_pane: RefCell<Option<Retained<NSScrollView>>>,
     about_pane: RefCell<Option<Retained<NSScrollView>>>,
+    update_button: RefCell<Option<Retained<NSButton>>>,
+    update_status: RefCell<Option<Retained<NSTextField>>>,
     save_button: Check,
     revert_button: Check,
     remove_button: Check,
@@ -199,6 +201,7 @@ pub struct SettingsIvars {
     swap_cmd_alt: Check,
     mac_shortcuts: Check,
     external_stt_paste: Check,
+    check_for_updates: Check,
     /// Launch-at-login. Not persisted in the document: the checkbox mirrors
     /// the system's `SMAppService` status.
     launch_at_login: Check,
@@ -462,6 +465,22 @@ define_class!(
             }
         }
 
+        #[unsafe(method(checkForUpdates:))]
+        fn check_for_updates(&self, _s: Option<&AnyObject>) {
+            if let Some(release) = crate::updates::available() {
+                crate::updates::open_download_page(&release);
+                return;
+            }
+            if let Some(button) = self.ivars().update_button.borrow().as_ref() {
+                button.setEnabled(false);
+            }
+            self.set_update_status("Checking for updates…");
+            let this = self.retain();
+            crate::updates::check(Some(Box::new(move |outcome| {
+                this.show_update_outcome(outcome);
+            })));
+        }
+
         #[unsafe(method(copyVersionInfo:))]
         fn copy_version_info(&self, _s: Option<&AnyObject>) {
             let info = format!(
@@ -632,6 +651,35 @@ impl SettingsController {
         *self.ivars().window.borrow_mut() = Some(window);
     }
 
+    fn set_update_status(&self, text: &str) {
+        if let Some(status) = self.ivars().update_status.borrow().as_ref() {
+            status.setStringValue(&NSString::from_str(text));
+        }
+    }
+
+    fn show_update_outcome(&self, outcome: &crate::updates::Outcome) {
+        use crate::updates::Outcome;
+        let (status, button) = match outcome {
+            Outcome::UpToDate => ("RDP123 is up to date.".to_string(), "Check for Updates"),
+            Outcome::Available(release) => (
+                format!(
+                    "Version {} is available. With Homebrew: brew upgrade --cask rdp123",
+                    release.version
+                ),
+                "Open Download Page",
+            ),
+            Outcome::Failed(error) => (
+                format!("Could not check for updates: {error}"),
+                "Check for Updates",
+            ),
+        };
+        self.set_update_status(&status);
+        if let Some(b) = self.ivars().update_button.borrow().as_ref() {
+            b.setTitle(&NSString::from_str(button));
+            b.setEnabled(true);
+        }
+    }
+
     /// A centered label helper for the About pane.
     fn centered(
         &self,
@@ -697,14 +745,22 @@ impl SettingsController {
         self.button_ret(
             mtm,
             parent,
-            rect(W / 2.0 - 166.0, 498.0, 150.0, 28.0),
+            rect(W / 2.0 - 250.0, 498.0, 150.0, 28.0),
             "Copy Version Info",
             sel!(copyVersionInfo:),
         );
+        let update_button = self.button_ret(
+            mtm,
+            parent,
+            rect(W / 2.0 - 92.0, 498.0, 170.0, 28.0),
+            "Check for Updates",
+            sel!(checkForUpdates:),
+        );
+        *self.ivars().update_button.borrow_mut() = Some(update_button);
         let github = self.url_button(
             mtm,
             parent,
-            rect(W / 2.0 - 4.0, 498.0, 170.0, 28.0),
+            rect(W / 2.0 + 86.0, 498.0, 170.0, 28.0),
             "Source on GitHub",
             "https://github.com/asd123ch/rdp123",
         );
@@ -720,17 +776,26 @@ impl SettingsController {
             github.setImagePosition(NSCellImagePosition::ImageLeading);
         }
 
+        let status = self.centered(mtm, parent, 472.0, 18.0, "");
+        status.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+        status.setSelectable(true);
+        self.muted(&status);
+        *self.ivars().update_status.borrow_mut() = Some(status);
+        if let Some(release) = crate::updates::available() {
+            self.show_update_outcome(&crate::updates::Outcome::Available(release));
+        }
+
         // Separator line.
-        let separator = NSBox::initWithFrame(NSBox::alloc(mtm), rect(120.0, 480.0, W - 240.0, 1.0));
+        let separator = NSBox::initWithFrame(NSBox::alloc(mtm), rect(120.0, 462.0, W - 240.0, 1.0));
         separator.setBoxType(NSBoxType::Separator);
         parent.addSubview(&separator);
 
-        let header = self.centered(mtm, parent, 450.0, 18.0, "Open Source Libraries");
+        let header = self.centered(mtm, parent, 436.0, 18.0, "Open Source Libraries");
         header.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
         let note = self.centered(
             mtm,
             parent,
-            428.0,
+            414.0,
             15.0,
             "Direct dependencies. Click for details; hover over a group to see its libraries.",
         );
@@ -1202,6 +1267,18 @@ impl SettingsController {
             );
         }
         *self.ivars().launch_at_login.borrow_mut() = Some(login);
+
+        let updates = self.checkbox_fit(
+            mtm,
+            parent,
+            gfield,
+            96.0,
+            "Check for updates automatically",
+            sel!(globalChanged:),
+        );
+        *self.ivars().check_for_updates.borrow_mut() = Some(updates);
+        self.help_text(mtm, parent, rect(gfield + 20.0, 54.0, field_width - 20.0, 34.0),
+            "Asks GitHub once a day whether a newer version exists.\nNothing about you or your connections is sent.");
     }
 
     // ---------- small control builders ----------
@@ -1769,6 +1846,8 @@ impl SettingsController {
         self.set_check(&iv.mac_shortcuts, mac_shortcuts);
         let external_stt_paste = iv.document.borrow().settings.external_stt_paste;
         self.set_check(&iv.external_stt_paste, external_stt_paste);
+        let check_for_updates = iv.document.borrow().settings.check_for_updates;
+        self.set_check(&iv.check_for_updates, check_for_updates);
         // Reflect the system's login-item state, not a stored flag.
         self.set_check(&iv.launch_at_login, crate::login_item::is_enabled());
 
@@ -2002,6 +2081,7 @@ impl SettingsController {
         document.settings.swap_cmd_alt = self.check_on(&self.ivars().swap_cmd_alt);
         document.settings.mac_shortcuts = self.check_on(&self.ivars().mac_shortcuts);
         document.settings.external_stt_paste = self.check_on(&self.ivars().external_stt_paste);
+        document.settings.check_for_updates = self.check_on(&self.ivars().check_for_updates);
         if self.save_document(&mut document) {
             if let Some(field) = self.ivars().custom.borrow().as_ref() {
                 field.setEnabled(document.settings.terminal == TerminalKind::Custom);

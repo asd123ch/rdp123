@@ -1,0 +1,27 @@
+cask "rdp123" do
+  version "@VERSION@"
+  sha256 "@SHA256@"
+
+  url "https://github.com/asd123ch/rdp123/releases/download/v#{version}/RDP123-#{version}.dmg"
+  name "RDP123"
+  desc "Native remote desktop client for Windows PCs"
+  homepage "https://github.com/asd123ch/rdp123"
+
+  livecheck do
+    url :url
+    strategy :github_latest
+  end
+
+  depends_on arch: :arm64
+  depends_on :macos
+
+  app "RDP123.app"
+
+  uninstall quit: "ch.asd123.rdp123"
+
+  zap trash: [
+    "~/Library/Application Support/ch.asd123.RDP123",
+    "~/Library/Preferences/ch.asd123.rdp123.plist",
+    "~/Library/Saved Application State/ch.asd123.rdp123.savedState",
+  ]
+end

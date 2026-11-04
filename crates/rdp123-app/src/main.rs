@@ -5,6 +5,7 @@ mod file_pasteboard;
 mod login_item;
 mod settings;
 mod ui;
+mod updates;
 mod view;
 mod web_auth;
 mod window;

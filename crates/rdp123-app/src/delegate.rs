@@ -160,6 +160,9 @@ define_class!(
             status.setMenu(Some(&menu));
             self.rebuild_menu(&menu, mtm);
             self.ivars().borrow_mut().status_item = Some(status);
+
+            let store = self.ivars().borrow().store.clone();
+            crate::updates::start(store);
         }
 
         /// Add every live RDP session to the Dock icon's context menu. macOS
@@ -193,6 +196,13 @@ define_class!(
         #[unsafe(method(openSettings:))]
         fn open_settings(&self, _sender: Option<&AnyObject>) {
             self.show_settings();
+        }
+
+        #[unsafe(method(showUpdate:))]
+        fn show_update(&self, _sender: Option<&AnyObject>) {
+            if let Some(release) = crate::updates::available() {
+                crate::updates::open_download_page(&release);
+            }
         }
 
         #[unsafe(method(showSessionFromDock:))]
@@ -235,6 +245,23 @@ impl AppDelegate {
         menu.removeAllItems();
 
         let store = self.ivars().borrow().store.clone();
+        let update = crate::updates::available()
+            .filter(|_| crate::updates::automatic_checks_enabled(&store));
+        if let Some(release) = update {
+            let item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &NSString::from_str(&format!("Update to RDP123 {}…", release.version)),
+                    Some(sel!(showUpdate:)),
+                    ns_string!(""),
+                )
+            };
+            let target: &AnyObject = self;
+            unsafe { item.setTarget(Some(target)) };
+            menu.addItem(&item);
+            menu.addItem(&NSMenuItem::separatorItem(mtm));
+        }
+
         let (connections, load_failed) = match store.load() {
             Ok(connections) => (connections, false),
             Err(error) => {

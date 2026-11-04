@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.6.25" src="https://img.shields.io/badge/version-0.6.25-2f81f7">
+  <img alt="Version 0.7.1" src="https://img.shields.io/badge/version-0.7.1-2f81f7">
   <a href="LICENSE"><img alt="GNU AGPL v3.0" src="https://img.shields.io/badge/license-AGPLv3-3da639"></a>
   <img alt="macOS 11 or newer" src="https://img.shields.io/badge/macOS-11%2B-black">
   <img alt="Rust 1.94 or newer" src="https://img.shields.io/badge/Rust-1.94%2B-b7410e">
@@ -18,7 +18,7 @@
 
 <p align="center">
   <a href="#features">Features</a> ·
-  <a href="#build--install">Build</a> ·
+  <a href="#install">Install</a> ·
   <a href="#usage">Usage</a> ·
   <a href="#security">Security</a> ·
   <a href="#privacy">Privacy</a> ·
@@ -37,13 +37,13 @@ last one closes, the app quietly returns to the menu bar.
 
 RDP123 is a native AppKit app written in Rust, with no Electron or bundled
 browser. It focuses on everyday remote access rather than enterprise
-management and occupies about 10 MB when installed.
+management and occupies about 11 MB when installed.
 
 <p align="center">
-  <img src="assets/size-comparison.svg" alt="Installed size: RDP123 10 MB, Microsoft Windows App 228 MB, Remote Desktop Manager (Devolutions) 993 MB" width="640">
+  <img src="assets/size-comparison.svg" alt="Installed size: RDP123 11 MB, Microsoft Windows App 228 MB, Remote Desktop Manager (Devolutions) 993 MB" width="640">
 </p>
 
-RDP123's size is measured from v0.6.17; comparison app sizes are from mid-2026.
+RDP123's size is measured from v0.7.1; comparison app sizes are from mid-2026.
 
 Classic RDP 6.1 graphics is the default. Experimental RDP 8 graphics, including
 H.264, can be enabled per connection.
@@ -65,17 +65,45 @@ H.264, can be enabled per connection.
 
 ## Requirements
 
-- macOS 11 or newer on Apple Silicon or Intel.
-- Xcode Command Line Tools: `xcode-select --install`.
-- Rust 1.94 or newer via [rustup](https://rustup.rs).
+- A Mac with Apple Silicon (M1 or newer) and macOS 11 or newer. Intel Macs are
+  not supported.
 - A Windows host accepting password-based NLA or RDS AAD Auth. Entra mode
   requires the device hostname, not an IP address.
 
-## Build & install
+## Install
 
-RDP123 has no prebuilt download. A ready-made macOS binary would require a paid
-Apple Developer account for notarization; a local build needs no Apple account,
-does not receive a quarantine flag, and makes the running source explicit.
+Install with [Homebrew](https://brew.sh):
+
+```sh
+brew install --cask asd123ch/tap/rdp123
+```
+
+Update to the latest version:
+
+```sh
+brew upgrade --cask rdp123
+```
+
+Without Homebrew, download the DMG from
+[Releases](https://github.com/asd123ch/rdp123/releases/latest) and drag RDP123
+into Applications. Releases are signed with a Developer ID and notarized by
+Apple.
+
+### Updates
+
+With **Settings → Global → Check for updates automatically** (on by default),
+RDP123 asks GitHub once a day for a newer version. When one exists, the menu
+shows **Update to RDP123 …**. **Settings → About → Check for Updates** checks
+at any time. RDP123 never downloads or installs anything itself.
+
+## Build from source
+
+Most people should install with Homebrew. To build RDP123 yourself, you need
+the Xcode Command Line Tools (`xcode-select --install`) and Rust 1.94 or newer
+via [rustup](https://rustup.rs).
+
+<details>
+<summary>Build and install from source</summary>
 
 ```sh
 git clone https://github.com/asd123ch/rdp123.git
@@ -88,8 +116,10 @@ open /Applications/RDP123.app
 Use `cargo xtask bundle` to create `dist/RDP123.app` without installing.
 Run the signing helper once to keep macOS permissions stable across builds.
 
+</details>
+
 <details>
-<summary>Back up before updating and restore a previous build</summary>
+<summary>Back up a source build and restore a previous one</summary>
 
 Quit RDP123 before updating. Keep the signed app and a separate profile backup
 outside the repository:
@@ -177,7 +207,8 @@ unnotarized, which is unnecessary when running it on the Mac that built it.
 2. Under **Connections**, choose **+**, enter the host and login details, and
    **Save**. Use **Duplicate** to copy an existing profile.
 3. Under **Global**, choose the SSH terminal, optional ⌘/⌥ swap, Mac shortcuts,
-   speech-to-text paste, and whether RDP123 starts at login.
+   speech-to-text paste, whether RDP123 starts at login, and automatic update
+   checks.
 4. Select a saved connection from the menu to connect. RDP asks you to trust a
    new server key before signing in; Entra mode opens Microsoft login and MFA.
 
@@ -320,15 +351,13 @@ workaround is described in
 ## Privacy
 
 - No telemetry, analytics, crash reporting, advertising, tracking, accounts,
-  automatic updates, hosted control plane, or hidden background listener.
+  automatic downloads, hosted control plane, or hidden background listener.
 - No data is sent to the developer. RDP connects only to the configured host;
   SSH invokes the local client; Entra mode contacts
   `login.microsoftonline.com` for Microsoft authentication and its RDP token.
+- The update check requests the latest release from `api.github.com` once a
+  day. It sends only the app version in its user agent and can be turned off.
 - Clipboard and audio move only when enabled for that connection.
-
-There are intentionally no prebuilt notarized binaries. Review the source and
-dependencies before building any remote-access software. The signing helper
-only provides a stable local identity and never contacts Apple.
 
 ## Architecture
 
@@ -382,13 +411,12 @@ Issues and focused pull requests are welcome. Do not attach credentials,
 hostnames, captured RDP traffic, or private desktop screenshots. Keep vendored
 IronRDP changes narrow and documented for future upstreaming or rebasing.
 
-CI checks formatting, tests, Clippy, Intel compilation, and dependencies:
+CI checks formatting, tests, Clippy, bundling, and dependencies:
 
 ```sh
 cargo fmt --all -- --check
 cargo test --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo check --workspace --target x86_64-apple-darwin --locked
 cargo audit --ignore RUSTSEC-2023-0071 -D warnings
 ```
 
