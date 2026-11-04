@@ -20,46 +20,45 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::oneshot;
 use zeroize::Zeroize;
 
-use ironrdp::cliprdr::backend::CliprdrBackend;
-use ironrdp::cliprdr::pdu::{
+use ironrdp_cliprdr::backend::CliprdrBackend;
+use ironrdp_cliprdr::pdu::{
     ClipboardFileAttributes, ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags,
     FileContentsFlags, FileContentsRequest, FileContentsResponse, FileDescriptor,
     FormatDataRequest, FormatDataResponse, LockDataId, OwnedFormatDataResponse,
 };
-use ironrdp::cliprdr::{Client, CliprdrClient, CliprdrSvcMessages};
-use ironrdp::connector::connection_activation::{
+use ironrdp_cliprdr::{Client, CliprdrClient, CliprdrSvcMessages};
+use ironrdp_connector::connection_activation::{
     ConnectionActivationFactory, ConnectionActivationSequence, ConnectionActivationState,
 };
-use ironrdp::connector::sspi::{generator::NetworkRequest, ErrorKind as SspiErrorKind};
-use ironrdp::connector::{
+use ironrdp_connector::sspi::{generator::NetworkRequest, ErrorKind as SspiErrorKind};
+use ironrdp_connector::{
     BitmapConfig, ClientConnector, Config, ConnectionResult, ConnectorError, ConnectorErrorExt,
     ConnectorErrorKind, ConnectorResult, Credentials, DesktopSize, ServerName,
 };
-use ironrdp::core::WriteBuf;
-use ironrdp::displaycontrol::client::DisplayControlClient;
-use ironrdp::displaycontrol::pdu::MonitorLayoutEntry;
-use ironrdp::dvc::DrdynvcClient;
-use ironrdp::graphics::image_processing::PixelFormat;
-use ironrdp::input::{
+use ironrdp_core::WriteBuf;
+use ironrdp_displaycontrol::client::DisplayControlClient;
+use ironrdp_displaycontrol::pdu::MonitorLayoutEntry;
+use ironrdp_dvc::DrdynvcClient;
+use ironrdp_graphics::image_processing::PixelFormat;
+use ironrdp_input::{
     synchronize_event, Database, MouseButton, MousePosition, Operation, Scancode, WheelRotations,
 };
-use ironrdp::pdu::gcc::KeyboardType;
-use ironrdp::pdu::geometry::Rectangle as _;
-use ironrdp::pdu::input::fast_path::FastPathInputEvent;
-use ironrdp::pdu::rdp::capability_sets::{client_codecs_capabilities, MajorPlatformType};
-use ironrdp::pdu::rdp::client_info::{CompressionType, PerformanceFlags, TimezoneInfo};
-use ironrdp::pdu::PduResult;
-use ironrdp::rdpdr::{NoopRdpdrBackend, Rdpdr};
-use ironrdp::rdpsnd::client::Rdpsnd;
-use ironrdp::session::image::DecodedImage;
-use ironrdp::session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput};
+use ironrdp_pdu::gcc::KeyboardType;
+use ironrdp_pdu::geometry::Rectangle as _;
+use ironrdp_pdu::input::fast_path::FastPathInputEvent;
+use ironrdp_pdu::rdp::capability_sets::{client_codecs_capabilities, MajorPlatformType};
+use ironrdp_pdu::rdp::client_info::{CompressionType, PerformanceFlags, TimezoneInfo};
+use ironrdp_pdu::PduResult;
+use ironrdp_rdpdr::{NoopRdpdrBackend, Rdpdr};
+use ironrdp_rdpsnd::client::Rdpsnd;
+use ironrdp_session::image::DecodedImage;
+use ironrdp_session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput};
 use ironrdp_tokio::{
     connect_begin, connect_finalize, mark_as_upgraded, single_sequence_step_read,
     split_tokio_framed, FramedWrite as _, NetworkClient, TokioFramed,
 };
 
 use crate::framebuffer::SharedFramebuffer;
-use crate::gfx::GfxEvent;
 use crate::keymap;
 use crate::profile::{AudioMode, AuthenticationMode, ClipboardMode, GraphicsMode};
 use crate::rdsaad::RdsAadClient;
@@ -483,6 +482,7 @@ struct FetchJob {
     cache_dir: std::path::PathBuf,
     top_level_paths: Vec<std::path::PathBuf>,
     keep_cache: bool,
+    reply: Option<std::sync::mpsc::Sender<std::path::PathBuf>>,
 }
 
 impl Drop for FetchJob {
@@ -496,12 +496,61 @@ impl Drop for FetchJob {
 /// State of the remote clipboard's file offer and the fetch pipeline.
 #[derive(Debug)]
 struct RemoteClipboard {
+    generation: u64,
     files: Vec<RemoteFileEntry>,
     data_id: Option<u32>,
     jobs: std::collections::VecDeque<FetchJob>,
     next_stream_id: u32,
     /// Outstanding request: (stream id, was a SIZE request, requested bytes).
     outstanding: Option<(u32, bool, u32)>,
+}
+
+impl RemoteClipboard {
+    fn offer(
+        &mut self,
+        files: Vec<RemoteFileEntry>,
+        data_id: Option<u32>,
+        tx: Sender<ClipSignal>,
+    ) -> RemoteFileOffer {
+        self.invalidate();
+        self.files = files;
+        self.data_id = data_id;
+        let names = self
+            .files
+            .iter()
+            .filter(|entry| !entry.wire_name.contains('\\'))
+            .map(|entry| entry.wire_name.clone())
+            .collect();
+        RemoteFileOffer {
+            names,
+            generation: self.generation,
+            tx,
+        }
+    }
+
+    fn request(
+        &mut self,
+        generation: u64,
+        name: String,
+        reply: std::sync::mpsc::Sender<std::path::PathBuf>,
+    ) -> Result<bool, String> {
+        if generation != self.generation || !self.jobs.is_empty() {
+            return Ok(false);
+        }
+        let dir = create_remote_clipboard_cache_dir()?;
+        let mut job = plan_remote_clipboard_cache(self, &[name], dir)?;
+        job.reply = Some(reply);
+        self.jobs.push_back(job);
+        Ok(true)
+    }
+
+    fn invalidate(&mut self) {
+        self.jobs.clear();
+        self.outstanding = None;
+        self.files.clear();
+        self.data_id = None;
+        self.generation = self.generation.wrapping_add(1);
+    }
 }
 
 impl Default for RemoteClipboard {
@@ -513,6 +562,7 @@ impl Default for RemoteClipboard {
             // Some Windows clipboard owners treat zero as an uninitialized
             // correlation ID even though the field is formally an unsigned
             // integer. Start at one and skip zero after wrapping.
+            generation: 0,
             next_stream_id: 1,
             outstanding: None,
         }
@@ -658,6 +708,7 @@ fn plan_remote_clipboard_cache(
         cache_dir,
         top_level_paths,
         keep_cache: false,
+        reply: None,
     })
 }
 
@@ -668,13 +719,12 @@ async fn advance_remote_fetch(
     remote: &mut RemoteClipboard,
     active_stage: &mut ActiveStage,
     out_tx: &OutSender,
-    event_cb: &EventCb,
 ) -> Result<(), String> {
     loop {
         match next_remote_fetch_action(remote)? {
             RemoteFetchAction::Idle => return Ok(()),
             RemoteFetchAction::Ready(paths) => {
-                event_cb(SessionEvent::ClipboardFilesReady(paths));
+                tracing::debug!(items = paths.len(), "clipboard file request complete");
             }
             RemoteFetchAction::Request(request) => {
                 return send_cliprdr(active_stage, out_tx, |c| c.request_file_contents(request))
@@ -748,7 +798,10 @@ fn next_remote_fetch_action(remote: &mut RemoteClipboard) -> Result<RemoteFetchA
                 let Some(mut job) = remote.jobs.pop_front() else {
                     return Ok(RemoteFetchAction::Idle);
                 };
-                job.keep_cache = true;
+                job.keep_cache = match job.reply.take() {
+                    Some(reply) => reply.send(job.top_level_paths[0].clone()).is_ok(),
+                    None => true,
+                };
                 return Ok(RemoteFetchAction::Ready(job.top_level_paths.clone()));
             }
         }
@@ -776,7 +829,7 @@ async fn handle_remote_file_contents(
         fail_front_job(remote, reason, event_cb);
         return;
     }
-    if let Err(reason) = advance_remote_fetch(remote, active_stage, out_tx, event_cb).await {
+    if let Err(reason) = advance_remote_fetch(remote, active_stage, out_tx).await {
         fail_front_job(remote, reason, event_cb);
     }
 }
@@ -911,14 +964,7 @@ pub enum SessionEvent {
     /// The server hides the pointer (e.g. touch input or full-screen video).
     PointerHidden,
     ClipboardText(String),
-    /// Remote files are being materialized in a private local cache before
-    /// Finder receives real file URLs.
-    ClipboardFilesPreparing {
-        count: usize,
-    },
-    /// Fully downloaded top-level files ready to publish on the macOS
-    /// pasteboard. Paths remain valid independently of the RDP session.
-    ClipboardFilesReady(Vec<std::path::PathBuf>),
+    ClipboardFilesOffered(RemoteFileOffer),
     /// Preparing the remote clipboard files failed; no partial selection is
     /// published to Finder.
     ClipboardFilesFailed(String),
@@ -1149,8 +1195,41 @@ pub fn spawn(config: SessionConfig, event_cb: EventCb) -> SessionHandle {
     }
 }
 
-/// Signals produced by the clipboard backend, drained by the session loop.
+pub struct RemoteFileOffer {
+    names: Vec<String>,
+    generation: u64,
+    tx: Sender<ClipSignal>,
+}
+
+impl RemoteFileOffer {
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    /// Called on the pasteboard worker, never on the AppKit or RDP thread.
+    pub fn fetch(&self, index: usize) -> Option<std::path::PathBuf> {
+        let name = self.names.get(index)?.clone();
+        let (reply, result) = std::sync::mpsc::channel();
+        self.tx
+            .blocking_send(ClipSignal::FetchFile {
+                generation: self.generation,
+                name,
+                reply,
+            })
+            .ok()?;
+        result.recv().ok()
+    }
+}
+
 enum ClipSignal {
+    FetchFile {
+        generation: u64,
+        name: String,
+        reply: std::sync::mpsc::Sender<std::path::PathBuf>,
+    },
     /// Send the mandatory non-file FormatList that completes CLIPRDR setup.
     InitializeClipboard,
     /// Advertise the current local clipboard generation. Stale retries are
@@ -1171,6 +1250,7 @@ enum ClipSignal {
     SubmitFileContents(FileContentsResponse<'static>),
     /// The remote clipboard's file list arrived (parsed FileGroupDescriptorW).
     RemoteFileList {
+        tx: Sender<ClipSignal>,
         files: Vec<RemoteFileEntry>,
         data_id: Option<u32>,
     },
@@ -1180,6 +1260,7 @@ enum ClipSignal {
         data: Option<Vec<u8>>,
     },
     InitiatePaste(ClipboardFormatId),
+    InvalidateRemoteFiles,
     SubmitData {
         response: OwnedFormatDataResponse,
         paste_generation: Option<u64>,
@@ -1319,18 +1400,14 @@ async fn run(
             }
         }
         let (clip_tx, clip_rx) = channel::<ClipSignal>(CLIPBOARD_QUEUE_CAPACITY);
-        let (gfx_tx, gfx_rx) = tokio::sync::mpsc::unbounded_channel::<GfxEvent>();
         let outcome = match connect(
             &config,
             &mut rdsaad_client,
             &mut session_trusted,
             local_clip.clone(),
             clip_tx,
-            gfx_tx,
             audio.as_ref(),
-            &framebuffer,
             &event_cb,
-            connected_once && config.reconnect,
         )
         .await
         {
@@ -1363,7 +1440,6 @@ async fn run(
                     &mut command_rx,
                     &pending,
                     clip_rx,
-                    gfx_rx,
                     &local_clip,
                     &event_cb,
                 )
@@ -1390,9 +1466,7 @@ async fn run(
                 // `{error:#}` keeps the underlying io/TLS/auth cause.
                 let reason = format!("{error:#}");
                 if !connected_once && retryable {
-                    // Only TCP reachability failures are retried. Authentication,
-                    // certificate and protocol failures must never be repeated,
-                    // because repeated bad credentials can lock a domain account.
+                    // Transport and incomplete handshakes can recover while Windows starts.
                     failures += 1;
                     if failures >= max_initial_failures {
                         Outcome::Fail {
@@ -1576,7 +1650,6 @@ async fn run_session(
     command_rx: &mut Receiver<SessionCommand>,
     pending: &PendingCommands,
     mut clip_rx: Receiver<ClipSignal>,
-    mut gfx_rx: tokio::sync::mpsc::UnboundedReceiver<GfxEvent>,
     local_clip: &LocalClipState,
     event_cb: &EventCb,
 ) -> SessionEnd {
@@ -1618,9 +1691,8 @@ async fn run_session(
     }
     event_cb(SessionEvent::Connected { width, height });
     // With clipboard disabled the sender is dropped at connect; stop polling the
-    // closed channel or the select loop would spin at 100% CPU. Same for gfx.
+    // closed channel or the select loop would spin at 100% CPU.
     let mut clip_open = true;
-    let mut gfx_open = true;
     let mut remote_clip = RemoteClipboard::default();
     let mut clipboard_timeout_tick = tokio::time::interval_at(
         tokio::time::Instant::now() + CLIPBOARD_TIMEOUT_TICK,
@@ -1743,19 +1815,6 @@ async fn run_session(
                 }
             }
 
-            ev = gfx_rx.recv(), if gfx_open => {
-                match ev {
-                    // The compositor already wrote the pixels; just repaint.
-                    Some(GfxEvent::Updated) => event_cb(SessionEvent::FrameUpdated {
-                        x: 0, y: 0, width: 0, height: 0,
-                    }),
-                    Some(GfxEvent::Resized { width, height }) => {
-                        event_cb(SessionEvent::Resized { width, height });
-                    }
-                    None => gfx_open = false,
-                }
-            }
-
             // Idle keep-alive. Disabled unless enabled and no key is held; the
             // sleep target moves with `last_input`, so any real input reschedules
             // it and the tap only fires after a full idle interval.
@@ -1775,7 +1834,7 @@ async fn run_session(
 
             pdu = reader.read_pdu() => {
                 match pdu {
-                    Ok((action, payload)) => match active_stage.process(&mut image, action, &payload) {
+                    Ok((action, payload)) => match active_stage.process(&mut image, action, &payload, reader.last_read_at()) {
                         Ok(outputs) => match drain_outputs(
                             outputs,
                             &mut reader,
@@ -1863,11 +1922,8 @@ async fn connect(
     session_trusted: &mut Option<String>,
     local_clip: LocalClipState,
     clip_tx: Sender<ClipSignal>,
-    gfx_tx: tokio::sync::mpsc::UnboundedSender<GfxEvent>,
     audio: Option<&crate::audio::AudioPlayer>,
-    framebuffer: &Arc<SharedFramebuffer>,
     event_cb: &EventCb,
-    retry_authentication_during_reconnect: bool,
 ) -> std::result::Result<(ConnectionResult, SessionFramed), ConnectFailure> {
     let tcp = connect_tcp(&config.host, config.port).await?;
     tcp.set_nodelay(true).ok();
@@ -1895,15 +1951,15 @@ async fn connect(
                 None
             }
         };
-        let handler = crate::gfx::GfxHandler::new(framebuffer.clone(), gfx_tx);
+        let handler = crate::gfx::GfxHandler;
         drdynvc = drdynvc.with_dynamic_channel(ironrdp_egfx::client::GraphicsPipelineClient::new(
             Box::new(handler),
             decoder,
         ));
     }
 
-    let mut connector = ClientConnector::new(build_config(config, audio.is_some()), client_addr)
-        .with_static_channel(drdynvc);
+    let mut connector =
+        build_connector(config, audio.is_some(), client_addr).with_static_channel(drdynvc);
 
     if let Some(player) = audio {
         connector.attach_static_channel(Rdpsnd::new(Box::new(player.handler())));
@@ -1933,13 +1989,13 @@ async fn connect(
     // 1. Pre-TLS X.224 negotiation.
     let should_upgrade = connect_begin(&mut framed, &mut connector)
         .await
-        .map_err(|error| connector_failure(error, retry_authentication_during_reconnect))?;
+        .map_err(connector_failure)?;
 
     // 2. TLS handshake. CA/hostname verification is intentionally replaced by
     // TOFU below, but the server must still prove possession of the certificate
     // private key by signing the TLS handshake.
     let (initial_stream, leftover) = framed.into_inner();
-    let (mut tls_stream, server_public_key) = crate::tls::upgrade(initial_stream, &config.host)
+    let (tls_stream, server_public_key) = crate::tls::upgrade(initial_stream, &config.host)
         .await
         .context("TLS handshake")
         .map_err(ConnectFailure::fatal)?;
@@ -1952,19 +2008,18 @@ async fn connect(
 
     // 4. Finalize (MCS, licensing, capabilities, CredSSP/NLA).
     let upgraded = mark_as_upgraded(should_upgrade, &mut connector);
-    if connector.should_perform_rdsaad() {
+    let mut framed = TokioFramed::new_with_leftover(tls_stream, leftover);
+    if connector.should_perform_entra_auth() {
         let client = rdsaad_client
             .as_mut()
             .context("RDS AAD authentication state is missing")
             .map_err(ConnectFailure::fatal)?;
         client
-            .authenticate(&mut tls_stream, &config.username, event_cb)
+            .authenticate(&mut framed, &mut connector, &config.username, event_cb)
             .await
             .context("Microsoft Entra RDP authentication")
             .map_err(ConnectFailure::fatal)?;
-        connector.mark_rdsaad_as_done();
     }
-    let mut framed = TokioFramed::new_with_leftover(tls_stream, leftover);
     let mut network_client = NoNetworkClient;
     let result = connect_finalize(
         upgraded,
@@ -1976,9 +2031,14 @@ async fn connect(
         None,
     )
     .await
-    .map_err(|error| connector_failure(error, retry_authentication_during_reconnect))?;
+    .map_err(connector_failure)?;
 
-    Ok((result, framed))
+    match result {
+        ironrdp_connector::ConnectionOutcome::Connected(result) => Ok((result, framed)),
+        ironrdp_connector::ConnectionOutcome::Redirected(_) => Err(ConnectFailure::fatal(anyhow!(
+            "The server requested a connection to another host. Connect to that host directly."
+        ))),
+    }
 }
 
 enum TcpHostFailure {
@@ -2300,7 +2360,12 @@ async fn handle_clip_signal(
             send_cliprdr(active_stage, out_tx, |c| c.submit_file_contents(response)).await?;
             Ok(false)
         }
+        ClipSignal::InvalidateRemoteFiles => {
+            remote_clip.invalidate();
+            Ok(false)
+        }
         ClipSignal::InitiatePaste(format) => {
+            remote_clip.invalidate();
             send_cliprdr(active_stage, out_tx, |c| c.initiate_paste(format)).await?;
             Ok(false)
         }
@@ -2328,39 +2393,27 @@ async fn handle_clip_signal(
             event_cb(SessionEvent::ClipboardText(text));
             Ok(false)
         }
-        ClipSignal::RemoteFileList { files, data_id } => {
-            // A newer Windows clipboard offer supersedes any partial cache
-            // transfer. Dropping unfinished jobs removes their private cache.
-            remote_clip.jobs.clear();
-            remote_clip.outstanding = None;
-            remote_clip.files = files;
-            remote_clip.data_id = data_id;
-            let names: Vec<String> = remote_clip
-                .files
-                .iter()
-                .filter(|f| !f.wire_name.contains('\\'))
-                .map(|f| f.wire_name.clone())
-                .collect();
-            if names.is_empty() {
-                return Ok(false);
-            }
-
-            event_cb(SessionEvent::ClipboardFilesPreparing { count: names.len() });
-            let planned = create_remote_clipboard_cache_dir()
-                .and_then(|cache_dir| plan_remote_clipboard_cache(remote_clip, &names, cache_dir));
-            match planned {
-                Ok(job) => {
-                    remote_clip.jobs.push_back(job);
+        ClipSignal::RemoteFileList { files, data_id, tx } => {
+            event_cb(SessionEvent::ClipboardFilesOffered(
+                remote_clip.offer(files, data_id, tx),
+            ));
+            Ok(false)
+        }
+        ClipSignal::FetchFile {
+            generation,
+            name,
+            reply,
+        } => {
+            match remote_clip.request(generation, name, reply) {
+                Ok(false) => return Ok(false),
+                Ok(true) => {
                     if let Err(reason) =
-                        advance_remote_fetch(remote_clip, active_stage, out_tx, event_cb).await
+                        advance_remote_fetch(remote_clip, active_stage, out_tx).await
                     {
                         fail_front_job(remote_clip, reason, event_cb);
                     }
                 }
-                Err(reason) => {
-                    tracing::warn!("clipboard: could not prepare remote files: {reason}");
-                    event_cb(SessionEvent::ClipboardFilesFailed(reason));
-                }
+                Err(reason) => event_cb(SessionEvent::ClipboardFilesFailed(reason)),
             }
             Ok(false)
         }
@@ -2441,6 +2494,20 @@ async fn drain_outputs(
     framebuffer: &SharedFramebuffer,
     event_cb: &EventCb,
 ) -> Result<bool> {
+    let (width, height) = (image.width(), image.height());
+    if framebuffer.dimensions() != (width, height) {
+        if width == 0
+            || height == 0
+            || width > crate::profile::MAX_REMOTE_DIMENSION
+            || height > crate::profile::MAX_REMOTE_DIMENSION
+        {
+            return Err(anyhow!(
+                "server requested an unreasonable desktop size {width}x{height}"
+            ));
+        }
+        framebuffer.resize(width, height);
+        event_cb(SessionEvent::Resized { width, height });
+    }
     for output in outputs {
         match output {
             ActiveStageOutput::ResponseFrame(frame) => emit(out_tx, frame).await?,
@@ -2486,7 +2553,22 @@ async fn drain_outputs(
             // mouse; the multitransport/autodetect paths are unused.
             ActiveStageOutput::PointerPosition { .. }
             | ActiveStageOutput::MultitransportRequest(_)
-            | ActiveStageOutput::AutoDetect(_) => {}
+            | ActiveStageOutput::AutoDetect(_)
+            | ActiveStageOutput::MonitorLayout(_)
+            | ActiveStageOutput::WindowingOrders(_)
+            | ActiveStageOutput::WindowSurfaceUpdates(_)
+            | ActiveStageOutput::SaveSessionInfo { .. }
+            | ActiveStageOutput::SessionId(_)
+            | ActiveStageOutput::AutoReconnectCookie(_) => {}
+            ActiveStageOutput::LogonErrors(_) => {
+                tracing::warn!("the server reported a logon warning");
+            }
+            ActiveStageOutput::AutoReconnectFailed => {
+                return Err(anyhow!("The server could not resume the previous session."));
+            }
+            ActiveStageOutput::ServerRedirection(_) => {
+                return Err(anyhow!("The server requested a connection to another host. Connect to that host directly."));
+            }
         }
     }
     Ok(false)
@@ -2503,15 +2585,37 @@ async fn reactivate(
     framebuffer: &SharedFramebuffer,
     event_cb: &EventCb,
 ) -> Result<()> {
-    let (size, share_id, enable_server_pointer) = loop {
+    let (
+        size,
+        share_id,
+        enable_server_pointer,
+        pointer_software_rendering,
+        static_channel_chunk_size,
+    ) = loop {
         if let ConnectionActivationState::Finalized {
             desktop_size,
             share_id,
             enable_server_pointer,
+            pointer_software_rendering,
+            static_channel_chunk_size,
             ..
         } = cas.connection_activation_state()
         {
-            break (desktop_size, share_id, enable_server_pointer);
+            break (
+                desktop_size,
+                share_id,
+                enable_server_pointer,
+                pointer_software_rendering,
+                static_channel_chunk_size,
+            );
+        }
+        if matches!(
+            cas.connection_activation_state(),
+            ConnectionActivationState::Redirected { .. }
+        ) {
+            return Err(anyhow!(
+                "The server requested a connection to another host. Connect to that host directly."
+            ));
         }
         // Read + step on the read half; queue any response for the writer task.
         let mut buf = WriteBuf::new();
@@ -2536,8 +2640,18 @@ async fn reactivate(
     }
     *image = DecodedImage::new(PIXEL_FORMAT, size.width, size.height);
     framebuffer.resize(size.width, size.height);
-    active_stage.set_share_id(share_id);
-    active_stage.set_enable_server_pointer(enable_server_pointer);
+    if !active_stage.reactivate(
+        cas.io_channel_id(),
+        cas.user_channel_id(),
+        share_id,
+        enable_server_pointer,
+        pointer_software_rendering,
+        static_channel_chunk_size,
+    ) {
+        return Err(anyhow!(
+            "The server returned an invalid channel configuration."
+        ));
+    }
     synchronize_initial_keyboard_state(active_stage, image, out_tx).await?;
     event_cb(SessionEvent::Resized {
         width: size.width,
@@ -2723,6 +2837,19 @@ fn translate_input(
     (ops, last_mouse)
 }
 
+fn build_connector(
+    config: &SessionConfig,
+    audio_active: bool,
+    client_addr: std::net::SocketAddr,
+) -> ClientConnector {
+    let connector = ClientConnector::new(build_config(config, audio_active), client_addr);
+    if config.authentication == AuthenticationMode::EntraWeb {
+        connector.with_entra_auth()
+    } else {
+        connector
+    }
+}
+
 fn build_config(config: &SessionConfig, audio_active: bool) -> Config {
     let bitmap = Some(BitmapConfig {
         lossy_compression: true,
@@ -2735,9 +2862,15 @@ fn build_config(config: &SessionConfig, audio_active: bool) -> Config {
             height: config.height,
         },
         desktop_scale_factor: config.scale.unwrap_or(100),
+        monitor_layout: None,
+        desktop_physical_size: None,
+        desktop_orientation: None,
+        device_scale_factor: None,
+        monitor_extended_layout: None,
+        relative_mouse_input: false,
         enable_tls: false,
+        enable_standard_rdp_security: false,
         enable_credssp: config.authentication == AuthenticationMode::Password,
-        enable_rdsaad: config.authentication == AuthenticationMode::EntraWeb,
         credentials: Credentials::UsernamePassword {
             username: config.username.clone(),
             password: config.password.clone(),
@@ -2745,16 +2878,19 @@ fn build_config(config: &SessionConfig, audio_active: bool) -> Config {
         domain: config.domain.clone(),
         client_build: 0,
         client_name: "RDP123".to_string(),
-        keyboard_type: KeyboardType::IbmEnhanced,
+        keyboard_type: KeyboardType::IBM_ENHANCED,
         keyboard_subtype: 0,
         keyboard_functional_keys_count: 12,
         keyboard_layout: 0,
+        connection_type: ironrdp_pdu::gcc::ConnectionType::Lan,
         ime_file_name: String::new(),
         bitmap,
         dig_product_id: String::new(),
         client_dir: String::new(),
         alternate_shell: String::new(),
         work_dir: String::new(),
+        remote_application_mode: false,
+        rail_support_level: ironrdp_pdu::rdp::capability_sets::RailSupportLevel::empty(),
         platform: MajorPlatformType::MACINTOSH,
         hardware_id: None,
         request_data: None,
@@ -2768,8 +2904,8 @@ fn build_config(config: &SessionConfig, audio_active: bool) -> Config {
             AudioMode::RemoteComputer => true,
             AudioMode::Never => false,
         },
-        // From our vendored connector patch: advertises the Graphics Pipeline.
-        support_gfx: config.graphics == GraphicsMode::Egfx,
+        enable_audio_capture: false,
+        support_dyn_vc_gfx_protocol: config.graphics == GraphicsMode::Egfx,
         // Ask the host to render text with ClearType/anti-aliasing; without this
         // fonts come across rough and un-smoothed.
         performance_flags: PerformanceFlags::ENABLE_FONT_SMOOTHING,
@@ -2897,19 +3033,11 @@ fn user_facing_disconnect_reason(reason: &str) -> String {
     cleaned
 }
 
-/// An incomplete RDP or CredSSP response commonly means that a host accepted
-/// TCP while Windows was still starting or shutting down. Explicit credential
-/// rejection is fatal on the initial connection. After this session has
-/// already authenticated successfully, it is safe to treat a short-lived
-/// CredSSP rejection during reboot as part of the bounded reconnect loop.
-fn connector_failure(
-    e: ConnectorError,
-    retry_authentication_during_reconnect: bool,
-) -> ConnectFailure {
+fn connector_failure(e: ConnectorError) -> ConnectFailure {
     let retryable = match e.kind() {
         ConnectorErrorKind::Decode(_) => true,
         ConnectorErrorKind::Credssp(_) | ConnectorErrorKind::AccessDenied => {
-            retry_authentication_during_reconnect || !connector_credentials_rejected(e.kind())
+            !connector_credentials_rejected(e.kind())
         }
         _ => false,
     };
@@ -3065,7 +3193,7 @@ fn local_file_contents_response(
     FileContentsResponse::new_data_response(request.stream_id, data)
 }
 
-impl ironrdp::core::AsAny for MacClipboardBackend {
+impl ironrdp_core::AsAny for MacClipboardBackend {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -3163,6 +3291,8 @@ impl CliprdrBackend for MacClipboardBackend {
             .any(|f| f.id == ClipboardFormatId::CF_UNICODETEXT)
         {
             self.queue_signal(ClipSignal::InitiatePaste(ClipboardFormatId::CF_UNICODETEXT));
+        } else {
+            self.queue_signal(ClipSignal::InvalidateRemoteFiles);
         }
     }
 
@@ -3193,6 +3323,10 @@ impl CliprdrBackend for MacClipboardBackend {
         if response.is_error() || !self.mode.allow_remote_to_local() {
             return;
         }
+        // UTF-16 needs at most two wire bytes per UTF-8 byte, plus the terminator.
+        if response.data().len() > MAX_CLIPBOARD_TEXT_BYTES * 2 + 2 {
+            return;
+        }
         if let Ok(text) = response.to_unicode_string() {
             if text.len() > MAX_CLIPBOARD_TEXT_BYTES {
                 tracing::warn!(
@@ -3210,15 +3344,22 @@ impl CliprdrBackend for MacClipboardBackend {
     }
 
     fn on_file_contents_response(&mut self, response: FileContentsResponse<'_>) {
-        let data = if response.is_error() {
+        let data = if response.is_error() || response.data().len() > FETCH_CHUNK_BYTES as usize {
             None
         } else {
             Some(response.data().to_vec())
         };
-        self.queue_signal(ClipSignal::RemoteFileContents {
+        let signal = ClipSignal::RemoteFileContents {
             stream_id: response.stream_id(),
             data,
-        });
+        };
+        if let Err(tokio::sync::mpsc::error::TrySendError::Full(signal)) = self.tx.try_send(signal)
+        {
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(signal).await;
+            });
+        }
     }
 
     fn on_remote_file_list(&mut self, files: &[FileDescriptor], clip_data_id: Option<u32>) {
@@ -3239,6 +3380,7 @@ impl CliprdrBackend for MacClipboardBackend {
             })
             .collect();
         self.queue_signal(ClipSignal::RemoteFileList {
+            tx: self.tx.clone(),
             files: entries,
             data_id: clip_data_id,
         });
@@ -3259,8 +3401,8 @@ fn normalize_clipboard_to_crlf(text: &str) -> String {
 mod tests {
     use super::{
         absorb_offline_command, apply_remote_file_contents, build_config, connector_failure,
-        create_remote_clipboard_cache_dir, initial_keyboard_sync_event, mdns_fallback_hostname,
-        next_remote_fetch_action, normalize_clipboard_to_crlf, plan_remote_clipboard_cache,
+        initial_keyboard_sync_event, mdns_fallback_hostname, next_remote_fetch_action,
+        normalize_clipboard_to_crlf, plan_remote_clipboard_cache,
         remote_clipboard_paste_input_events, remote_top_level_destination, resolve_pending_command,
         to_file_descriptors, update_keys_down, user_facing_disconnect_reason,
         validate_remote_file_range, ClipSignal, InputEvent, LocalClip, LocalClipFile,
@@ -3269,19 +3411,66 @@ mod tests {
         SessionConfig, SessionHandle, CLIPBOARD_RETRY_DELAYS,
     };
     use crate::profile::{AudioMode, AuthenticationMode, ClipboardMode, GraphicsMode};
-    use ironrdp::cliprdr::backend::CliprdrBackend;
-    use ironrdp::cliprdr::pdu::{
+    use ironrdp_cliprdr::backend::CliprdrBackend;
+    use ironrdp_cliprdr::pdu::{
         ClipboardFormatId, FileContentsFlags, FileContentsRequest, FormatDataRequest,
     };
-    use ironrdp::cliprdr::{Cliprdr, CliprdrClient, CliprdrServer, Role};
-    use ironrdp::connector::sspi::{Error as SspiError, ErrorKind as SspiErrorKind};
-    use ironrdp::connector::{ConnectorError, ConnectorErrorExt};
-    use ironrdp::core::{not_enough_bytes_err, DecodeError};
-    use ironrdp::input::{Database, Operation, Scancode};
-    use ironrdp::pdu::input::fast_path::{FastPathInputEvent, KeyboardFlags, SynchronizeFlags};
-    use ironrdp::pdu::rdp::client_info::CompressionType;
-    use ironrdp::svc::{SvcMessage, SvcProcessor};
+    use ironrdp_cliprdr::{CliprdrClient, CliprdrServer};
+    use ironrdp_connector::sspi::{Error as SspiError, ErrorKind as SspiErrorKind};
+    use ironrdp_connector::{ConnectorError, ConnectorErrorExt};
+    use ironrdp_core::{not_enough_bytes_err, DecodeError};
+    use ironrdp_input::{Database, Operation, Scancode};
+    use ironrdp_pdu::input::fast_path::{FastPathInputEvent, KeyboardFlags, SynchronizeFlags};
+    use ironrdp_pdu::rdp::client_info::CompressionType;
+    use ironrdp_svc::{StaticVirtualChannel, SvcMessage};
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn svc_rejects_oversized_first_fragment_without_waiting_for_the_body() {
+        let mut channel = ironrdp_svc::StaticVirtualChannel::new(ironrdp_dvc::DrdynvcClient::new());
+        let header = |len: u32| [len.to_le_bytes(), 1u32.to_le_bytes()].concat();
+        assert!(channel.process(&header(64 * 1024 * 1024 + 1)).is_err());
+        assert!(channel.process(&header(16 * 1024 * 1024 + 16)).is_ok());
+    }
+
+    #[test]
+    fn compressed_fragments_cannot_bypass_the_receive_limit() {
+        let mut channel = StaticVirtualChannel::new(ironrdp_dvc::DrdynvcClient::new());
+        let mut packet = [1u32.to_le_bytes(), 0x0020_0001u32.to_le_bytes()].concat();
+        packet.resize(8 + 16_000, 0);
+        channel.process(&packet).unwrap();
+        packet[4..8].copy_from_slice(&0x0020_0000u32.to_le_bytes());
+        for _ in 1..(64 * 1024 * 1024 / 16_000) {
+            channel.process(&packet).unwrap();
+        }
+        assert!(channel.process(&packet).is_err());
+        // A new valid FIRST fragment is accepted after the rejected sequence.
+        assert!(channel.process(&[4, 0, 0, 0, 1, 0, 0, 0, 0x50]).is_ok());
+    }
+
+    #[test]
+    fn replacing_a_file_offer_cancels_waiters_and_removes_partial_downloads() {
+        let mut clipboard = RemoteClipboard::default();
+        let entry = RemoteFileEntry {
+            wire_name: "folder".into(),
+            size: None,
+            is_dir: true,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(2);
+        let offer = clipboard.offer(vec![entry], None, tx);
+        let (reply, result) = std::sync::mpsc::channel();
+        assert!(clipboard
+            .request(offer.generation, "folder".into(), reply)
+            .unwrap());
+        let dir = clipboard.jobs[0].cache_dir.clone();
+        clipboard.invalidate();
+        assert!(!dir.exists());
+        assert!(result.recv().is_err());
+        let (reply, _) = std::sync::mpsc::channel();
+        assert!(!clipboard
+            .request(offer.generation, "folder".into(), reply)
+            .unwrap());
+    }
 
     fn test_session_config(graphics: GraphicsMode, compression: bool) -> SessionConfig {
         SessionConfig {
@@ -3313,14 +3502,13 @@ mod tests {
         InputEvent::Key { keycode: 0, down }
     }
 
-    fn deliver_cliprdr<R: Role>(
+    fn deliver_cliprdr(
         messages: Vec<SvcMessage>,
-        receiver: &mut Cliprdr<R>,
+        receiver: &mut StaticVirtualChannel,
     ) -> Vec<SvcMessage> {
         let mut replies = Vec::new();
-        for message in messages {
-            let payload = message.encode_unframed_pdu().unwrap();
-            replies.extend(receiver.process(&payload).unwrap());
+        for chunk in StaticVirtualChannel::chunkify(messages).unwrap() {
+            replies.extend(receiver.process(chunk.filled()).unwrap());
         }
         replies
     }
@@ -3487,11 +3675,15 @@ mod tests {
             "rdp123-remote-source-test-{}",
             uuid::Uuid::new_v4()
         ));
-        std::fs::write(&source, b"from windows").unwrap();
+        // Larger than the SVC receive limit, but streamed as independent file ranges.
+        let data: Vec<u8> = (0..65 * 1024 * 1024 + 17)
+            .map(|n| (n % 251) as u8)
+            .collect();
+        std::fs::write(&source, &data).unwrap();
         let source_file = LocalClipFile {
             path: source.clone(),
             wire_name: "report.txt".to_string(),
-            size: 12,
+            size: data.len() as u64,
             is_dir: false,
         };
 
@@ -3501,19 +3693,21 @@ mod tests {
         let mut server_state = LocalClipboardState::default();
         server_state.replace(LocalClip::Files(vec![source_file.clone()]));
         let server_state: LocalClipState = std::sync::Arc::new(std::sync::Mutex::new(server_state));
-        let mut client = CliprdrClient::new(Box::new(MacClipboardBackend {
+        let client = CliprdrClient::new(Box::new(MacClipboardBackend {
             tx: client_tx,
             local_clip: client_state.clone(),
             tmp: "/tmp".to_string(),
             mode: ClipboardMode::Bidirectional,
         }));
-        let mut server = CliprdrServer::new(Box::new(MacClipboardBackend {
+        let server = CliprdrServer::new(Box::new(MacClipboardBackend {
             tx: server_tx,
             local_clip: server_state,
             tmp: "/tmp".to_string(),
             mode: ClipboardMode::Bidirectional,
         }));
 
+        let mut client = StaticVirtualChannel::new(client);
+        let mut server = StaticVirtualChannel::new(server);
         // Complete the real CLIPRDR client/server initialization handshake.
         let replies = deliver_cliprdr(server.start().unwrap(), &mut client);
         assert!(replies.is_empty());
@@ -3522,7 +3716,12 @@ mod tests {
             Some(ClipSignal::InitializeClipboard)
         ));
         let initial_formats = client_state.lock().unwrap().begin_initial_offer().unwrap();
-        let initial: Vec<_> = client.initiate_copy(&initial_formats).unwrap().into();
+        let initial: Vec<_> = client
+            .channel_processor_downcast_mut::<CliprdrClient>()
+            .unwrap()
+            .initiate_copy(&initial_formats)
+            .unwrap()
+            .into();
         let replies = deliver_cliprdr(initial, &mut server);
         let trailing = deliver_cliprdr(replies, &mut client);
         assert!(trailing.is_empty());
@@ -3534,6 +3733,8 @@ mod tests {
         // The simulated Windows side advertises a copied file. RDP123 requests
         // its file list using IronRDP's normal delayed-rendering exchange.
         let remote_offer: Vec<_> = server
+            .channel_processor_downcast_mut::<CliprdrServer>()
+            .unwrap()
             .initiate_file_copy(to_file_descriptors(&[source_file]))
             .unwrap()
             .into();
@@ -3544,27 +3745,37 @@ mod tests {
             Some(ClipSignal::InitiatePaste(format)) => format,
             _ => panic!("expected remote file-list request"),
         };
-        let list_request: Vec<_> = client.initiate_paste(format).unwrap().into();
+        let list_request: Vec<_> = client
+            .channel_processor_downcast_mut::<CliprdrClient>()
+            .unwrap()
+            .initiate_paste(format)
+            .unwrap()
+            .into();
         let list_response = deliver_cliprdr(list_request, &mut server);
         let trailing = deliver_cliprdr(list_response, &mut client);
         assert!(trailing.is_empty());
-        let (files, data_id) = match client_rx.recv().await {
-            Some(ClipSignal::RemoteFileList { files, data_id }) => (files, data_id),
+        let mut remote = RemoteClipboard::default();
+        let offer = match client_rx.recv().await {
+            Some(ClipSignal::RemoteFileList { files, data_id, tx }) => {
+                remote.offer(files, data_id, tx)
+            }
             _ => panic!("expected remote file list"),
         };
-
-        // Exercise the exact RDP123 download state machine until it publishes
-        // a fully materialized top-level file.
-        let names = vec!["report.txt".to_string()];
-        let mut remote = RemoteClipboard {
-            files,
-            data_id,
-            ..RemoteClipboard::default()
+        assert_eq!(offer.len(), 1);
+        assert!(matches!(
+            next_remote_fetch_action(&mut remote).unwrap(),
+            RemoteFetchAction::Idle
+        ));
+        let paste = tokio::task::spawn_blocking(move || offer.fetch(0));
+        let Some(ClipSignal::FetchFile {
+            generation,
+            name,
+            reply,
+        }) = client_rx.recv().await
+        else {
+            panic!("expected paste request")
         };
-        let cache_dir = create_remote_clipboard_cache_dir().unwrap();
-        remote
-            .jobs
-            .push_back(plan_remote_clipboard_cache(&remote, &names, cache_dir.clone()).unwrap());
+        assert!(remote.request(generation, name, reply).unwrap());
 
         let ready_paths = loop {
             match next_remote_fetch_action(&mut remote).unwrap() {
@@ -3572,16 +3783,24 @@ mod tests {
                 RemoteFetchAction::Ready(paths) => break paths,
                 RemoteFetchAction::Request(request) => {
                     assert_ne!(request.stream_id, 0);
-                    let request_messages: Vec<_> =
-                        client.request_file_contents(request).unwrap().into();
+                    let request_messages: Vec<_> = client
+                        .channel_processor_downcast_mut::<CliprdrClient>()
+                        .unwrap()
+                        .request_file_contents(request)
+                        .unwrap()
+                        .into();
                     let immediate = deliver_cliprdr(request_messages, &mut server);
                     assert!(immediate.is_empty());
                     let response = match server_rx.recv().await {
                         Some(ClipSignal::SubmitFileContents(response)) => response,
                         _ => panic!("expected Windows file response"),
                     };
-                    let response_messages: Vec<_> =
-                        server.submit_file_contents(response).unwrap().into();
+                    let response_messages: Vec<_> = server
+                        .channel_processor_downcast_mut::<CliprdrServer>()
+                        .unwrap()
+                        .submit_file_contents(response)
+                        .unwrap()
+                        .into();
                     let trailing = deliver_cliprdr(response_messages, &mut client);
                     assert!(trailing.is_empty());
                     let (stream_id, data) = match client_rx.recv().await {
@@ -3595,9 +3814,11 @@ mod tests {
             }
         };
 
-        assert_eq!(ready_paths, [cache_dir.join("report.txt")]);
-        assert_eq!(std::fs::read(&ready_paths[0]).unwrap(), b"from windows");
-        let _ = std::fs::remove_dir_all(cache_dir);
+        let path = paste.await.unwrap().unwrap();
+        assert_eq!(ready_paths.as_slice(), std::slice::from_ref(&path));
+        assert_eq!(path.file_name().unwrap(), "report.txt");
+        assert!(std::fs::read(&path).unwrap() == data);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
         let _ = std::fs::remove_file(source);
     }
 
@@ -4007,9 +4228,8 @@ mod tests {
 
     #[test]
     fn connector_decode_errors_hide_internal_source_locations() {
-        let decode: DecodeError = not_enough_bytes_err("test packet", 0, 4);
-        let (error, retryable) =
-            connector_failure(ConnectorError::decode(decode), false).into_parts();
+        let decode: DecodeError = not_enough_bytes_err("test packet", 0, 4, None);
+        let (error, retryable) = connector_failure(ConnectorError::decode(decode)).into_parts();
         let message = error.to_string();
 
         assert!(retryable);
@@ -4026,12 +4246,12 @@ mod tests {
     fn transient_credssp_failures_retry_without_exposing_source_paths() {
         let transient = ConnectorError::new(
             "CredSSP",
-            ironrdp::connector::ConnectorErrorKind::Credssp(SspiError::new(
+            ironrdp_connector::ConnectorErrorKind::Credssp(SspiError::new(
                 SspiErrorKind::InternalError,
                 "server is still starting",
             )),
         );
-        let (error, retryable) = connector_failure(transient, false).into_parts();
+        let (error, retryable) = connector_failure(transient).into_parts();
         let message = error.to_string();
 
         assert!(retryable);
@@ -4044,12 +4264,12 @@ mod tests {
 
         let rejected = ConnectorError::new(
             "CredSSP",
-            ironrdp::connector::ConnectorErrorKind::Credssp(SspiError::new(
+            ironrdp_connector::ConnectorErrorKind::Credssp(SspiError::new(
                 SspiErrorKind::LogonDenied,
                 "bad credentials",
             )),
         );
-        let (error, retryable) = connector_failure(rejected, false).into_parts();
+        let (error, retryable) = connector_failure(rejected).into_parts();
         assert!(!retryable);
         assert_eq!(
             error.to_string(),
@@ -4058,10 +4278,13 @@ mod tests {
 
         let reconnect_rejection = ConnectorError::new(
             "CredSSP",
-            ironrdp::connector::ConnectorErrorKind::AccessDenied,
+            ironrdp_connector::ConnectorErrorKind::AccessDenied,
         );
-        let (_, retryable) = connector_failure(reconnect_rejection, true).into_parts();
-        assert!(retryable);
+        let (_, retryable) = connector_failure(reconnect_rejection).into_parts();
+        assert!(
+            !retryable,
+            "do not retry rejected credentials after a successful login"
+        );
     }
 
     #[test]
@@ -4076,14 +4299,14 @@ mod tests {
         );
         assert_eq!(
             user_facing_disconnect_reason(
-                "[connector error @ /Users/patrick/.cargo/registry/src/lib.rs:413] decode error"
+                "[connector error @ /Users/builder/.cargo/registry/src/lib.rs:413] decode error"
             ),
             "The remote computer closed the connection or sent an incomplete RDP response. \
              It may be offline, restarting, or not ready to accept RDP connections yet."
         );
         assert_eq!(
             user_facing_disconnect_reason(
-                "[CredSSP @ /Users/patrick/.cargo/registry/src/lib.rs:413] CredSSP, caused by: \
+                "[CredSSP @ /Users/builder/.cargo/registry/src/lib.rs:413] CredSSP, caused by: \
                  InternalError: server is restarting"
             ),
             "The remote computer is not ready to complete authentication yet."
@@ -4105,8 +4328,8 @@ mod tests {
     #[test]
     fn single_label_hosts_get_an_mdns_fallback() {
         assert_eq!(
-            mdns_fallback_hostname("BIHA-5CG6094NC9").as_deref(),
-            Some("BIHA-5CG6094NC9.local")
+            mdns_fallback_hostname("WIN-EXAMPLE").as_deref(),
+            Some("WIN-EXAMPLE.local")
         );
         assert_eq!(
             mdns_fallback_hostname(" workstation ").as_deref(),
@@ -4117,7 +4340,7 @@ mod tests {
     #[test]
     fn addresses_and_qualified_hosts_do_not_get_an_mdns_fallback() {
         assert_eq!(mdns_fallback_hostname("server.example.test"), None);
-        assert_eq!(mdns_fallback_hostname("192.168.1.124"), None);
+        assert_eq!(mdns_fallback_hostname("192.0.2.10"), None);
         assert_eq!(mdns_fallback_hostname("2001:db8::1"), None);
         assert_eq!(mdns_fallback_hostname(""), None);
     }
@@ -4192,21 +4415,34 @@ mod tests {
 
     #[test]
     fn authentication_mode_selects_exactly_one_pre_session_protocol() {
-        let password = build_config(&test_session_config(GraphicsMode::Classic, true), false);
-        assert!(password.enable_credssp);
-        assert!(!password.enable_rdsaad);
-
-        let mut entra = test_session_config(GraphicsMode::Classic, true);
-        entra.authentication = AuthenticationMode::EntraWeb;
-        let entra = build_config(&entra, false);
-        assert!(!entra.enable_credssp);
-        assert!(entra.enable_rdsaad);
+        use super::build_connector;
+        use ironrdp_connector::Sequence as _;
+        use ironrdp_core::WriteBuf;
+        use ironrdp_pdu::{
+            nego::{ConnectionRequest, SecurityProtocol},
+            x224::X224,
+        };
+        for (mode, expected) in [
+            (
+                AuthenticationMode::Password,
+                SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX,
+            ),
+            (AuthenticationMode::EntraWeb, SecurityProtocol::RDSAAD),
+        ] {
+            let mut config = test_session_config(GraphicsMode::Classic, true);
+            config.authentication = mode;
+            let mut connector = build_connector(&config, false, "127.0.0.1:12345".parse().unwrap());
+            let mut buffer = WriteBuf::new();
+            connector.step_no_input(&mut buffer).unwrap();
+            let request: X224<ConnectionRequest> = ironrdp_core::decode(buffer.filled()).unwrap();
+            assert_eq!(request.0.protocol, expected);
+        }
     }
 
     #[test]
     fn file_descriptors_split_wire_names_and_mark_directories() {
         use super::{to_file_descriptors, LocalClipFile};
-        use ironrdp::cliprdr::pdu::ClipboardFileAttributes;
+        use ironrdp_cliprdr::pdu::ClipboardFileAttributes;
 
         let files = vec![
             LocalClipFile {

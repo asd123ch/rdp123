@@ -7,34 +7,32 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.13"
+version = "0.6.19"
 edition = "2021"
-rust-version = "1.89"
+rust-version = "1.94"
 license = "AGPL-3.0-only"
 
 [workspace.dependencies]
 # --- RDP protocol (IronRDP) ---
-ironrdp = { version = "0.17", features = [
-    "connector",
-    "session",
-    "graphics",
-    "input",
-    "svc",
-    "dvc",
-    "cliprdr",
-    "displaycontrol",
-    "rdpsnd",
-    "rdpdr",
-    "pdu",
-    "core",
-] }
-ironrdp-tokio = "0.10"
+ironrdp-connector = "0.12"
+ironrdp-session = "0.13"
+ironrdp-graphics = "0.11"
+ironrdp-input = "0.9"
+ironrdp-svc = "0.10"
+ironrdp-dvc = "0.10"
+ironrdp-cliprdr = "0.9"
+ironrdp-displaycontrol = "0.10"
+ironrdp-rdpsnd = "0.11"
+ironrdp-rdpdr = "0.9"
+ironrdp-pdu = { version = "0.11", features = ["std"] }
+ironrdp-core = { version = "0.3", features = ["std"] }
+ironrdp-tokio = "0.12"
 # Graphics Pipeline (EGFX): AVC420 via bundled OpenH264 (compiled from source,
 # so end users need no binary downloads).
-ironrdp-egfx = { version = "0.3", features = ["openh264-bundled"] }
+ironrdp-egfx = { version = "0.5", features = ["openh264-bundled"] }
 
 # --- async / networking ---
-tokio = { version = "1.52", features = [
+tokio = { version = "1.54", features = [
     "rt-multi-thread",
     "net",
     "sync",
@@ -46,7 +44,7 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", 
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "logging", "tls12"] }
 x509-cert = { version = "0.3", default-features = false, features = ["std"] }
 reqwest = { version = "0.13", default-features = false, features = ["form", "json", "rustls-no-provider"] }
-aws-lc-rs = "1.17"
+aws-lc-rs = "1.19"
 
 # --- macOS platform ---
 # objc2 framework crates activate ~all classes via default features; the
@@ -103,14 +101,7 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
-# ironrdp-connector with one addition: a `support_gfx` Config flag that
-# advertises RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL (required for the server to
-# offer the EGFX graphics pipeline; upstream has no way to set it yet).
+# Keep unused smart-card support optional in the connector.
 [patch.crates-io]
 ironrdp-connector = { path = "vendor/ironrdp-connector" }
-# ironrdp-graphics: fixes RemoteFX Progressive context lifetime, signed
-# fixed-point color conversion, implicit full-quality upgrades, region DWT
-# selection, and continuous SRL/RAW stream decoding. These are required for
-# Windows RDP 8 frames to refine cleanly instead of failing after the first
-# frame or rendering black/white block artifacts.
-ironrdp-graphics = { path = "vendor/ironrdp-graphics" }
+ironrdp-svc = { path = "vendor/ironrdp-svc" }

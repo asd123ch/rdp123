@@ -11,7 +11,18 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
-ironrdp.workspace = true
+ironrdp-connector.workspace = true
+ironrdp-session.workspace = true
+ironrdp-graphics.workspace = true
+ironrdp-input.workspace = true
+ironrdp-svc.workspace = true
+ironrdp-dvc.workspace = true
+ironrdp-cliprdr.workspace = true
+ironrdp-displaycontrol.workspace = true
+ironrdp-rdpsnd.workspace = true
+ironrdp-rdpdr.workspace = true
+ironrdp-pdu.workspace = true
+ironrdp-core.workspace = true
 ironrdp-tokio.workspace = true
 ironrdp-egfx.workspace = true
 

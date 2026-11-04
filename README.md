@@ -9,10 +9,10 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.6.13" src="https://img.shields.io/badge/version-0.6.13-2f81f7">
+  <img alt="Version 0.6.19" src="https://img.shields.io/badge/version-0.6.19-2f81f7">
   <a href="LICENSE"><img alt="GNU AGPL v3.0" src="https://img.shields.io/badge/license-AGPLv3-3da639"></a>
   <img alt="macOS 11 or newer" src="https://img.shields.io/badge/macOS-11%2B-black">
-  <img alt="Rust 1.89 or newer" src="https://img.shields.io/badge/Rust-1.89%2B-b7410e">
+  <img alt="Rust 1.94 or newer" src="https://img.shields.io/badge/Rust-1.94%2B-b7410e">
   <a href="#privacy"><img alt="Privacy: no telemetry" src="https://img.shields.io/badge/privacy-no_telemetry-6f42c1"></a>
 </p>
 
@@ -38,14 +38,14 @@ last one closes, the app quietly returns to the menu bar.
 **Native and small.** RDP123 is an AppKit application written in Rust with
 `objc2`: no Electron and no bundled browser. Microsoft Entra login uses the
 system WebKit framework only while authenticating. The installed app is about
-9 MB, with a near-zero idle footprint.
+10 MB, with a near-zero idle footprint.
 
 <p align="center">
-  <img src="assets/size-comparison.svg" alt="Installed size: RDP123 9 MB, Microsoft Windows App 228 MB, Remote Desktop Manager (Devolutions) 993 MB" width="640">
+  <img src="assets/size-comparison.svg" alt="Installed size: RDP123 10 MB, Microsoft Windows App 228 MB, Remote Desktop Manager (Devolutions) 993 MB" width="640">
 </p>
 
-Sizes above are installed sizes measured in mid-2026. RDP123 deliberately
-focuses on everyday remote access rather than enterprise-management features.
+RDP123's size is measured from v0.6.17; comparison app sizes are from mid-2026.
+RDP123 focuses on everyday remote access rather than enterprise-management features.
 
 **Built for low latency.** The first update after an idle period is presented
 immediately. Bursts are coalesced in an 8 ms window, allowing sustained streams
@@ -56,22 +56,23 @@ per-frame image allocation, full-frame copies, or texture uploads.
 **Two graphics pipelines.** Classic RDP 6.1 graphics is the reliable default.
 The selectable, experimental RDP 8 pipeline supports H.264/AVC420, RemoteFX
 Progressive, ClearCodec with NSCodec, Planar, cache-driven compositing, and
-automatic ZGFX compression. Its decoders were checked against the reference
-implementation and include narrowly scoped fixes for upstream issues.
+automatic ZGFX compression, using IronRDP's codec decoders.
 
 ## Features
 
 - **Native multi-session workflow** — sessions appear individually in the Dock
   and ⌘-Tab. Right-click the Dock icon to list and raise open sessions; the
   frontmost session is marked.
+  Selecting an already open RDP connection raises its existing window.
 - **Responsive remote windows** — native title bar, font smoothing, Retina/
   HiDPI-aware dynamic resizing, fixed resolutions, remembered window size, and
   full screen.
 - **Native remote cursor** — server resize arrows, I-beam, hand, and other
   pointer shapes are applied to the macOS cursor without server-drawn lag.
 - **Clipboard and files** — bidirectional text and file copy/paste, including
-  folders. File data streams on demand without an application-imposed size
-  limit; clipboard access can be restricted or disabled per connection.
+  folders. Windows files are fetched when Finder or another app requests their
+  file URLs. Keep the session open until the paste finishes. Files stream in
+  chunks; clipboard access can be restricted or disabled per connection.
 - **External speech-to-text paste** — enable this option under **Settings →
   Global** to accept the standard macOS Paste action from dictation tools,
   wait for Windows to confirm the matching clipboard text, and insert it with
@@ -88,7 +89,7 @@ implementation and include narrowly scoped fixes for upstream issues.
   macOS Keychain. Entra web authentication supports joined Windows 11 hosts and
   is equivalent to `enablerdsaadauth:i:1`; tokens and the ephemeral
   proof-of-possession key remain in memory.
-- **Native Settings** — manage RDP and SSH entries without editing config files.
+- **Native Settings** — create, duplicate, and manage RDP and SSH entries.
   Configure display, colour depth, scaling, graphics, compression, clipboard,
   audio, authentication, reconnect behavior, and password handling. The About
   tab shows the exact installed version.
@@ -99,7 +100,7 @@ implementation and include narrowly scoped fixes for upstream issues.
 
 - macOS 11 or newer on Apple Silicon or Intel.
 - Xcode Command Line Tools: `xcode-select --install`.
-- Rust 1.89 or newer via [rustup](https://rustup.rs).
+- Rust 1.94 or newer via [rustup](https://rustup.rs).
 - A Windows host accepting password-based NLA or RDS AAD Auth. Entra mode
   requires the device hostname, not an IP address.
 
@@ -121,7 +122,40 @@ open /Applications/RDP123.app
 Use `cargo xtask bundle` to create `dist/RDP123.app` without installing. Both
 commands use the locally generated **RDP123 Local** identity when available and
 otherwise fall back to an ad-hoc signature (`-`). The bundle includes the
-AGPLv3 license under `Contents/Resources`.
+AGPLv3 license under `Contents/Resources`. Bundling replaces home and workspace
+paths with generic build paths and refuses binaries that still contain either
+original path.
+
+<details>
+<summary>Back up before updating and restore a previous build</summary>
+
+Quit RDP123 before updating. Keep the signed app and a separate profile backup
+outside the repository:
+
+```sh
+backup="$HOME/Library/Application Support/RDP123/Backups/$(date +%Y%m%d-%H%M%S)"
+mkdir -p -m 700 "$backup"
+ditto -c -k --sequesterRsrc --keepParent /Applications/RDP123.app "$backup/RDP123.app.zip"
+cp "$HOME/Library/Application Support/ch.asd123.RDP123/connections.json" "$backup/connections.json"
+chmod 600 "$backup/connections.json"
+```
+
+To check or restore the app, keep `backup` set to the chosen backup directory:
+
+```sh
+restore="$(mktemp -d)"
+ditto -x -k "$backup/RDP123.app.zip" "$restore"
+codesign --verify --deep --strict "$restore/RDP123.app"
+open "$restore"
+```
+
+For rollback, quit RDP123, move the current app out of `/Applications`, then
+move the verified extracted app into `/Applications` and launch it. Do not
+merge app bundles. Replacing the app does not replace profiles or Keychain
+passwords; restore `connections.json` separately only if needed. Backups may
+contain private connection details and must never be committed or published.
+
+</details>
 
 ### Stable local signing
 
@@ -175,7 +209,9 @@ unnotarized, which is unnecessary when running it on the Mac that built it.
    item → **Settings…**.
 2. Under **Connection**, add an entry with **+**, configure it, and choose
    **Save**. **Revert** discards edits; switching with unsaved changes asks
-   before continuing.
+   before continuing. **Duplicate** copies the selected entry, including any
+   saved password, into an independent profile with a "Copy" suffix.
+   Server-key trust is confirmed separately for the copy.
 3. Under **Global**, choose the SSH terminal, optional ⌘/⌥ swap, external STT
    paste support, and whether RDP123 starts at login. STT paste also requires
    Local → Remote clipboard access on the connection.
@@ -185,6 +221,9 @@ unnotarized, which is unnecessary when running it on the Mac that built it.
    - **RDP with Microsoft Entra web:** trust the server key and complete the
      Microsoft login and MFA without an RDP password. Use the device hostname.
    - **SSH:** launch `ssh user@host` in the selected terminal.
+   Selecting an RDP entry that is already open brings that window forward,
+   including while connecting or reconnecting. Duplicate the entry if you
+   need a separate session with the same settings.
 
 <p align="center">
   <img src="assets/screenshot-settings.png" alt="The Settings window with the connection editor" width="560">

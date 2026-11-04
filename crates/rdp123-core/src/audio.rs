@@ -15,11 +15,11 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use ironrdp::core::{Decode as _, Encode, EncodeResult, ReadCursor, WriteCursor};
-use ironrdp::dvc::{DvcClientProcessor, DvcMessage, DvcProcessor};
-use ironrdp::pdu::{decode_err, PduResult};
-use ironrdp::rdpsnd::client::RdpsndClientHandler;
-use ironrdp::rdpsnd::pdu::{
+use ironrdp_core::{Decode as _, Encode, EncodeResult, ReadCursor, WriteCursor};
+use ironrdp_dvc::{DvcClientProcessor, DvcMessage, DvcProcessor};
+use ironrdp_pdu::{decode_err, PduResult};
+use ironrdp_rdpsnd::client::RdpsndClientHandler;
+use ironrdp_rdpsnd::pdu::{
     AudioFormat, AudioFormatFlags, ClientAudioFormatPdu, ClientAudioOutputPdu, PitchPdu,
     QualityMode, QualityModePdu, ServerAudioFormatPdu, ServerAudioOutputPdu, TrainingConfirmPdu,
     Version, VolumePdu, WaveConfirmPdu, WaveFormat,
@@ -203,12 +203,13 @@ impl RdpsndClientHandler for RdpsndBackend {
         &self.formats
     }
 
-    fn wave(&mut self, format_no: usize, _ts: u32, data: Cow<'_, [u8]>) {
-        // Only one format is ever advertised, so all wave data is our PCM
-        // format regardless of how the server indexes `format_no`.
+    fn wave(&mut self, format: &AudioFormat, _ts: u32, data: Cow<'_, [u8]>) {
+        if !self.formats.contains(format) {
+            return;
+        }
         if !self.got_audio {
             self.got_audio = true;
-            tracing::info!("rdpsnd: receiving remote audio (format_no {format_no})");
+            tracing::info!("rdpsnd: receiving remote PCM audio");
         }
         // Dropping on a full queue trades a glitch for bounded memory/latency.
         let _ = self.tx.try_send(data.into_owned());
@@ -251,7 +252,7 @@ impl Encode for AudioDvcPdu {
     }
 }
 
-impl ironrdp::dvc::DvcEncode for AudioDvcPdu {}
+impl ironrdp_dvc::DvcEncode for AudioDvcPdu {}
 
 fn dvc_msg(pdu: ClientAudioOutputPdu) -> DvcMessage {
     Box::new(AudioDvcPdu(pdu))
@@ -271,6 +272,7 @@ pub struct RdpsndDvcChannel {
     backend: RdpsndBackend,
     state: DvcAudioState,
     server_format: Option<ServerAudioFormatPdu>,
+    client_formats: Vec<AudioFormat>,
 }
 
 impl RdpsndDvcChannel {
@@ -279,6 +281,7 @@ impl RdpsndDvcChannel {
             backend,
             state: DvcAudioState::Start,
             server_format: None,
+            client_formats: Vec::new(),
         }
     }
 
@@ -303,6 +306,7 @@ impl RdpsndDvcChannel {
             );
         }
         self.server_format = Some(af);
+        self.client_formats = formats.clone();
         self.state = DvcAudioState::WaitingForTraining;
 
         let mut messages = vec![dvc_msg(ClientAudioOutputPdu::AudioFormat(
@@ -325,7 +329,7 @@ impl RdpsndDvcChannel {
     }
 }
 
-impl ironrdp::core::AsAny for RdpsndDvcChannel {
+impl ironrdp_core::AsAny for RdpsndDvcChannel {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -385,8 +389,9 @@ impl RdpsndDvcChannel {
     fn streaming(&mut self, pdu: ServerAudioOutputPdu<'_>) -> Vec<DvcMessage> {
         match pdu {
             ServerAudioOutputPdu::Wave2(wave) => {
-                self.backend
-                    .wave(usize::from(wave.format_no), wave.audio_timestamp, wave.data);
+                if let Some(format) = self.client_formats.get(usize::from(wave.format_no)) {
+                    self.backend.wave(format, wave.audio_timestamp, wave.data);
+                }
                 let confirm = WaveConfirmPdu {
                     timestamp: wave.timestamp,
                     block_no: wave.block_no,
@@ -418,7 +423,7 @@ impl RdpsndDvcChannel {
     }
 }
 
-fn training_confirm(t: &ironrdp::rdpsnd::pdu::TrainingPdu) -> DvcMessage {
+fn training_confirm(t: &ironrdp_rdpsnd::pdu::TrainingPdu) -> DvcMessage {
     dvc_msg(ClientAudioOutputPdu::TrainingConfirm(TrainingConfirmPdu {
         timestamp: t.timestamp,
         pack_size: u16::try_from(t.data.len()).unwrap_or(0),

@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -84,6 +85,18 @@ fn workspace_root() -> PathBuf {
 fn bundle() -> Result<PathBuf> {
     let root = workspace_root();
     let libraries = runtime_libraries(&root)?;
+    let home = PathBuf::from(env::var_os("HOME").context("HOME is not set")?);
+    if !home.is_absolute() {
+        bail!("HOME must be an absolute path for build-path remapping");
+    }
+    let rustflags = env::var_os("CARGO_ENCODED_RUSTFLAGS").unwrap_or_else(|| {
+        env::var("RUSTFLAGS")
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("\x1f")
+            .into()
+    });
 
     // Make the app's build script rerun so the About tab's build time and commit
     // reflect this build.
@@ -94,12 +107,23 @@ fn bundle() -> Result<PathBuf> {
     run(Command::new(env!("CARGO"))
         .current_dir(&root)
         .args(["build", "--release", "-p", "rdp123-app", "--locked"])
+        .env(
+            "CARGO_ENCODED_RUSTFLAGS",
+            remap_build_paths(rustflags, &root, &home),
+        )
         .env("RDP123_LIBS", libraries))
     .context("cargo build failed")?;
 
     let bin = root.join("target/release").join(BIN_NAME);
     if !bin.exists() {
         bail!("release binary not found at {}", bin.display());
+    }
+    let binary = fs::read(&bin).context("checking release binary for private build paths")?;
+    for path in [&root, &home] {
+        let prefix = path.as_os_str().as_encoded_bytes();
+        if binary.windows(prefix.len()).any(|window| window == prefix) {
+            bail!("release binary still contains a private build path; refusing to bundle it");
+        }
     }
 
     let app = root.join("dist").join(format!("{APP_NAME}.app"));
@@ -132,6 +156,21 @@ fn bundle() -> Result<PathBuf> {
     println!("\nBundled: {}", app.display());
     println!("Install: cargo xtask install   (into /Applications, single copy)");
     Ok(app)
+}
+
+fn remap_build_paths(mut flags: OsString, root: &Path, home: &Path) -> OsString {
+    // Cargo's encoded flags keep paths with spaces intact. The more specific
+    // workspace mapping comes last because rustc uses the last matching prefix.
+    for (from, to) in [(home, "/build/home"), (root, "/build/rdp123")] {
+        if !flags.is_empty() {
+            flags.push("\x1f");
+        }
+        flags.push("--remap-path-prefix=");
+        flags.push(from);
+        flags.push("=");
+        flags.push(to);
+    }
+    flags
 }
 
 fn runtime_libraries(root: &Path) -> Result<String> {
@@ -354,6 +393,35 @@ fn run(cmd: &mut Command) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_path_remapping_preserves_existing_flags_and_spaces() {
+        let flags = remap_build_paths(
+            OsString::from("-C\x1ftarget-cpu=apple-m1"),
+            Path::new("/Users/build user/Work/RDP123"),
+            Path::new("/Users/build user"),
+        );
+        assert_eq!(
+            flags,
+            "-C\x1ftarget-cpu=apple-m1\x1f\
+             --remap-path-prefix=/Users/build user=/build/home\x1f\
+             --remap-path-prefix=/Users/build user/Work/RDP123=/build/rdp123"
+        );
+    }
+
+    #[test]
+    fn build_path_remapping_starts_without_an_empty_flag() {
+        let flags = remap_build_paths(
+            OsString::new(),
+            Path::new("/workspace/RDP123"),
+            Path::new("/home/builder"),
+        );
+        assert_eq!(
+            flags,
+            "--remap-path-prefix=/home/builder=/build/home\x1f\
+             --remap-path-prefix=/workspace/RDP123=/build/rdp123"
+        );
+    }
 
     #[test]
     fn runtime_libraries_keep_direct_external_packages_once() {

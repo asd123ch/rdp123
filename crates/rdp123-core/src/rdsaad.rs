@@ -13,10 +13,12 @@ use aws_lc_rs::rsa::{KeyPair as RsaKeyPair, KeySize};
 use aws_lc_rs::signature::{KeyPair as _, RSA_PKCS1_SHA256};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use ironrdp_connector::ClientConnector;
+use ironrdp_core::WriteBuf;
+use ironrdp_tokio::{single_sequence_step, Framed, FramedRead, FramedWrite};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::oneshot;
 use url::Url;
 use zeroize::Zeroizing;
@@ -32,7 +34,6 @@ const AUTHORIZE_ENDPOINT: &str = "https://login.microsoftonline.com/common/oauth
 const TOKEN_ENDPOINT: &str = "https://login.microsoftonline.com/common/oauth2/v2.0/token";
 const AUTH_TIMEOUT: Duration = Duration::from_secs(120);
 const INTERACTIVE_AUTH_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-const MAX_MESSAGE_SIZE: usize = 64 * 1024;
 
 pub(crate) struct RdsAadClient {
     resource: String,
@@ -99,34 +100,50 @@ impl RdsAadClient {
 
     pub(crate) async fn authenticate<S>(
         &mut self,
-        stream: &mut S,
+        framed: &mut Framed<S>,
+        connector: &mut ClientConnector,
         username_hint: &str,
         event_cb: &dyn Fn(SessionEvent),
     ) -> Result<()>
     where
-        S: AsyncRead + AsyncWrite + Unpin,
+        S: FramedRead + FramedWrite,
     {
         self.ensure_access_token(username_hint, event_cb).await?;
         let aad_nonce = self.fetch_aad_nonce().await?;
-        let server_nonce = read_json_message::<ServerNonce, _>(stream)
-            .await
-            .context("reading the RDS AAD server nonce")?;
-        let assertion = self
-            .create_assertion(&server_nonce.ts_nonce, &aad_nonce)
-            .context("creating the RDS AAD proof-of-possession assertion")?;
-        write_json_message(stream, &json!({ "rdp_assertion": assertion }))
-            .await
-            .context("sending the RDS AAD assertion")?;
-
-        let result = read_json_message::<AuthenticationResult, _>(stream)
-            .await
-            .context("reading the RDS AAD authentication result")?;
-        if result.authentication_result != 0 {
-            let code = result.authentication_result as u32;
-            bail!(
-                "Microsoft Entra rejected the RDP sign-in ({})",
-                auth_error(code)
-            );
+        let mut buffer = WriteBuf::new();
+        tokio::time::timeout(
+            AUTH_TIMEOUT,
+            single_sequence_step(framed, connector, &mut buffer),
+        )
+        .await
+        .context("timed out waiting for the RDS AAD server nonce")??;
+        let nonce = connector
+            .entra_server_nonce()
+            .context("RDS AAD server nonce is missing")?;
+        let assertion = Zeroizing::new(
+            self.create_assertion(nonce, &aad_nonce)
+                .context("creating the RDS AAD proof-of-possession assertion")?,
+        );
+        buffer.clear();
+        connector.submit_entra_assertion(&assertion, &mut buffer)?;
+        let write = tokio::time::timeout(AUTH_TIMEOUT, framed.write_all(buffer.filled())).await;
+        buffer.filled_mut().fill(0);
+        buffer.clear();
+        write.context("timed out sending RDS AAD authentication")??;
+        if let Err(error) = tokio::time::timeout(
+            AUTH_TIMEOUT,
+            single_sequence_step(framed, connector, &mut buffer),
+        )
+        .await
+        .context("timed out waiting for the RDS AAD authentication result")?
+        {
+            if let ironrdp_connector::ConnectorErrorKind::EntraAuth(code) = error.kind() {
+                bail!(
+                    "Microsoft Entra rejected the RDP sign-in ({})",
+                    auth_error(*code)
+                );
+            }
+            return Err(error.into());
         }
         Ok(())
     }
@@ -303,46 +320,6 @@ async fn decode_response<T: for<'de> Deserialize<'de>>(
         .with_context(|| format!("decoding the Microsoft {operation} response"))
 }
 
-async fn read_json_message<T, S>(stream: &mut S) -> Result<T>
-where
-    T: for<'de> Deserialize<'de>,
-    S: AsyncRead + Unpin,
-{
-    let bytes = tokio::time::timeout(AUTH_TIMEOUT, async {
-        let mut bytes = Vec::new();
-        loop {
-            let byte = stream.read_u8().await?;
-            if byte == 0 {
-                break;
-            }
-            if bytes.len() >= MAX_MESSAGE_SIZE {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "RDS AAD message is too large",
-                ));
-            }
-            bytes.push(byte);
-        }
-        Ok::<_, std::io::Error>(bytes)
-    })
-    .await
-    .context("timed out waiting for the RDS AAD server")??;
-    serde_json::from_slice(&bytes).context("server returned invalid RDS AAD JSON")
-}
-
-async fn write_json_message<S>(stream: &mut S, value: &serde_json::Value) -> Result<()>
-where
-    S: AsyncWrite + Unpin,
-{
-    let mut bytes = serde_json::to_vec(value)?;
-    bytes.push(0);
-    tokio::time::timeout(AUTH_TIMEOUT, stream.write_all(&bytes))
-        .await
-        .context("timed out sending RDS AAD authentication")??;
-    stream.flush().await?;
-    Ok(())
-}
-
 fn auth_error(code: u32) -> String {
     let label = match code {
         0x8009_0308 => "invalid token",
@@ -374,16 +351,6 @@ struct NonceResponse {
 struct OAuthError {
     error: Option<String>,
     error_description: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ServerNonce {
-    ts_nonce: String,
-}
-
-#[derive(Deserialize)]
-struct AuthenticationResult {
-    authentication_result: i64,
 }
 
 #[cfg(test)]

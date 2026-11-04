@@ -7,7 +7,7 @@ use anyhow::{anyhow, Result};
 use security_framework::passwords::{
     delete_generic_password, get_generic_password, set_generic_password,
 };
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 const SERVICE: &str = "ch.asd123.rdp123";
 /// Service name used by builds before the bundle-identifier change; entries
@@ -43,6 +43,15 @@ pub fn load_password(account: &str) -> Result<Option<String>> {
     set_generic_password(SERVICE, account, password.as_bytes())?;
     let _ = delete_generic_password(LEGACY_SERVICE, account);
     Ok(Some(password))
+}
+
+/// Copy a saved password to an independent Keychain entry, if one exists.
+pub fn copy_password(source: &str, destination: &str) -> Result<bool> {
+    let Some(password) = load_password(source)?.map(Zeroizing::new) else {
+        return Ok(false);
+    };
+    store_password(destination, &password)?;
+    Ok(true)
 }
 
 fn load_from_service(service: &str, account: &str) -> Result<Option<String>> {

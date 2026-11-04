@@ -14,6 +14,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
@@ -24,7 +25,8 @@ use objc2_app_kit::{
     NSFont, NSImageView, NSPasteboard, NSPasteboardTypeString, NSPopUpButton, NSScrollView,
     NSSecureTextField, NSSegmentSwitchTracking, NSSegmentedControl, NSTableColumn, NSTableView,
     NSTableViewDataSource, NSTableViewDelegate, NSTextAlignment, NSTextField, NSTextFieldDelegate,
-    NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
+    NSUserInterfaceItemIdentification, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSWorkspace,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{
@@ -83,6 +85,42 @@ const POPUP_PITCH: f64 = 26.0;
 const CHECKBOX_PITCH: f64 = 22.0;
 const HDR_PITCH: f64 = 26.0;
 
+struct AboutLibrary<'a> {
+    name: String,
+    version: &'a str,
+    crates: Vec<&'a str>,
+}
+
+fn about_libraries(metadata: &str) -> Vec<AboutLibrary<'_>> {
+    let mut libraries = Vec::new();
+    let mut frameworks: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for entry in metadata.split(';').filter(|entry| !entry.is_empty()) {
+        let (name, version) = entry.split_once(' ').unwrap_or((entry, ""));
+        if name.starts_with("objc2-") {
+            frameworks.entry(version).or_default().push(name);
+        } else {
+            libraries.push(AboutLibrary {
+                name: name.into(),
+                version,
+                crates: vec![name],
+            });
+        }
+    }
+    for (version, crates) in frameworks {
+        libraries.push(AboutLibrary {
+            name: if crates.len() > 1 {
+                format!("objc2 frameworks ({})", crates.len())
+            } else {
+                crates[0].into()
+            },
+            version,
+            crates,
+        });
+    }
+    libraries.sort_by(|a, b| a.name.cmp(&b.name).then(a.version.cmp(b.version)));
+    libraries
+}
+
 fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
     CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
 }
@@ -116,6 +154,7 @@ pub struct SettingsIvars {
     save_button: Check,
     revert_button: Check,
     remove_button: Check,
+    duplicate_button: Check,
     /// Shown in the editor area when no connection is selected.
     empty_label: RefCell<Option<Retained<NSTextField>>>,
     /// Editor controls shared by RDP and SSH (hidden when nothing is selected).
@@ -262,6 +301,55 @@ define_class!(
             }
         }
 
+        #[unsafe(method(duplicateConnection:))]
+        fn duplicate(&self, _s: Option<&AnyObject>) {
+            if !self.confirm_discard_ok() {
+                return;
+            }
+            let row = self.ivars().selected.get();
+            let mut document = self.ivars().document.borrow().clone();
+            let Some(original) = usize::try_from(row).ok()
+                .and_then(|row| document.connections.get(row)).cloned() else {
+                return;
+            };
+            let Some(index) = document.duplicate_connection(&original.id) else {
+                return;
+            };
+            let copy_id = &document.connections[index].id;
+            let copied_password = if original.kind == ConnectionKind::Rdp
+                && original.rdp.authentication == AuthenticationMode::Password
+                && original.rdp.password_policy == PasswordPolicy::Remember
+            {
+                match secrets::copy_password(&original.id, copy_id) {
+                    Ok(copied) => copied,
+                    Err(error) => {
+                        ui::show_error(self.mtm(), "Could not duplicate connection", &format!("{error:#}"));
+                        return;
+                    }
+                }
+            } else {
+                false
+            };
+            if !self.save_document(&document) {
+                if copied_password {
+                    if let Err(error) = secrets::delete_password(copy_id) {
+                        ui::show_error(self.mtm(), "Could not remove copied password", &format!("{error:#}"));
+                    }
+                }
+                return;
+            }
+            *self.ivars().document.borrow_mut() = document;
+            self.ivars().selected.set(-1);
+            self.reload_table();
+            self.select_row(index as isize);
+            if let (Some(window), Some(name)) = (
+                self.ivars().window.borrow().as_ref(),
+                self.ivars().name.borrow().as_ref(),
+            ) {
+                window.makeFirstResponder(Some(name));
+            }
+        }
+
         #[unsafe(method(removeConnection:))]
         fn remove(&self, _s: Option<&AnyObject>) {
             if !self.confirm_discard_ok() {
@@ -362,9 +450,8 @@ define_class!(
         #[unsafe(method(openLibraryLink:))]
         fn open_library_link(&self, sender: Option<&AnyObject>) {
             let Some(sender) = sender else { return };
-            let title: Retained<NSString> = unsafe { msg_send![sender, title] };
-            let url = format!("https://crates.io/crates/{}", title);
-            if let Some(url) = NSURL::URLWithString(&NSString::from_str(&url)) {
+            let url: Option<Retained<NSString>> = unsafe { msg_send![sender, identifier] };
+            if let Some(url) = url.and_then(|url| NSURL::URLWithString(&url)) {
                 NSWorkspace::sharedWorkspace().openURL(&url);
             }
         }
@@ -558,18 +645,18 @@ impl SettingsController {
         // App icon, centered.
         if let Some(icon) = NSApplication::sharedApplication(mtm).applicationIconImage() {
             let view = NSImageView::imageViewWithImage(&icon, mtm);
-            view.setFrame(rect((W - 96.0) / 2.0, 584.0, 96.0, 96.0));
+            view.setFrame(rect((W - 72.0) / 2.0, 628.0, 72.0, 72.0));
             parent.addSubview(&view);
         }
 
         // Name + version identity block.
-        let title = self.centered(mtm, parent, 544.0, 32.0, "RDP123");
+        let title = self.centered(mtm, parent, 590.0, 32.0, "RDP123");
         title.setFont(Some(&NSFont::boldSystemFontOfSize(26.0)));
 
         let version = self.centered(
             mtm,
             parent,
-            518.0,
+            564.0,
             18.0,
             &format!(
                 "Version {} ({})",
@@ -583,7 +670,7 @@ impl SettingsController {
         let built = self.centered(
             mtm,
             parent,
-            498.0,
+            544.0,
             16.0,
             &format!("Built {}", env!("RDP123_BUILD_TIME")),
         );
@@ -594,47 +681,60 @@ impl SettingsController {
         let copy = self.button_ret(
             mtm,
             parent,
-            rect((W - 150.0) / 2.0, 460.0, 150.0, 28.0),
+            rect((W - 150.0) / 2.0, 506.0, 150.0, 28.0),
             "Copy Version Info",
             sel!(copyVersionInfo:),
         );
         let _ = copy;
 
         // Separator line.
-        let separator = NSBox::initWithFrame(NSBox::alloc(mtm), rect(120.0, 444.0, W - 240.0, 1.0));
+        let separator = NSBox::initWithFrame(NSBox::alloc(mtm), rect(120.0, 488.0, W - 240.0, 1.0));
         separator.setBoxType(NSBoxType::Separator);
         parent.addSubview(&separator);
 
-        // Direct runtime libraries, in two compact columns of crates.io links.
-        let header = self.centered(mtm, parent, 408.0, 18.0, "Open Source Libraries");
+        let header = self.centered(mtm, parent, 454.0, 18.0, "Open Source Libraries");
         header.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
         let note = self.centered(
             mtm,
             parent,
-            388.0,
+            430.0,
             15.0,
-            "Direct runtime dependencies — click a name to view it on crates.io.",
+            "Direct dependencies. Click for details; hover over a group to see its libraries.",
         );
         note.setFont(Some(&NSFont::systemFontOfSize(11.0)));
         self.muted(&note);
 
-        let libs: Vec<(&str, &str)> = env!("RDP123_LIBS")
-            .split(';')
-            .filter(|s| !s.is_empty())
-            .map(|entry| entry.split_once(' ').unwrap_or((entry, "")))
-            .collect();
-        let rows = libs.len().div_ceil(2);
-        for (i, (name, version)) in libs.iter().enumerate() {
-            let col_x = if i < rows { 68.0 } else { 374.0 };
-            let y = 356.0 - (i % rows) as f64 * 19.0;
-            self.link_button(mtm, parent, rect(col_x, y, 176.0, 18.0), name);
-            let ver = self.label(mtm, parent, rect(col_x + 182.0, y, 82.0, 18.0), version);
+        let libs = about_libraries(env!("RDP123_LIBS"));
+        let rows = libs.len().div_ceil(3);
+        let list_height = (rows as f64 * 24.0).max(346.0);
+        let scroll = NSScrollView::initWithFrame(
+            NSScrollView::alloc(mtm),
+            rect(28.0, 64.0, W - 56.0, 346.0),
+        );
+        scroll.setBorderType(NSBorderType::NoBorder);
+        scroll.setHasVerticalScroller(true);
+        scroll.setAutohidesScrollers(true);
+        scroll.setDrawsBackground(false);
+        let list = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, W - 56.0, list_height));
+        for (i, library) in libs.iter().enumerate() {
+            let col_x = (i / rows) as f64 * 222.0;
+            let y = list_height - 24.0 - (i % rows) as f64 * 24.0;
+            self.link_button(mtm, &list, rect(col_x, y, 160.0, 20.0), library);
+            let ver = self.label(
+                mtm,
+                &list,
+                rect(col_x + 164.0, y, 50.0, 20.0),
+                library.version,
+            );
             ver.setFont(Some(&NSFont::systemFontOfSize(11.0)));
             self.muted(&ver);
         }
+        scroll.setDocumentView(Some(&list));
+        list.scrollPoint(CGPoint::new(0.0, list_height - 346.0));
+        parent.addSubview(&scroll);
 
         // License line pinned to the bottom.
-        let license = self.centered(mtm, parent, 28.0, 15.0, "Open source under GNU GPL v3.0");
+        let license = self.centered(mtm, parent, 28.0, 15.0, "Open source under GNU AGPL v3.0");
         license.setFont(Some(&NSFont::systemFontOfSize(11.0)));
         license.setTextColor(Some(&NSColor::tertiaryLabelColor()));
     }
@@ -684,6 +784,16 @@ impl SettingsController {
         );
         remove.setEnabled(false);
         *self.ivars().remove_button.borrow_mut() = Some(remove);
+
+        let duplicate = self.button_ret(
+            mtm,
+            parent,
+            rect(96.0, 16.0, 110.0, 26.0),
+            "Duplicate",
+            sel!(duplicateConnection:),
+        );
+        duplicate.setEnabled(false);
+        *self.ivars().duplicate_button.borrow_mut() = Some(duplicate);
 
         let save = self.button_ret(
             mtm,
@@ -1132,11 +1242,16 @@ impl SettingsController {
         label.setTextColor(Some(&NSColor::secondaryLabelColor()));
     }
 
-    /// A borderless, link-coloured button whose title opens a crates.io page.
-    fn link_button(&self, mtm: MainThreadMarker, parent: &NSView, f: CGRect, title: &str) {
+    fn link_button(
+        &self,
+        mtm: MainThreadMarker,
+        parent: &NSView,
+        f: CGRect,
+        library: &AboutLibrary<'_>,
+    ) {
         let b = unsafe {
             NSButton::buttonWithTitle_target_action(
-                &NSString::from_str(title),
+                &NSString::from_str(&library.name),
                 Some(self.any()),
                 Some(sel!(openLibraryLink:)),
                 mtm,
@@ -1147,6 +1262,13 @@ impl SettingsController {
         b.setAlignment(NSTextAlignment::Left);
         b.setFont(Some(&NSFont::systemFontOfSize(11.0)));
         b.setContentTintColor(Some(&NSColor::linkColor()));
+        let url = if library.crates.len() > 1 {
+            "https://github.com/madsmtm/objc2/tree/main/framework-crates".into()
+        } else {
+            format!("https://crates.io/crates/{}", library.crates[0])
+        };
+        b.setIdentifier(Some(&NSString::from_str(&url)));
+        b.setToolTip(Some(&NSString::from_str(&library.crates.join("\n"))));
         parent.addSubview(&b);
     }
 
@@ -1485,6 +1607,9 @@ impl SettingsController {
             e.setHidden(has_selection);
         }
         if let Some(b) = self.ivars().remove_button.borrow().as_ref() {
+            b.setEnabled(has_selection);
+        }
+        if let Some(b) = self.ivars().duplicate_button.borrow().as_ref() {
             b.setEnabled(has_selection);
         }
         let entra = self.popup_index(&self.ivars().authentication) == 1;
@@ -1862,4 +1987,33 @@ where
         .trim()
         .parse()
         .map_err(|_| format!("{label} must be a valid number."))
+}
+
+#[cfg(test)]
+mod about_tests {
+    use super::about_libraries;
+
+    #[test]
+    fn groups_frameworks_without_losing_names_or_versions() {
+        let libraries =
+            about_libraries("objc2 0.6.5;objc2-app-kit 0.3.2;objc2-foundation 0.3.2;tokio 1.54.1");
+        assert_eq!(libraries.len(), 3);
+        assert_eq!(libraries[0].name, "objc2");
+        assert_eq!(libraries[0].version, "0.6.5");
+        assert_eq!(libraries[1].name, "objc2 frameworks (2)");
+        assert_eq!(libraries[1].version, "0.3.2");
+        assert_eq!(libraries[1].crates, ["objc2-app-kit", "objc2-foundation"]);
+        assert_eq!(libraries[2].name, "tokio");
+    }
+
+    #[test]
+    fn keeps_frameworks_with_different_versions_separate() {
+        let libraries = about_libraries("objc2-app-kit 0.3.2;objc2-foundation 0.4.0");
+        assert_eq!(libraries.len(), 2);
+        assert_eq!(libraries[0].name, "objc2-app-kit");
+        assert_eq!(libraries[0].version, "0.3.2");
+        assert_eq!(libraries[1].name, "objc2-foundation");
+        assert_eq!(libraries[1].version, "0.4.0");
+        assert!(about_libraries("").is_empty());
+    }
 }

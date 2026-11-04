@@ -12,11 +12,11 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
           targets: x86_64-apple-darwin
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
       - name: Format
         run: cargo fmt --all --check
       - name: Test
@@ -25,6 +25,10 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Intel compatibility
         run: cargo check --workspace --target x86_64-apple-darwin --locked
+      - name: Bundle and check build paths
+        env:
+          RDP123_SIGN_IDENTITY: "-"
+        run: cargo xtask bundle
       - name: Dependency audit
         run: |
           cargo install cargo-audit --version 0.22.2 --locked

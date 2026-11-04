@@ -445,6 +445,30 @@ impl Default for Document {
 }
 
 impl Document {
+    pub fn duplicate_connection(&mut self, id: &str) -> Option<usize> {
+        let index = self
+            .connections
+            .iter()
+            .position(|connection| connection.id == id)?;
+        let mut copy = self.connections[index].clone();
+        copy.id = new_id();
+        let base_name = format!("{} Copy", copy.name);
+        copy.name = base_name.clone();
+        let mut suffix = 2;
+        while self
+            .connections
+            .iter()
+            .any(|connection| connection.name == copy.name)
+        {
+            copy.name = format!("{base_name} {suffix}");
+            suffix += 1;
+        }
+        // A copy is often retargeted to another host; establish trust separately.
+        copy.cert_fingerprint = None;
+        self.connections.insert(index + 1, copy);
+        Some(index + 1)
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.version != DOCUMENT_VERSION {
             bail!(
@@ -604,6 +628,61 @@ impl ProfileStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_connection_preserves_settings_with_a_new_identity() {
+        for kind in [ConnectionKind::Rdp, ConnectionKind::Ssh] {
+            let mut original = Connection::new("Office", kind);
+            original.host = "server.example".into();
+            original.username = "user".into();
+            original.domain = Some("example".into());
+            original.cert_fingerprint = Some("trusted-key".into());
+            original.rdp.reconnect = true;
+            original.rdp.reconnect_per_minute = 12;
+            let mut document = Document::default();
+            document.connections.push(original.clone());
+
+            let index = document.duplicate_connection(&original.id).unwrap();
+            assert_eq!(index, 1);
+            let copy = &document.connections[index];
+            assert_ne!(copy.id, original.id);
+            assert!(Uuid::parse_str(&copy.id).is_ok());
+            let mut expected = original.clone();
+            expected.id = copy.id.clone();
+            expected.name = "Office Copy".into();
+            expected.cert_fingerprint = None;
+            assert_eq!(
+                serde_json::to_value(copy).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+
+            document.connections[index].host = "other.example".into();
+            assert_eq!(
+                serde_json::to_value(&document.connections[0]).unwrap(),
+                serde_json::to_value(original).unwrap()
+            );
+            document.validate().unwrap();
+            let (store, dir) = test_store();
+            store.save_document(&document).unwrap();
+            assert_eq!(store.load_document().unwrap().connections.len(), 2);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn duplicate_connection_uses_unique_names_and_requires_an_existing_id() {
+        let mut original = Connection::new("Office", ConnectionKind::Rdp);
+        original.host = "server.example".into();
+        let mut document = Document::default();
+        document.connections.push(original.clone());
+        for name in ["Office Copy", "Office Copy 2", "Office Copy 3"] {
+            let index = document.duplicate_connection(&original.id).unwrap();
+            assert_eq!(document.connections[index].name, name);
+        }
+        assert_eq!(document.duplicate_connection("missing"), None);
+        assert_eq!(document.connections.len(), 4);
+        document.validate().unwrap();
+    }
 
     fn test_store() -> (ProfileStore, PathBuf) {
         let dir = std::env::temp_dir().join(format!("rdp123-profile-test-{}", Uuid::new_v4()));

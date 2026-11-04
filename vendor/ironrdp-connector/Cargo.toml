@@ -11,9 +11,9 @@
 
 [package]
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.94"
 name = "ironrdp-connector"
-version = "0.10.0"
+version = "0.12.0"
 authors = [
     "Devolutions Inc. <infos@devolutions.net>",
     "Teleport <goteleport.com>",
@@ -43,12 +43,7 @@ resolver = "2"
 default = []
 qoi = ["ironrdp-pdu/qoi"]
 qoiz = ["ironrdp-pdu/qoiz"]
-scard = [
-    "dep:picky",
-    "dep:picky-asn1-der",
-    "dep:picky-asn1-x509",
-    "sspi/scard",
-]
+scard = ["dep:picky", "dep:picky-asn1-der", "dep:picky-asn1-x509", "sspi/scard"]
 
 [lib]
 name = "ironrdp_connector"
@@ -57,21 +52,20 @@ test = false
 doctest = false
 
 [dependencies.ironrdp-core]
-version = "0.2"
+version = "0.3"
 
 [dependencies.ironrdp-error]
 version = "0.2"
 
 [dependencies.ironrdp-pdu]
-version = "0.9"
+version = "0.11"
 features = ["std"]
 
 [dependencies.ironrdp-svc]
-version = "0.8"
+version = "0.10"
 
 [dependencies.picky]
-version = "=7.0.0-rc.25"
-default-features = false
+version = "=7.0.0-rc.26"
 optional = true
 
 [dependencies.picky-asn1-der]
@@ -86,9 +80,11 @@ optional = true
 version = "0.9"
 features = ["std"]
 
+[dependencies.serde_json]
+version = "1"
+
 [dependencies.sspi]
-version = "0.21"
-default-features = true
+version = "0.23.1"
 
 [dependencies.tracing]
 version = "0.1"

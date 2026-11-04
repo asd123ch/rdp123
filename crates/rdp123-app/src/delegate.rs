@@ -418,6 +418,18 @@ impl AppDelegate {
     }
 
     fn open_rdp(&self, connection: Connection) {
+        let existing_window = self
+            .ivars()
+            .borrow()
+            .windows
+            .iter()
+            .find_map(|(&id, controller)| {
+                (controller.connection_id() == connection.id).then_some(id)
+            });
+        if let Some(id) = existing_window {
+            self.show_session(id);
+            return;
+        }
         let mtm = self.mtm();
 
         let password = match connection.rdp.authentication {
@@ -595,10 +607,7 @@ impl AppDelegate {
                 max_attempts,
             } => controller.set_reconnecting(attempt, max_attempts),
             SessionEvent::ClipboardText(text) => controller.set_clipboard(&text),
-            SessionEvent::ClipboardFilesPreparing { count } => {
-                controller.prepare_remote_files(count)
-            }
-            SessionEvent::ClipboardFilesReady(paths) => controller.offer_remote_files(paths),
+            SessionEvent::ClipboardFilesOffered(offer) => controller.offer_remote_files(offer),
             SessionEvent::ClipboardFilesFailed(message) => {
                 controller.remote_file_preparation_failed(&message)
             }

@@ -11,9 +11,9 @@
 
 [package]
 edition = "2024"
-rust-version = "1.89"
-name = "ironrdp-graphics"
-version = "0.9.0"
+rust-version = "1.94"
+name = "ironrdp-svc"
+version = "0.10.0"
 authors = [
     "Devolutions Inc. <infos@devolutions.net>",
     "Teleport <goteleport.com>",
@@ -24,7 +24,7 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "RDP image processing primitives"
+description = "IronRDP traits to implement RDP static virtual channels"
 homepage = "https://github.com/Devolutions/IronRDP"
 readme = "README.md"
 keywords = [
@@ -39,52 +39,28 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/Devolutions/IronRDP"
 resolver = "2"
 
-[lib]
-name = "ironrdp_graphics"
-path = "src/lib.rs"
-doctest = false
+[features]
+default = []
+std = []
 
-[dependencies.bit_field]
-version = "0.10"
+[lib]
+name = "ironrdp_svc"
+path = "src/lib.rs"
+test = false
+doctest = false
 
 [dependencies.bitflags]
 version = "2.11"
 
-[dependencies.bitvec]
-version = "1.0"
-
-[dependencies.byteorder]
-version = "1.5"
-
 [dependencies.ironrdp-core]
-version = "0.2"
+version = "0.3"
 
 [dependencies.ironrdp-pdu]
-version = "0.9"
-features = ["std"]
-
-[dependencies.num-derive]
-version = "0.4"
-
-[dependencies.num-traits]
-version = "0.2"
-
-[dependencies.tracing]
-version = "0.1"
-default-features = false
-
-[dependencies.yuv]
-version = "0.8"
-features = ["rdp"]
-
-[dev-dependencies.bmp]
-version = "0.5"
-
-[dev-dependencies.bytemuck]
-version = "1.24"
-
-[dev-dependencies.expect-test]
-version = "1"
+version = "0.11"
+features = [
+    "alloc",
+    "std",
+]
 
 [lints.clippy]
 alloc_instead_of_core = "warn"
@@ -200,5 +176,3 @@ unused_lifetimes = "warn"
 unused_macro_rules = "warn"
 unused_qualifications = "warn"
 unused_unsafe = "warn"
-
-[workspace]

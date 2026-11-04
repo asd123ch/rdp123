@@ -13,10 +13,9 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSAlert, NSAlertStyle, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSEvent,
-    NSEventModifierFlags, NSFont, NSLineBreakMode, NSModalResponse, NSPasteboard, NSPasteboardItem,
-    NSPasteboardTypeFileURL, NSPasteboardTypeString, NSPasteboardWriting, NSProgressIndicator,
-    NSProgressIndicatorStyle, NSScreen, NSTextField, NSTrackingArea, NSTrackingAreaOptions, NSView,
-    NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSEventModifierFlags, NSFont, NSLineBreakMode, NSModalResponse, NSPasteboard,
+    NSPasteboardTypeString, NSProgressIndicator, NSProgressIndicatorStyle, NSScreen, NSTextField,
+    NSTrackingArea, NSTrackingAreaOptions, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{NSNotification, NSObjectProtocol, NSString, NSTimer, NSURL};
 use objc2_quartz_core::kCAFilterLinear;
@@ -161,10 +160,7 @@ pub struct WindowControllerIvars {
     remember_size: Cell<bool>,
     clipboard_mode: Cell<ClipboardMode>,
     clipboard_tracker: RefCell<ClipboardChangeTracker>,
-    /// Pasteboard generation reserved while remote files are materialized.
-    /// A newer local copy wins and prevents a completed background transfer
-    /// from overwriting the user's newer clipboard contents.
-    remote_file_offer_change_count: Cell<Option<isize>>,
+    file_offer_owner: RefCell<Option<crate::file_pasteboard::Owner>>,
 }
 
 define_class!(
@@ -610,7 +606,7 @@ impl WindowController {
     /// Dim the last remote frame so it is visibly stale while reconnecting.
     pub fn set_reconnecting(&self, attempt: u32, max_attempts: u32) {
         self.cancel_clipboard_status_timer();
-        self.ivars().remote_file_offer_change_count.set(None);
+        self.ivars().file_offer_owner.borrow_mut().take();
         if let Some(window) = self.ivars().window.borrow().as_ref() {
             let base = self.ivars().title.borrow().clone();
             window.setTitle(&NSString::from_str(&format!("{base} — reconnecting…")));
@@ -641,7 +637,7 @@ impl WindowController {
             timer.invalidate();
         }
         self.cancel_clipboard_status_timer();
-        self.ivars().remote_file_offer_change_count.set(None);
+        self.ivars().file_offer_owner.borrow_mut().take();
         if let Some(view) = self.ivars().view.borrow().as_ref() {
             view.release_all_keys();
         }
@@ -706,7 +702,7 @@ impl WindowController {
         if !self.ivars().clipboard_mode.get().allow_remote_to_local() {
             return;
         }
-        self.ivars().remote_file_offer_change_count.set(None);
+        self.ivars().file_offer_owner.borrow_mut().take();
         self.cancel_clipboard_status_timer();
         self.restore_connection_title();
         let pasteboard = NSPasteboard::generalPasteboard();
@@ -781,82 +777,26 @@ impl WindowController {
         }
     }
 
-    /// Reserve the macOS clipboard while the session materializes the remote
-    /// selection. Clearing now prevents Finder from pasting stale local data.
-    pub fn prepare_remote_files(&self, count: usize) {
-        if !self.ivars().clipboard_mode.get().allow_remote_to_local() {
+    pub fn offer_remote_files(&self, offer: rdp123_core::session::RemoteFileOffer) {
+        self.ivars().file_offer_owner.borrow_mut().take();
+        if !self.ivars().clipboard_mode.get().allow_remote_to_local() || offer.is_empty() {
             return;
         }
-        if count == 0 {
-            return;
-        }
-        self.cancel_clipboard_status_timer();
-        let pasteboard = NSPasteboard::generalPasteboard();
-        pasteboard.clearContents();
-        let change_count = pasteboard.changeCount();
+        // Do not offer the previous selection while the new owner is starting.
+        let change = NSPasteboard::generalPasteboard().clearContents();
         self.ivars()
             .clipboard_tracker
             .borrow_mut()
-            .acknowledge_local_write(change_count);
-        self.ivars()
-            .remote_file_offer_change_count
-            .set(Some(change_count));
-        let noun = if count == 1 { "file" } else { "files" };
-        self.set_window_title_status(&format!("preparing {count} {noun}…"));
-    }
-
-    /// Publish fully downloaded files as real `public.file-url` pasteboard
-    /// items. Finder can copy these with its normal Command-V path.
-    pub fn offer_remote_files(&self, paths: Vec<std::path::PathBuf>) {
-        if !self.ivars().clipboard_mode.get().allow_remote_to_local() {
-            return;
+            .acknowledge_local_write(change);
+        match crate::file_pasteboard::publish(offer, change) {
+            Ok(owner) => *self.ivars().file_offer_owner.borrow_mut() = Some(owner),
+            Err(error) => self.remote_file_preparation_failed(&error.to_string()),
         }
-        let pasteboard = NSPasteboard::generalPasteboard();
-        let expected_change = self.ivars().remote_file_offer_change_count.take();
-        if expected_change != Some(pasteboard.changeCount()) {
-            tracing::debug!(
-                "clipboard: not publishing remote files because the local clipboard changed"
-            );
-            remove_remote_file_cache(&paths);
-            self.cancel_clipboard_status_timer();
-            self.restore_connection_title();
-            return;
-        }
-        let items = file_url_pasteboard_items(&paths);
-        if items.len() != paths.len() || items.is_empty() {
-            tracing::warn!("clipboard: downloaded remote files could not be represented locally");
-            remove_remote_file_cache(&paths);
-            self.show_clipboard_file_failure();
-            return;
-        }
-        let writers: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> = items
-            .into_iter()
-            .map(|item| {
-                ProtocolObject::from_retained(item)
-                    as Retained<ProtocolObject<dyn NSPasteboardWriting>>
-            })
-            .collect();
-        pasteboard.clearContents();
-        let array = objc2_foundation::NSArray::from_retained_slice(&writers);
-        let ok = pasteboard.writeObjects(&array);
-        if !ok {
-            tracing::warn!("clipboard: could not publish downloaded files to the pasteboard");
-            remove_remote_file_cache(&paths);
-            self.show_clipboard_file_failure();
-            return;
-        }
-        // Don't re-read our own pasteboard write on the next poll.
-        self.ivars()
-            .clipboard_tracker
-            .borrow_mut()
-            .acknowledge_local_write(pasteboard.changeCount());
-        let noun = if paths.len() == 1 { "file" } else { "files" };
-        self.set_temporary_clipboard_status(&format!("{} {noun} ready to paste", paths.len()));
     }
 
     pub fn remote_file_preparation_failed(&self, message: &str) {
         tracing::warn!("clipboard: preparing remote files failed: {message}");
-        self.ivars().remote_file_offer_change_count.set(None);
+        self.ivars().file_offer_owner.borrow_mut().take();
         self.show_clipboard_file_failure();
     }
 
@@ -898,6 +838,17 @@ impl WindowController {
 
         // Files take precedence over text: a Finder copy also puts the file
         // names on the pasteboard as a string.
+        let marker = NSString::from_str(crate::file_pasteboard::MARKER);
+        if pasteboard
+            .types()
+            .is_some_and(|types| types.containsObject(&marker))
+        {
+            self.ivars()
+                .clipboard_tracker
+                .borrow_mut()
+                .acknowledge_local_write(count);
+            return;
+        }
         let files = pasteboard_file_paths(&pasteboard);
         if !files.is_empty() {
             let delivered = self.ivars().handle.borrow().as_ref().is_some_and(|handle| {
@@ -970,38 +921,6 @@ fn even(v: f64) -> u16 {
     n & !1
 }
 
-/// One modern file-URL pasteboard item per downloaded top-level path. Finder
-/// treats these like files copied locally and performs its normal copy on
-/// Command-V.
-fn file_url_pasteboard_items(paths: &[std::path::PathBuf]) -> Vec<Retained<NSPasteboardItem>> {
-    paths
-        .iter()
-        .filter_map(|path| {
-            if !path.exists() {
-                return None;
-            }
-            let path_string = NSString::from_str(&path.to_string_lossy());
-            let url = NSURL::fileURLWithPath_isDirectory(&path_string, path.is_dir());
-            let absolute = url.absoluteString()?;
-            let item = NSPasteboardItem::new();
-            unsafe {
-                item.setString_forType(&absolute, NSPasteboardTypeFileURL)
-                    .then_some(item)
-            }
-        })
-        .collect()
-}
-
-fn remove_remote_file_cache(paths: &[std::path::PathBuf]) {
-    let expected_root = std::env::temp_dir().join("RDP123").join("Clipboard");
-    let Some(cache_dir) = paths.first().and_then(|path| path.parent()) else {
-        return;
-    };
-    if cache_dir.parent() == Some(expected_root.as_path()) {
-        let _ = std::fs::remove_dir_all(cache_dir);
-    }
-}
-
 /// File URLs currently on the pasteboard, as local paths.
 fn pasteboard_file_paths(pasteboard: &NSPasteboard) -> Vec<std::path::PathBuf> {
     let mut paths = Vec::new();
@@ -1025,8 +944,7 @@ fn pasteboard_file_paths(pasteboard: &NSPasteboard) -> Vec<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{file_url_pasteboard_items, ClipboardChangeTracker};
-    use objc2_app_kit::NSPasteboardTypeFileURL;
+    use super::ClipboardChangeTracker;
 
     #[test]
     fn existing_clipboard_content_is_pending_for_a_new_session() {
@@ -1043,30 +961,5 @@ mod tests {
 
         tracker.record_attempt(42, true);
         assert!(!tracker.is_pending(42));
-    }
-
-    #[test]
-    fn downloaded_files_become_individual_file_url_items() {
-        let root =
-            std::env::temp_dir().join(format!("rdp123-file-url-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("folder")).unwrap();
-        std::fs::write(root.join("report.txt"), b"ready").unwrap();
-
-        let paths = vec![root.join("report.txt"), root.join("folder")];
-        let items = file_url_pasteboard_items(&paths);
-
-        assert_eq!(items.len(), 2);
-        for (item, path) in items.iter().zip(&paths) {
-            let value = unsafe { item.stringForType(NSPasteboardTypeFileURL) }
-                .expect("file URL pasteboard type");
-            let url = objc2_foundation::NSURL::URLWithString(&value).expect("valid file URL");
-            assert_eq!(
-                url.path().expect("local path").to_string(),
-                path.to_string_lossy()
-            );
-        }
-
-        let _ = std::fs::remove_dir_all(root);
     }
 }
