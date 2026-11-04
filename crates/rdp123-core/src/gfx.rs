@@ -140,7 +140,7 @@ mod tests {
         assert!(output.reset);
         assert!(output.region.is_some());
         assert_eq!((image.width(), image.height()), (4, 2));
-        for pixel in image.data().chunks_exact(4) {
+        for pixel in image.data().as_chunks::<4>().0 {
             assert_eq!(&pixel[..3], &[0x11, 0x22, 0x33]);
         }
         assert_eq!(pipeline.dropped_updates(), 0);

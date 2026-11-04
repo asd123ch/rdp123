@@ -424,9 +424,15 @@ impl RdpsndDvcChannel {
 }
 
 fn training_confirm(t: &ironrdp_rdpsnd::pdu::TrainingPdu) -> DvcMessage {
+    const RDPSND_HEADER_SIZE: usize = 4;
+    let pack_size = if t.data.is_empty() {
+        0
+    } else {
+        t.size() + RDPSND_HEADER_SIZE
+    };
     dvc_msg(ClientAudioOutputPdu::TrainingConfirm(TrainingConfirmPdu {
         timestamp: t.timestamp,
-        pack_size: u16::try_from(t.data.len()).unwrap_or(0),
+        pack_size: u16::try_from(pack_size).unwrap_or(0),
     }))
 }
 
@@ -435,6 +441,72 @@ impl DvcClientProcessor for RdpsndDvcChannel {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn training_channel(state: DvcAudioState) -> RdpsndDvcChannel {
+        let (tx, _rx) = sync_channel(1);
+        let mut channel = RdpsndDvcChannel::new(RdpsndBackend {
+            formats: Vec::new(),
+            tx,
+            negotiated: Cell::new(false),
+            got_audio: false,
+        });
+        channel.state = state;
+        channel
+    }
+
+    fn training_packet(pack_size: u16, data_len: usize) -> Vec<u8> {
+        let mut packet = vec![0x06, 0x00];
+        packet.extend_from_slice(&u16::try_from(4 + data_len).unwrap().to_le_bytes());
+        packet.extend_from_slice(&0x1234u16.to_le_bytes());
+        packet.extend_from_slice(&pack_size.to_le_bytes());
+        packet.resize(8 + data_len, 0);
+        packet
+    }
+
+    #[test]
+    fn training_confirm_echoes_windows_and_gnome_packet_sizes() {
+        for (pack_size, data_len) in [
+            (1024, 1016),
+            (1024, 1024),
+            (0, 0),
+            (9, 1),
+            (u16::MAX, 65527),
+        ] {
+            for state in [DvcAudioState::WaitingForTraining, DvcAudioState::Ready] {
+                let mut channel = training_channel(state);
+                let replies = channel
+                    .process(5, &training_packet(pack_size, data_len))
+                    .unwrap();
+                assert_eq!(replies.len(), 1);
+                let bytes = ironrdp_core::encode_vec(replies[0].as_ref()).unwrap();
+                let reply = ClientAudioOutputPdu::decode(&mut ReadCursor::new(&bytes)).unwrap();
+                let ClientAudioOutputPdu::TrainingConfirm(confirm) = reply else {
+                    panic!("expected a training confirmation");
+                };
+                assert_eq!(confirm.timestamp, 0x1234);
+                assert_eq!(confirm.pack_size, pack_size);
+                assert_eq!(channel.state, DvcAudioState::Ready);
+            }
+        }
+    }
+
+    #[test]
+    fn training_rejects_invalid_sizes_and_truncated_packets() {
+        for state in [DvcAudioState::WaitingForTraining, DvcAudioState::Ready] {
+            for pack_size in 1..8 {
+                let mut channel = training_channel(state);
+                assert!(channel.process(5, &training_packet(pack_size, 0)).is_err());
+                assert_eq!(channel.state, state);
+            }
+            for len in [0, 3, 7, 8, 1023] {
+                let mut packet = training_packet(1024, 1016);
+                packet.truncate(len);
+                let mut channel = training_channel(state);
+                assert!(channel.process(5, &packet).is_err());
+                assert_eq!(channel.state, state);
+            }
+        }
+    }
 
     #[test]
     #[ignore = "opens the real default audio output device"]

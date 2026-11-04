@@ -158,6 +158,16 @@ pub enum AuthenticationMode {
     EntraWeb,
 }
 
+impl AuthenticationMode {
+    /// Validate before connecting, not when loading incomplete saved profiles.
+    pub fn validate_username(self, username: &str) -> Result<()> {
+        if self == Self::Password && username.trim().is_empty() {
+            bail!("Enter a username for this connection.");
+        }
+        Ok(())
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -628,6 +638,46 @@ impl ProfileStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn username_preflight_only_requires_a_name_for_password_authentication() {
+        for username in ["", "   ", "\t\n", "\u{2003}"] {
+            assert_eq!(
+                AuthenticationMode::Password
+                    .validate_username(username)
+                    .unwrap_err()
+                    .to_string(),
+                "Enter a username for this connection."
+            );
+            assert!(AuthenticationMode::EntraWeb
+                .validate_username(username)
+                .is_ok());
+        }
+        for username in ["user", "DOMAIN\\user", "user@example.com", " user "] {
+            assert!(AuthenticationMode::Password
+                .validate_username(username)
+                .is_ok());
+        }
+    }
+
+    #[test]
+    fn blank_usernames_remain_loadable_for_rdp_and_ssh_profiles() {
+        let (store, dir) = test_store();
+        let mut document = Document::default();
+        for kind in [ConnectionKind::Rdp, ConnectionKind::Ssh] {
+            let mut connection = Connection::new("Incomplete", kind);
+            connection.host = "server.example".into();
+            document.connections.push(connection);
+        }
+        store.save_document(&document).unwrap();
+        let loaded = store.load_document().unwrap();
+        assert_eq!(loaded.connections.len(), 2);
+        assert!(loaded
+            .connections
+            .iter()
+            .all(|connection| connection.username.is_empty()));
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn duplicate_connection_preserves_settings_with_a_new_identity() {

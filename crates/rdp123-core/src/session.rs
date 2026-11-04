@@ -1347,6 +1347,10 @@ async fn run(
     pending: Arc<PendingCommands>,
     event_cb: EventCb,
 ) {
+    if let Err(error) = config.authentication.validate_username(&config.username) {
+        event_cb(SessionEvent::Error(error.to_string()));
+        return;
+    }
     ensure_crypto_provider();
     let mut rdsaad_client = if config.authentication == AuthenticationMode::EntraWeb {
         match RdsAadClient::new(&config.host) {
@@ -3495,6 +3499,49 @@ mod tests {
             swap_cmd_alt: false,
             wake_mac: None,
             keep_alive: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn blank_username_stops_before_connecting_or_retrying() {
+        for username in ["", "   ", "\t\n", "\u{2003}"] {
+            for reconnect in [false, true] {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let mut config = test_session_config(GraphicsMode::default(), false);
+                config.host = "127.0.0.1".into();
+                config.port = listener.local_addr().unwrap().port();
+                config.username = username.into();
+                config.reconnect = reconnect;
+                let (_tx, rx) = tokio::sync::mpsc::channel(1);
+                let (events_tx, events_rx) = std::sync::mpsc::channel();
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    super::run(
+                        config,
+                        crate::SharedFramebuffer::new(),
+                        rx,
+                        std::sync::Arc::new(PendingCommands::default()),
+                        Box::new(move |event| events_tx.send(event).unwrap()),
+                    ),
+                )
+                .await;
+                assert!(
+                    result.is_ok(),
+                    "invalid username must stop without retrying"
+                );
+                let events: Vec<_> = events_rx.try_iter().collect();
+                assert!(matches!(
+                    events.as_slice(),
+                    [super::SessionEvent::Error(message)]
+                        if message == "Enter a username for this connection."
+                ));
+                assert_eq!(
+                    listener.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock,
+                    "invalid username must not open a network connection"
+                );
+            }
         }
     }
 

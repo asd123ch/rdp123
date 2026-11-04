@@ -433,11 +433,20 @@ impl AppDelegate {
         let mtm = self.mtm();
 
         let password = match connection.rdp.authentication {
-            AuthenticationMode::Password => match self.resolve_password(mtm, &connection) {
-                Some(password) => password,
-                None => return,
-            },
-            AuthenticationMode::EntraWeb => String::new(),
+            AuthenticationMode::Password
+                if connection
+                    .rdp
+                    .authentication
+                    .validate_username(&connection.username)
+                    .is_ok() =>
+            {
+                match self.resolve_password(mtm, &connection) {
+                    Some(password) => password,
+                    None => return,
+                }
+            }
+            // Session preflight reports missing usernames through the non-blocking error sheet.
+            AuthenticationMode::Password | AuthenticationMode::EntraWeb => String::new(),
         };
 
         let window_id = {
