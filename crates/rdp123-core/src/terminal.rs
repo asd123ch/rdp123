@@ -134,9 +134,6 @@ fn shell_join(args: &[String]) -> String {
 }
 
 fn shell_quote(value: &str) -> String {
-    if value.is_empty() {
-        return "''".to_string();
-    }
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 

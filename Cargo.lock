@@ -1908,6 +1908,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-core-media"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05ec576860167a15dd9fce7fbee7512beb4e31f532159d3482d1f9c6caedf31d"
+dependencies = [
+ "bitflags 2.13.2",
+ "dispatch2",
+ "objc2",
+ "objc2-core-audio",
+ "objc2-core-audio-types",
+ "objc2-core-foundation",
+ "objc2-core-video",
+]
+
+[[package]]
 name = "objc2-core-text"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2014,6 +2029,21 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-foundation",
  "objc2-security",
+]
+
+[[package]]
+name = "objc2-video-toolbox"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05bf9a3c14831a7d9641b0d81d87dd913ee238a012b2fde27db5a84b56f5df3e"
+dependencies = [
+ "bitflags 2.13.2",
+ "block2",
+ "objc2",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
+ "objc2-core-media",
+ "objc2-core-video",
 ]
 
 [[package]]
@@ -2448,7 +2478,7 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "rdp123-app"
-version = "0.7.1"
+version = "0.7.7"
 dependencies = [
  "block2",
  "dispatch2",
@@ -2470,11 +2500,12 @@ dependencies = [
 
 [[package]]
 name = "rdp123-core"
-version = "0.7.1"
+version = "0.7.7"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
  "base64",
+ "block2",
  "cpal",
  "directories",
  "ironrdp-cliprdr",
@@ -2491,12 +2522,17 @@ dependencies = [
  "ironrdp-session",
  "ironrdp-svc",
  "ironrdp-tokio",
+ "objc2-core-foundation",
+ "objc2-core-media",
+ "objc2-core-video",
+ "objc2-video-toolbox",
  "reqwest",
  "rustls",
  "security-framework",
  "serde",
  "serde_json",
  "sha2",
+ "socket2",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -3910,7 +3946,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.7.1"
+version = "0.7.7"
 dependencies = [
  "anyhow",
 ]
@@ -3940,9 +3976,9 @@ dependencies = [
 
 [[package]]
 name = "yuv"
-version = "0.8.19"
+version = "0.8.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a295923535c00a4e72a50a0a1130097f93160b39892dd4d2d006b1e2b90d6bf9"
+checksum = "3d109d1eacc7b034329873d2d848039b365c65ab7d751b19ee84e4921c62c607"
 dependencies = [
  "num-traits",
 ]

@@ -70,11 +70,16 @@ fn load_from_service(service: &str, account: &str) -> Result<Option<String>> {
     }
 }
 
-/// Delete the password for `account`. Missing entries are treated as success.
+/// Delete the password for `account`, including an entry an older build left
+/// under [`LEGACY_SERVICE`] that [`load_password`] would otherwise bring back.
+/// Missing entries are treated as success.
 pub fn delete_password(account: &str) -> Result<()> {
-    match delete_generic_password(SERVICE, account) {
-        Ok(()) => Ok(()),
-        Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(()),
-        Err(e) => Err(e.into()),
+    for service in [SERVICE, LEGACY_SERVICE] {
+        match delete_generic_password(service, account) {
+            Ok(()) => {}
+            Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => {}
+            Err(e) => return Err(e.into()),
+        }
     }
+    Ok(())
 }

@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.1"
+version = "0.7.7"
 edition = "2021"
 rust-version = "1.94"
 license = "AGPL-3.0-only"
@@ -27,7 +27,7 @@ ironrdp-rdpdr = "0.9"
 ironrdp-pdu = { version = "0.11", features = ["std"] }
 ironrdp-core = { version = "0.3", features = ["std"] }
 ironrdp-tokio = "0.12"
-# Graphics Pipeline (EGFX): AVC420 via bundled OpenH264 (compiled from source,
+# Graphics Pipeline (EGFX): AVC420/AVC444 via bundled OpenH264 (compiled from source,
 # so end users need no binary downloads).
 ironrdp-egfx = { version = "0.5", features = ["openh264-bundled"] }
 
@@ -45,6 +45,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc
 x509-cert = { version = "0.3", default-features = false, features = ["std"] }
 reqwest = { version = "0.13", default-features = false, features = ["form", "json", "rustls-no-provider"] }
 aws-lc-rs = "1.19"
+socket2 = "0.6"
 
 # --- macOS platform ---
 # objc2 framework crates activate ~all classes via default features; the
@@ -57,6 +58,16 @@ objc2-app-kit = { version = "0.3", features = [
     "objc2-core-graphics",
 ] }
 objc2-core-foundation = "0.3"
+objc2-core-media = { version = "0.3.2", default-features = false, features = [
+    "std", "objc2", "CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "CMTime",
+] }
+objc2-core-video = { version = "0.3.2", default-features = false, features = [
+    "std", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn",
+] }
+objc2-video-toolbox = { version = "0.3.2", default-features = false, features = [
+    "std", "objc2", "block2", "objc2-core-media", "objc2-core-video",
+    "VTDecompressionSession", "VTDecompressionProperties", "VTErrors",
+] }
 objc2-quartz-core = "0.3"
 objc2-core-graphics = "0.3"
 objc2-io-surface = { version = "0.3", features = ["libc"] }

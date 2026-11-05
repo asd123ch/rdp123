@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.7.1" src="https://img.shields.io/badge/version-0.7.1-2f81f7">
+  <img alt="Version 0.7.7" src="https://img.shields.io/badge/version-0.7.7-2f81f7">
   <a href="LICENSE"><img alt="GNU AGPL v3.0" src="https://img.shields.io/badge/license-AGPLv3-3da639"></a>
   <img alt="macOS 11 or newer" src="https://img.shields.io/badge/macOS-11%2B-black">
   <img alt="Rust 1.94 or newer" src="https://img.shields.io/badge/Rust-1.94%2B-b7410e">
@@ -43,7 +43,7 @@ management and occupies about 11 MB when installed.
   <img src="assets/size-comparison.svg" alt="Installed size: RDP123 11 MB, Microsoft Windows App 228 MB, Remote Desktop Manager (Devolutions) 993 MB" width="640">
 </p>
 
-RDP123's size is measured from v0.7.1; comparison app sizes are from mid-2026.
+RDP123's size is measured from v0.7.2; comparison app sizes are from mid-2026.
 
 Classic RDP 6.1 graphics is the default. Experimental RDP 8 graphics, including
 H.264, can be enabled per connection.
@@ -381,10 +381,16 @@ tracking copies only changed pixels; pooled IOSurfaces and CoreAnimation avoid
 per-frame image allocation, full-frame copies, and texture uploads. Remote
 cursor shapes, including I-beam, hand, and resize arrows, use the native cursor.
 
-The experimental RDP 8 pipeline uses IronRDP's decoders for H.264/AVC420,
+The experimental RDP 8 pipeline uses IronRDP's decoders for H.264/AVC420/AVC444,
 RemoteFX Progressive, ClearCodec with NSCodec, and Planar, with cache-driven
-compositing and ZGFX compression. Microsoft Entra login uses the system WebKit
-framework only while authenticating.
+compositing and ZGFX compression. AVC444 and AVC444v2 preserve full-colour detail
+when selected by the server. H.264 uses VideoToolbox hardware decoding when
+available, with OpenH264 as the software fallback. The decoder keeps up to
+16 MiB or 512 H.264 access units since the last keyframe to restore reference
+frames if hardware decoding fails. Streams exceeding either limit also switch
+to software until the next full keyframe. Hardware failures keep the connection
+on software until reconnect. Classic graphics is unaffected.
+Microsoft Entra login uses the system WebKit framework only while authenticating.
 
 </details>
 
@@ -417,8 +423,18 @@ CI checks formatting, tests, Clippy, bundling, and dependencies:
 cargo fmt --all -- --check
 cargo test --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo audit --ignore RUSTSEC-2023-0071 -D warnings
+cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0441 -D warnings
 ```
+
+VideoToolbox hardware checks are separate from CI because virtual runners may
+not expose a hardware decoder. On a local Mac, run the pixel comparisons,
+AVC420/AVC444 pipeline, resize/reset, long-stream recovery, and pipeline timing:
+
+```sh
+cargo test -p rdp123-core --release videotoolbox --locked -- --include-ignored --test-threads=1 --nocapture
+```
+
+These tests use generated images, not saved connections or desktop captures.
 
 `RUSTSEC-2023-0071` is an unavoidable transitive advisory in the current
 IronRDP/SSPI graph. It concerns RSA private-key operations; password-based NTLM
@@ -426,6 +442,11 @@ does not load an RSA private key, while Entra proof-of-possession signing uses
 AWS-LC rather than the affected transitive implementation. The explicit
 exception keeps other advisories visible and can be removed after an upstream
 update.
+
+`RUSTSEC-2026-0441` reports that `pin-utils` is unmaintained, not a known
+vulnerability. It is required indirectly through SSPI and `async-dnssd`.
+This specific warning is temporarily exempted until that dependency chain
+removes or replaces it. All other audit warnings remain blocking.
 
 ## Credits
 

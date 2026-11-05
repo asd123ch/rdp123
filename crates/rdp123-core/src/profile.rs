@@ -96,7 +96,7 @@ pub enum AudioMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum GraphicsMode {
-    /// RDP 8 Graphics Pipeline (EGFX): H.264/AVC420 and RemoteFX Progressive.
+    /// RDP Graphics Pipeline (EGFX): H.264/AVC420/AVC444 and RemoteFX Progressive.
     /// Still experimental: rare compositing artifacts remain.
     Egfx,
     /// Legacy bitmap updates. Default until EGFX is artifact-free.
@@ -436,12 +436,8 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_terminal: Option<String>,
     /// Look for a newer release on GitHub once a day. On by default.
-    #[serde(default = "enabled")]
+    #[serde(default = "default_true")]
     pub check_for_updates: bool,
-}
-
-fn enabled() -> bool {
-    true
 }
 
 impl Default for Settings {

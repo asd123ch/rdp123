@@ -218,6 +218,9 @@ define_class!(
 
         #[unsafe(method(scrollWheel:))]
         fn scroll_wheel(&self, event: &NSEvent) {
+            if !self.accepts_pointer_event(event) {
+                return;
+            }
             let precise = event.hasPreciseScrollingDeltas();
             let factor = if precise { 4.0 } else { 120.0 };
             let dy = event.scrollingDeltaY();
@@ -439,6 +442,9 @@ impl RdpView {
 
     /// Map an event's window-space location to remote framebuffer pixels.
     fn remote_point(&self, event: &NSEvent) -> Option<(u16, u16)> {
+        if !self.accepts_pointer_event(event) {
+            return None;
+        }
         let (fb_w, fb_h) = self.ivars().framebuffer.borrow().as_ref()?.dimensions();
         if fb_w == 0 || fb_h == 0 {
             return None;
@@ -456,6 +462,41 @@ impl RdpView {
         let y = ((ny * f64::from(fb_h)) as u16).min(fb_h - 1);
         Some((x, y))
     }
+
+    fn accepts_pointer_event(&self, event: &NSEvent) -> bool {
+        let Some(window) = self.window() else {
+            return false;
+        };
+        let local = self.convertPoint_fromView(event.locationInWindow(), None);
+        pointer_event_allowed(
+            event.r#type(),
+            NSApplication::sharedApplication(self.mtm()).isActive(),
+            window.isKeyWindow(),
+            event.windowNumber() == window.windowNumber(),
+            self.mouse_inRect(local, self.visibleRect()),
+        )
+    }
+}
+
+fn pointer_event_allowed(
+    event_type: NSEventType,
+    app_active: bool,
+    key_window: bool,
+    same_window: bool,
+    inside_view: bool,
+) -> bool {
+    // AppKit keeps a drag and its matching release with the original view,
+    // even outside its bounds. Losing focus releases held input separately.
+    let captured = matches!(
+        event_type,
+        NSEventType::LeftMouseDragged
+            | NSEventType::RightMouseDragged
+            | NSEventType::OtherMouseDragged
+            | NSEventType::LeftMouseUp
+            | NSEventType::RightMouseUp
+            | NSEventType::OtherMouseUp
+    );
+    app_active && key_window && same_window && (inside_view || captured)
 }
 
 const DEVICE_MODIFIER_MASKS: usize = 0x0000_20ff;
@@ -792,12 +833,66 @@ fn external_stt_paste_text(enabled: bool, text: Option<&str>) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::{
-        external_stt_paste_text, menu_shortcut_keycode, modifier_masks, InputRoutingState,
+        external_stt_paste_text, menu_shortcut_keycode, modifier_masks, pointer_event_allowed,
+        InputRoutingState,
     };
     use objc2::rc::Retained;
     use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
     use objc2_foundation::{NSPoint, NSString};
     use rdp123_core::InputEvent;
+
+    #[test]
+    fn pointer_events_stay_in_the_active_session() {
+        for kind in [
+            NSEventType::MouseMoved,
+            NSEventType::LeftMouseDown,
+            NSEventType::RightMouseDown,
+            NSEventType::OtherMouseDown,
+            NSEventType::ScrollWheel,
+            NSEventType::LeftMouseDragged,
+            NSEventType::LeftMouseUp,
+        ] {
+            assert!(pointer_event_allowed(kind, true, true, true, true));
+            assert!(
+                !pointer_event_allowed(kind, false, true, true, true),
+                "inactive app: {kind:?}"
+            );
+            assert!(
+                !pointer_event_allowed(kind, true, false, true, true),
+                "inactive window: {kind:?}"
+            );
+            assert!(
+                !pointer_event_allowed(kind, true, true, false, true),
+                "other event window: {kind:?}"
+            );
+        }
+        for kind in [
+            NSEventType::MouseMoved,
+            NSEventType::LeftMouseDown,
+            NSEventType::ScrollWheel,
+        ] {
+            assert!(
+                !pointer_event_allowed(kind, true, true, true, false),
+                "outside desktop: {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn captured_pointer_drag_and_release_can_leave_the_active_view() {
+        for kind in [
+            NSEventType::LeftMouseDragged,
+            NSEventType::RightMouseDragged,
+            NSEventType::OtherMouseDragged,
+            NSEventType::LeftMouseUp,
+            NSEventType::RightMouseUp,
+            NSEventType::OtherMouseUp,
+        ] {
+            assert!(pointer_event_allowed(kind, true, true, true, false));
+            assert!(!pointer_event_allowed(kind, false, true, true, false));
+            assert!(!pointer_event_allowed(kind, true, false, true, false));
+        }
+    }
 
     fn key_events(events: &[InputEvent]) -> Vec<(u16, bool)> {
         events

@@ -999,35 +999,22 @@ impl SettingsController {
         ));
         *self.ivars().password_auth_group.borrow_mut() = rdp[password_start..].to_vec();
 
-        let entra_line_1 = self.label(
-            mtm,
-            parent,
-            rect(FIELD_X, password_top, FIELD_W, ROW_H),
-            "Sign in with your Microsoft account.",
-        );
-        self.muted(&entra_line_1);
-        rdp.push(unsafe { Retained::cast_unchecked(entra_line_1.clone()) });
-        let entra_line_2 = self.label(
-            mtm,
-            parent,
-            rect(FIELD_X, password_top - PITCH, FIELD_W, ROW_H),
-            "Use a hostname, not an IP address.",
-        );
-        self.muted(&entra_line_2);
-        rdp.push(unsafe { Retained::cast_unchecked(entra_line_2.clone()) });
-        let entra_line_3 = self.label(
-            mtm,
-            parent,
-            rect(FIELD_X, password_top - 2.0 * PITCH, FIELD_W, ROW_H),
-            "No RDP password or domain is stored or sent.",
-        );
-        self.muted(&entra_line_3);
-        rdp.push(unsafe { Retained::cast_unchecked(entra_line_3.clone()) });
-        *self.ivars().entra_auth_group.borrow_mut() = vec![
-            unsafe { Retained::cast_unchecked(entra_line_1) },
-            unsafe { Retained::cast_unchecked(entra_line_2) },
-            unsafe { Retained::cast_unchecked(entra_line_3) },
-        ];
+        let entra_start = rdp.len();
+        for (offset, text) in [
+            (0.0, "Sign in with your Microsoft account."),
+            (PITCH, "Use a hostname, not an IP address."),
+            (2.0 * PITCH, "No RDP password or domain is stored or sent."),
+        ] {
+            let label = self.label(
+                mtm,
+                parent,
+                rect(FIELD_X, password_top - offset, FIELD_W, ROW_H),
+                text,
+            );
+            self.muted(&label);
+            rdp.push(unsafe { Retained::cast_unchecked(label) });
+        }
+        *self.ivars().entra_auth_group.borrow_mut() = rdp[entra_start..].to_vec();
 
         self.header_g(mtm, parent, &mut yr, "Display", &mut rdp);
         *self.ivars().res_mode.borrow_mut() = Some(self.popup_row_g(

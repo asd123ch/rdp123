@@ -11,7 +11,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
-use std::{io, net::IpAddr};
+use std::{
+    io,
+    net::{IpAddr, SocketAddr},
+};
 
 use anyhow::{anyhow, Context, Result};
 use sha2::{Digest, Sha256};
@@ -199,7 +202,6 @@ impl LocalClipboardState {
     fn replace_for_paste(&mut self, text: String) -> u64 {
         // An explicit Paste action must remain repeatable even when the new STT
         // result is byte-for-byte identical to the previous one.
-        self.pending_paste_generation = None;
         let generation = self.replace_now(LocalClip::Text(text));
         self.pending_paste_generation = Some(generation);
         generation
@@ -1514,6 +1516,16 @@ const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
 /// Bound the TCP connect so a Local-Network-blocked LAN connect fails fast with
 /// a clear message rather than hanging on the long OS default.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
+/// Start an alternative without cancelling a slower, potentially working
+/// connection. The outer CONNECT_TIMEOUT bounds all attempts, including DNS.
+const ADDRESS_CONNECT_DELAY: Duration = Duration::from_millis(250);
+/// TCP keepalive probes notice a dead peer after sleep, a Wi-Fi or VPN change,
+/// or a host that lost power. Without them an idle session waits forever on a
+/// read and never reconnects.
+const TCP_KEEPALIVE: socket2::TcpKeepalive = socket2::TcpKeepalive::new()
+    .with_time(Duration::from_secs(15))
+    .with_interval(Duration::from_secs(5))
+    .with_retries(3);
 const PROTOCOL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Why a single session attempt ended.
@@ -1679,7 +1691,7 @@ async fn run(
                 match run_session(
                     connection_result,
                     framed,
-                    &config,
+                    &mut config,
                     &framebuffer,
                     &mut command_rx,
                     &pending,
@@ -1692,7 +1704,7 @@ async fn run(
                 {
                     SessionEnd::UserQuit => Outcome::Stop,
                     SessionEnd::Disconnected(reason) => {
-                        if config.reconnect && reason != REMOTE_ENDED {
+                        if config.reconnect && !ends_for_good(&reason) {
                             Outcome::Retry {
                                 delay: reconnect_delay(&config),
                                 reconnect_attempt: Some(1),
@@ -1890,7 +1902,7 @@ fn drain_should_stop(
 async fn run_session(
     connection_result: ConnectionResult,
     framed: SessionFramed,
-    config: &SessionConfig,
+    config: &mut SessionConfig,
     framebuffer: &SharedFramebuffer,
     command_rx: &mut Receiver<SessionCommand>,
     pending: &PendingCommands,
@@ -1956,13 +1968,16 @@ async fn run_session(
     clipboard_timeout_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Idle keep-alive bookkeeping: `last_input` is pushed forward by every real
     // user command, so the timer arm below only fires after a full idle
-    // interval; `keys_down` suppresses the tap while a key is held so the
-    // injected F15 can never merge with a modifier the user is pressing.
+    // interval. The tap is also skipped while a key is held so the injected
+    // F15 can never merge with a modifier the user is pressing.
     let mut last_input = tokio::time::Instant::now();
-    let mut keys_down: u32 = 0;
+    let mut pending_resize = None;
 
     let end = cancel_on_shutdown(pending, async {
         loop {
+            if let Err(error) = flush_pending_resize(&mut pending_resize, &mut active_stage, &out_tx).await {
+                break SessionEnd::Disconnected(format!("{error:#}"));
+            }
             let (rejected, response_lost) = {
                 let mut state = local_clip.lock().unwrap();
                 (std::mem::take(&mut state.rejected_file_requests),
@@ -1982,10 +1997,6 @@ async fn run_session(
                 ));
             }
             if pending.release_all_keys.swap(false, Ordering::AcqRel) {
-                // This path (not the command channel) usually wins the race, so
-                // clear the held-key counter here too or the keep-alive could stay
-                // suppressed after focus is lost while a key was held.
-                keys_down = 0;
                 let fp_events = input_db.release_all();
                 if !fp_events.is_empty() {
                     match active_stage.process_fastpath_input(&mut image, &fp_events) {
@@ -2023,11 +2034,10 @@ async fn run_session(
                     if matches!(cmd, SessionCommand::Input(_)) {
                         last_input = tokio::time::Instant::now();
                     }
-                    keys_down = update_keys_down(&cmd, keys_down);
                     match handle_command(
                         cmd, config, &mut reader, &out_tx, &mut active_stage, &mut image,
                         &activation_factory, &mut input_db, framebuffer, local_clip,
-                        &mut remote_clip, event_cb,
+                        &mut remote_clip, &mut pending_resize, event_cb,
                     ).await {
                         Ok(true) => break SessionEnd::UserQuit,
                         Ok(false) => {}
@@ -2056,7 +2066,6 @@ async fn run_session(
                                 Ok(false) => {
                                     if is_external_paste {
                                         last_input = tokio::time::Instant::now();
-                                        keys_down = 0;
                                     }
                                 }
                                 Err(e) => tracing::warn!("clipboard: {e}"),
@@ -2078,7 +2087,7 @@ async fn run_session(
                 // sleep target moves with `last_input`, so any real input reschedules
                 // it and the tap only fires after a full idle interval.
                 _ = tokio::time::sleep_until(last_input + KEEP_ALIVE_INTERVAL),
-                    if config.keep_alive && keys_down == 0 =>
+                    if config.keep_alive && !any_key_held(&input_db) =>
                 {
                     match send_keepalive_tap(
                         &mut reader, &out_tx, &mut active_stage, &mut image,
@@ -2133,6 +2142,7 @@ async fn run_session(
                     framebuffer,
                     local_clip,
                     &mut remote_clip,
+                    &mut pending_resize,
                     event_cb,
                 ),
             )
@@ -2228,6 +2238,9 @@ async fn connect(
 ) -> std::result::Result<(ConnectionResult, SessionFramed), ConnectFailure> {
     let tcp = connect_tcp(&config.host, config.port).await?;
     tcp.set_nodelay(true).ok();
+    if let Err(error) = socket2::SockRef::from(&tcp).set_tcp_keepalive(&TCP_KEEPALIVE) {
+        tracing::warn!("could not enable TCP keepalive: {error}");
+    }
     let client_addr = tcp
         .local_addr()
         .context("resolving local address")
@@ -2245,8 +2258,8 @@ async fn connect(
         // H.264 decode failing to initialize is not fatal: the pipeline still
         // renders uncompressed updates, and the server prefers AVC only when
         // the (filtered) capabilities advertise it.
-        let decoder = match ironrdp_egfx::decode::OpenH264Decoder::new() {
-            Ok(d) => Some(Box::new(d) as Box<dyn ironrdp_egfx::decode::H264Decoder>),
+        let decoder = match crate::gfx::h264_decoder() {
+            Ok(d) => Some(d),
             Err(e) => {
                 tracing::warn!("egfx: H.264 decoder unavailable ({e}); using fallback caps");
                 None
@@ -2379,28 +2392,54 @@ async fn connect_tcp_host(host: &str, port: u16) -> std::result::Result<TcpStrea
     let addresses = tokio::net::lookup_host((host, port))
         .await
         .map_err(TcpHostFailure::Resolve)?;
-    let mut last_error = None;
-    let mut found_address = false;
+    connect_tcp_addresses(addresses.collect(), TcpStream::connect)
+        .await
+        .map_err(TcpHostFailure::Connect)
+}
 
-    for address in addresses {
-        found_address = true;
-        match TcpStream::connect(address).await {
-            Ok(stream) => return Ok(stream),
-            Err(error) => last_error = Some(error),
+async fn connect_tcp_addresses<F>(
+    addresses: Vec<SocketAddr>,
+    connect: impl Fn(SocketAddr) -> F,
+) -> io::Result<TcpStream>
+where
+    F: std::future::Future<Output = io::Result<TcpStream>> + Send + 'static,
+{
+    let mut addresses = std::collections::VecDeque::from(addresses);
+    // Losing attempts are cancelled when this set drops, including on timeout.
+    let mut attempts = tokio::task::JoinSet::new();
+    let mut next_attempt = tokio::time::Instant::now();
+    let mut last_error = None;
+
+    while !addresses.is_empty() || !attempts.is_empty() {
+        if attempts.is_empty() || tokio::time::Instant::now() >= next_attempt {
+            if let Some(address) = addresses.pop_front() {
+                attempts.spawn(connect(address));
+                next_attempt = tokio::time::Instant::now() + ADDRESS_CONNECT_DELAY;
+                // Preserve resolver preference within each family, but give
+                // the other family the next chance instead of exhausting one.
+                if let Some(index) = addresses
+                    .iter()
+                    .position(|next| next.is_ipv6() != address.is_ipv6())
+                {
+                    let other = addresses.remove(index).expect("address index exists");
+                    addresses.push_front(other);
+                }
+            }
+        }
+        tokio::select! {
+            result = attempts.join_next() => match result {
+                Some(Ok(Ok(stream))) => return Ok(stream),
+                Some(Ok(Err(error))) => last_error = Some(error),
+                Some(Err(error)) => last_error = Some(io::Error::other(error)),
+                None => {}
+            },
+            _ = tokio::time::sleep_until(next_attempt), if !addresses.is_empty() => {}
         }
     }
 
-    let error = last_error.unwrap_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            if found_address {
-                "could not connect to any resolved address"
-            } else {
-                "name resolved to no addresses"
-            },
-        )
-    });
-    Err(TcpHostFailure::Connect(error))
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "name resolved to no addresses")
+    }))
 }
 
 /// Open the TCP socket with a bounded timeout. For a single-label LAN host,
@@ -2483,9 +2522,33 @@ async fn tofu_gate(
     }
 }
 
+type ResizeRequest = (u16, u16, Option<u32>);
+
+async fn flush_pending_resize(
+    pending: &mut Option<ResizeRequest>,
+    active_stage: &mut ActiveStage,
+    out_tx: &OutSender,
+) -> Result<()> {
+    if let Some((width, height, scale)) = *pending {
+        let (w, h) = MonitorLayoutEntry::adjust_display_size(u32::from(width), u32::from(height));
+        match active_stage.encode_resize(w, h, scale, None) {
+            Some(Ok(frame)) => {
+                emit(out_tx, frame).await?;
+                *pending = None;
+            }
+            Some(Err(e)) => {
+                *pending = None;
+                tracing::warn!("resize encode failed: {e}");
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
 async fn handle_command(
     cmd: SessionCommand,
-    config: &SessionConfig,
+    config: &mut SessionConfig,
     reader: &mut SessionReader,
     out_tx: &OutSender,
     active_stage: &mut ActiveStage,
@@ -2495,6 +2558,7 @@ async fn handle_command(
     framebuffer: &SharedFramebuffer,
     local_clip: &LocalClipState,
     file_worker: &mut ClipboardFileWorker,
+    pending_resize: &mut Option<ResizeRequest>,
     event_cb: &EventCb,
 ) -> Result<bool> {
     match cmd {
@@ -2528,13 +2592,11 @@ async fn handle_command(
             if !config.dynamic_resolution {
                 return Ok(false);
             }
-            let (w, h) =
-                MonitorLayoutEntry::adjust_display_size(u32::from(width), u32::from(height));
-            match active_stage.encode_resize(w, h, scale, None) {
-                Some(Ok(frame)) => emit(out_tx, frame).await?,
-                Some(Err(e)) => tracing::warn!("resize encode failed: {e}"),
-                None => tracing::debug!("resize ignored: display control not ready yet"),
-            }
+            // A reconnect opens at the size the window has now.
+            config.width = width;
+            config.height = height;
+            config.scale = scale;
+            *pending_resize = Some((width, height, scale));
         }
         SessionCommand::LocalClipboard(text) => {
             if text.len() > MAX_CLIPBOARD_TEXT_BYTES {
@@ -2925,10 +2987,25 @@ fn is_remote_logoff(reason: &ironrdp_session::GracefulDisconnectReason) -> bool 
         GracefulDisconnectReason::Other(description) => [
             ProtocolIndependentCode::LogoffByUser,
             ProtocolIndependentCode::RpcInitiatedLogoff,
+            ProtocolIndependentCode::RpcInitiatedDisconnectByuser,
         ]
         .iter()
         .any(|code| *description == ErrorInfo::ProtocolIndependentCode(*code).description()),
     }
+}
+
+/// Whether a dropped session must not reconnect on its own. An administrator
+/// or another client took the session over; reconnecting would take it back
+/// and start a tug of war with the other client.
+fn ends_for_good(reason: &str) -> bool {
+    use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
+    reason == REMOTE_ENDED
+        || [
+            ProtocolIndependentCode::RpcInitiatedDisconnect,
+            ProtocolIndependentCode::DisconnectedByOtherconnection,
+        ]
+        .iter()
+        .any(|code| reason == ErrorInfo::ProtocolIndependentCode(*code).description())
 }
 
 /// Drive a Deactivation-Reactivation sequence (e.g. a server-side resolution
@@ -3049,25 +3126,10 @@ async fn synchronize_initial_keyboard_state(
     Ok(())
 }
 
-/// Fold a command's key events into the held-key counter that gates the idle
-/// keep-alive. Key-down bumps it, key-up drops it (saturating at zero), and a
-/// full release resets it; everything else leaves the count untouched. While
-/// the count is above zero the keep-alive is suppressed so an injected F15
-/// cannot combine with a modifier the user is holding.
-fn update_keys_down(cmd: &SessionCommand, keys_down: u32) -> u32 {
-    match cmd {
-        SessionCommand::Input(events) => {
-            let mut n = i64::from(keys_down);
-            for ev in events {
-                if let InputEvent::Key { down, .. } = ev {
-                    n += if *down { 1 } else { -1 };
-                }
-            }
-            n.max(0) as u32
-        }
-        SessionCommand::ReleaseAllKeys => 0,
-        _ => keys_down,
-    }
+/// Whether the remote still sees a key as pressed. IronRDP's input state
+/// records each key once, so auto-repeat key-downs need only one key-up.
+fn any_key_held(input_db: &Database) -> bool {
+    input_db.keyboard_state().any()
 }
 
 /// Inject a single invisible F15 tap (down+up) straight into the FastPath input
@@ -4171,6 +4233,7 @@ mod tests {
         for code in [
             ProtocolIndependentCode::LogoffByUser,
             ProtocolIndependentCode::RpcInitiatedLogoff,
+            ProtocolIndependentCode::RpcInitiatedDisconnectByuser,
         ] {
             assert!(super::is_remote_logoff(&GracefulDisconnectReason::Other(
                 ErrorInfo::ProtocolIndependentCode(code).description()
@@ -4183,6 +4246,23 @@ mod tests {
         assert!(!super::is_remote_logoff(
             &GracefulDisconnectReason::ServerInitiated
         ));
+    }
+
+    #[test]
+    fn takeover_by_admin_or_other_client_does_not_reconnect() {
+        use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
+        let reason = |code| ErrorInfo::ProtocolIndependentCode(code).description();
+        assert!(super::ends_for_good(super::REMOTE_ENDED));
+        assert!(super::ends_for_good(&reason(
+            ProtocolIndependentCode::RpcInitiatedDisconnect
+        )));
+        assert!(super::ends_for_good(&reason(
+            ProtocolIndependentCode::DisconnectedByOtherconnection
+        )));
+        assert!(!super::ends_for_good(&reason(
+            ProtocolIndependentCode::ServerShutdown
+        )));
+        assert!(!super::ends_for_good("connection reset by peer"));
     }
 
     #[test]
@@ -4234,11 +4314,10 @@ mod tests {
         absorb_offline_command, build_config, connector_failure, initial_keyboard_sync_event,
         mdns_fallback_hostname, normalize_clipboard_to_crlf, plan_remote_clipboard_cache,
         remote_clipboard_paste_input_events, remote_top_level_destination, resolve_pending_command,
-        to_file_descriptors, update_keys_down, user_facing_disconnect_reason,
-        validate_remote_file_range, ClipSignal, InputEvent, LocalClip, LocalClipFile,
-        LocalClipState, LocalClipboardOfferResult, LocalClipboardState, MacClipboardBackend,
-        PendingCommands, RemoteClipboard, RemoteFileEntry, SessionCommand, SessionConfig,
-        SessionHandle, CLIPBOARD_RETRY_DELAYS,
+        to_file_descriptors, user_facing_disconnect_reason, validate_remote_file_range, ClipSignal,
+        InputEvent, LocalClip, LocalClipFile, LocalClipState, LocalClipboardOfferResult,
+        LocalClipboardState, MacClipboardBackend, PendingCommands, RemoteClipboard,
+        RemoteFileEntry, SessionCommand, SessionConfig, SessionHandle, CLIPBOARD_RETRY_DELAYS,
     };
     use crate::profile::{AudioMode, AuthenticationMode, ClipboardMode, GraphicsMode};
     use ironrdp_cliprdr::backend::CliprdrBackend;
@@ -4291,6 +4370,175 @@ mod tests {
         assert!(client
             .process(&ironrdp_core::encode_vec(&packet).unwrap())
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn early_resize_is_sent_once_after_display_capabilities_arrive() {
+        use ironrdp_displaycontrol::pdu::{DisplayControlCapabilities, DisplayControlPdu};
+        use ironrdp_dvc::pdu::{CreateRequestPdu, DataPdu, DrdynvcDataPdu, DrdynvcServerPdu};
+        use ironrdp_svc::{StaticChannelSet, SvcProcessor};
+        use std::any::TypeId;
+
+        let mut channels = StaticChannelSet::new();
+        channels.insert(ironrdp_dvc::DrdynvcClient::new().with_dynamic_channel(
+            ironrdp_displaycontrol::client::DisplayControlClient::new(|_| Ok(Vec::new())),
+        ));
+        channels.attach_channel_id(TypeId::of::<ironrdp_dvc::DrdynvcClient>(), 1004);
+        let mut stage = ironrdp_session::ActiveStageBuilder {
+            static_channels: channels,
+            user_channel_id: 1001,
+            io_channel_id: 1003,
+            message_channel_id: None,
+            share_id: 1,
+            compression_type: None,
+            enable_server_pointer: false,
+            pointer_software_rendering: false,
+        }
+        .build();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut pending = Some((1280, 720, Some(100)));
+        super::flush_pending_resize(&mut pending, &mut stage, &tx)
+            .await
+            .unwrap();
+        assert!(rx.try_recv().is_err());
+        assert!(
+            pending.is_some(),
+            "resize must survive an unavailable display channel"
+        );
+
+        // A newer window size replaces the unsent one.
+        pending = Some((1600, 900, Some(200)));
+        let dvc = stage
+            .get_svc_processor_mut::<ironrdp_dvc::DrdynvcClient>()
+            .unwrap();
+        let create = DrdynvcServerPdu::Create(CreateRequestPdu::new(
+            1,
+            ironrdp_displaycontrol::CHANNEL_NAME.into(),
+        ));
+        dvc.process(&ironrdp_core::encode_vec(&create).unwrap())
+            .unwrap();
+        super::flush_pending_resize(&mut pending, &mut stage, &tx)
+            .await
+            .unwrap();
+        assert!(pending.is_some(), "channel creation alone is not enough");
+        assert!(rx.try_recv().is_err());
+        let dvc = stage
+            .get_svc_processor_mut::<ironrdp_dvc::DrdynvcClient>()
+            .unwrap();
+        let caps = DisplayControlPdu::Caps(DisplayControlCapabilities::new(1, 3840, 2400).unwrap());
+        let data = DrdynvcServerPdu::Data(DrdynvcDataPdu::Data(DataPdu::new(
+            1,
+            ironrdp_core::encode_vec(&caps).unwrap(),
+        )));
+        dvc.process(&ironrdp_core::encode_vec(&data).unwrap())
+            .unwrap();
+        let expected = stage
+            .encode_resize(1600, 900, Some(200), None)
+            .unwrap()
+            .unwrap();
+        super::flush_pending_resize(&mut pending, &mut stage, &tx)
+            .await
+            .unwrap();
+        assert_eq!(rx.try_recv().unwrap(), expected);
+        assert!(pending.is_none());
+        super::flush_pending_resize(&mut pending, &mut stage, &tx)
+            .await
+            .unwrap();
+        assert!(rx.try_recv().is_err(), "do not send the resize twice");
+    }
+
+    #[tokio::test]
+    async fn stalled_ipv6_addresses_do_not_delay_ipv4() {
+        struct CancelledOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for CancelledOnDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reachable = listener.local_addr().unwrap();
+        let addresses = vec![
+            "[2001:db8::1]:3389".parse().unwrap(),
+            "[2001:db8::2]:3389".parse().unwrap(),
+            "[2001:db8::3]:3389".parse().unwrap(),
+            reachable,
+        ];
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+        let cancellation = std::sync::Mutex::new(Some(cancelled_tx));
+        let connect = super::connect_tcp_addresses(addresses, |address| {
+            let guard = if address.is_ipv6() {
+                Some(CancelledOnDrop(cancellation.lock().unwrap().take()))
+            } else {
+                None
+            };
+            async move {
+                let _guard = guard;
+                if address.is_ipv6() {
+                    std::future::pending().await
+                } else {
+                    tokio::net::TcpStream::connect(address).await
+                }
+            }
+        });
+        let stream = tokio::time::timeout(std::time::Duration::from_secs(2), connect)
+            .await
+            .expect("IPv4 must start before stalled IPv6 attempts time out")
+            .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), reachable);
+        tokio::time::timeout(std::time::Duration::from_secs(1), cancelled_rx)
+            .await
+            .unwrap()
+            .expect("the losing attempt must be cancelled");
+    }
+
+    #[tokio::test]
+    async fn fallback_failure_does_not_cancel_a_slower_working_address() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reachable = listener.local_addr().unwrap();
+        let addresses = vec!["[2001:db8::1]:3389".parse().unwrap(), reachable];
+        let connect = super::connect_tcp_addresses(addresses, move |address| async move {
+            if address.is_ipv6() {
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                tokio::net::TcpStream::connect(reachable).await
+            } else {
+                Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+            }
+        });
+        let stream = tokio::time::timeout(std::time::Duration::from_secs(2), connect)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), reachable);
+    }
+
+    #[tokio::test]
+    async fn failed_addresses_return_an_error_without_waiting_for_the_deadline() {
+        let connect = |_: std::net::SocketAddr| async {
+            Err::<tokio::net::TcpStream, _>(std::io::Error::from(
+                std::io::ErrorKind::ConnectionRefused,
+            ))
+        };
+        let addresses = vec![
+            "[::1]:3389".parse().unwrap(),
+            "127.0.0.1:3389".parse().unwrap(),
+        ];
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            super::connect_tcp_addresses(addresses, connect),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+        assert_eq!(
+            super::connect_tcp_addresses(Vec::new(), connect)
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
     }
 
     #[test]
@@ -4407,10 +4655,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    fn key(down: bool) -> InputEvent {
-        InputEvent::Key { keycode: 0, down }
     }
 
     fn deliver_cliprdr(
@@ -5291,31 +5535,15 @@ mod tests {
     }
 
     #[test]
-    fn held_keys_are_counted_and_balanced() {
-        // Two presses without releases keep the count up (keep-alive suppressed).
-        let cmd = SessionCommand::Input(vec![key(true), key(true)]);
-        assert_eq!(update_keys_down(&cmd, 0), 2);
-        // The matching releases bring it back to zero.
-        let cmd = SessionCommand::Input(vec![key(false), key(false)]);
-        assert_eq!(update_keys_down(&cmd, 2), 0);
-    }
-
-    #[test]
-    fn key_counter_never_underflows_and_full_release_zeroes_it() {
-        // A stray release with nothing held saturates at zero, not u32::MAX.
-        assert_eq!(
-            update_keys_down(&SessionCommand::Input(vec![key(false)]), 0),
-            0
-        );
-        // ReleaseAllKeys clears any stuck held-key state.
-        assert_eq!(update_keys_down(&SessionCommand::ReleaseAllKeys, 3), 0);
-    }
-
-    #[test]
-    fn non_key_input_leaves_the_held_counter_untouched() {
-        let mouse = SessionCommand::Input(vec![InputEvent::MouseMove { x: 5, y: 5 }]);
-        assert_eq!(update_keys_down(&mouse, 1), 1);
-        assert_eq!(update_keys_down(&SessionCommand::Shutdown, 1), 1);
+    fn auto_repeat_needs_only_one_key_up_to_release() {
+        let mut database = Database::new();
+        let backspace = Scancode::from_u8(false, 0x0E);
+        for _ in 0..15 {
+            database.apply([Operation::KeyPressed(backspace)]);
+        }
+        assert!(super::any_key_held(&database));
+        database.apply([Operation::KeyReleased(backspace)]);
+        assert!(!super::any_key_held(&database));
     }
 
     #[test]

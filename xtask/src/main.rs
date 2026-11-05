@@ -641,21 +641,7 @@ fn codesign(app: &Path) -> Result<()> {
     Ok(())
 }
 
-/// A monotonic build number so Launch Services can tell rebuilds of the same
-/// marketing version apart: the git commit count, falling back to the version.
-fn build_number() -> String {
-    Command::new("git")
-        .args(["rev-list", "--count", "HEAD"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| VERSION.to_string())
-}
-
 fn info_plist() -> String {
-    let build = build_number();
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -667,7 +653,7 @@ fn info_plist() -> String {
     <key>CFBundleExecutable</key><string>{BIN_NAME}</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>{VERSION}</string>
-    <key>CFBundleVersion</key><string>{build}</string>
+    <key>CFBundleVersion</key><string>{VERSION}</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>LSMinimumSystemVersion</key><string>11.0</string>
     <key>LSUIElement</key><true/>

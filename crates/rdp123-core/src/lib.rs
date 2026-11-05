@@ -15,6 +15,8 @@ pub mod session;
 pub mod terminal;
 mod tls;
 pub mod update;
+#[cfg(target_os = "macos")]
+mod videotoolbox;
 pub mod wol;
 
 pub use framebuffer::SharedFramebuffer;

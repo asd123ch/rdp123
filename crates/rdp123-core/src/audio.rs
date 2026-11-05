@@ -39,6 +39,7 @@ const MAX_AUDIO_BLOCK_BYTES: usize = u16::MAX as usize;
 
 /// Cap the callback-side buffer at ~500 ms so a hiccup can't build up latency.
 const MAX_BUFFERED_MS: usize = 500;
+const MAX_BUFFERED_BYTES: usize = SOURCE_RATE as usize * FRAME_BYTES * MAX_BUFFERED_MS / 1000;
 
 /// Owns the output stream. Lives on the session thread for the whole session;
 /// dropping it stops playback.
@@ -125,7 +126,6 @@ fn pcm_callback(
 /// Streaming linear resampler from `SOURCE_RATE` to the device rate.
 struct Resampler {
     buffered: VecDeque<u8>,
-    max_buffered: usize,
     /// Source position advance per output frame.
     step: f64,
     /// Fractional position between `current` and `next` (0.0..1.0).
@@ -138,7 +138,6 @@ impl Resampler {
     fn new(out_rate: u32) -> Self {
         Self {
             buffered: VecDeque::new(),
-            max_buffered: SOURCE_RATE as usize * FRAME_BYTES * MAX_BUFFERED_MS / 1000,
             step: f64::from(SOURCE_RATE) / f64::from(out_rate),
             // Start past 1.0 so the first output frame loads real data.
             position: 1.0,
@@ -151,8 +150,8 @@ impl Resampler {
         if !block.len().is_multiple_of(FRAME_BYTES) {
             return;
         }
-        let block = &block[block.len().saturating_sub(self.max_buffered)..];
-        let discard = (self.buffered.len() + block.len()).saturating_sub(self.max_buffered);
+        let block = &block[block.len().saturating_sub(MAX_BUFFERED_BYTES)..];
+        let discard = (self.buffered.len() + block.len()).saturating_sub(MAX_BUFFERED_BYTES);
         self.buffered.drain(..discard);
         self.buffered.extend(block);
     }

@@ -165,6 +165,16 @@ define_class!(
             crate::updates::start(store);
         }
 
+        /// Quitting does not close windows, so run their close-time work
+        /// (saving the window size, ending the session) here.
+        #[unsafe(method(applicationWillTerminate:))]
+        fn will_terminate(&self, _notification: &NSNotification) {
+            let controllers: Vec<_> = self.ivars().borrow().windows.values().cloned().collect();
+            for controller in controllers {
+                controller.close();
+            }
+        }
+
         /// Add every live RDP session to the Dock icon's context menu. macOS
         /// gives one Dock icon to the application process, so this is the
         /// native way to make its individual session windows directly
@@ -248,14 +258,12 @@ impl AppDelegate {
         let update = crate::updates::available()
             .filter(|_| crate::updates::automatic_checks_enabled(&store));
         if let Some(release) = update {
-            let item = unsafe {
-                NSMenuItem::initWithTitle_action_keyEquivalent(
-                    NSMenuItem::alloc(mtm),
-                    &NSString::from_str(&format!("Update to RDP123 {}…", release.version)),
-                    Some(sel!(showUpdate:)),
-                    ns_string!(""),
-                )
-            };
+            let item = menu_item(
+                mtm,
+                &format!("Update to RDP123 {}…", release.version),
+                sel!(showUpdate:),
+                "",
+            );
             let target: &AnyObject = self;
             unsafe { item.setTarget(Some(target)) };
             menu.addItem(&item);
@@ -298,14 +306,7 @@ impl AppDelegate {
                 ConnectionKind::Rdp => connection.name.clone(),
                 ConnectionKind::Ssh => format!("{} (SSH)", connection.name),
             };
-            let item = unsafe {
-                NSMenuItem::initWithTitle_action_keyEquivalent(
-                    NSMenuItem::alloc(mtm),
-                    &NSString::from_str(&label),
-                    Some(sel!(openConnection:)),
-                    ns_string!(""),
-                )
-            };
+            let item = menu_item(mtm, &label, sel!(openConnection:), "");
             item.setTag(index as isize);
             let target: &AnyObject = self;
             unsafe { item.setTarget(Some(target)) };
@@ -314,26 +315,12 @@ impl AppDelegate {
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 
-        let settings = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str("Settings…"),
-                Some(sel!(openSettings:)),
-                ns_string!(","),
-            )
-        };
+        let settings = menu_item(mtm, "Settings…", sel!(openSettings:), ",");
         let target: &AnyObject = self;
         unsafe { settings.setTarget(Some(target)) };
         menu.addItem(&settings);
 
-        let quit = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str("Quit RDP123"),
-                Some(sel!(quitApp:)),
-                ns_string!("q"),
-            )
-        };
+        let quit = menu_item(mtm, "Quit RDP123", sel!(quitApp:), "q");
         let target: &AnyObject = self;
         unsafe { quit.setTarget(Some(target)) };
         menu.addItem(&quit);
@@ -372,14 +359,7 @@ impl AppDelegate {
         });
 
         for (tag, title, is_key_window) in sessions {
-            let item = unsafe {
-                NSMenuItem::initWithTitle_action_keyEquivalent(
-                    NSMenuItem::alloc(mtm),
-                    &NSString::from_str(&title),
-                    Some(sel!(showSessionFromDock:)),
-                    ns_string!(""),
-                )
-            };
+            let item = menu_item(mtm, &title, sel!(showSessionFromDock:), "");
             item.setTag(tag);
             if is_key_window {
                 item.setState(NSControlStateValueOn);
@@ -453,11 +433,15 @@ impl AppDelegate {
             .windows
             .iter()
             .find_map(|(&id, controller)| {
-                (controller.connection_id() == connection.id).then_some(id)
+                (controller.connection_id() == connection.id).then(|| (id, controller.clone()))
             });
-        if let Some(id) = existing_window {
-            self.show_session(id);
-            return;
+        if let Some((id, controller)) = existing_window {
+            if !controller.has_ended() {
+                self.show_session(id);
+                return;
+            }
+            // A failed session's window only shows why it ended; replace it.
+            controller.close();
         }
         let mtm = self.mtm();
 
@@ -503,7 +487,7 @@ impl AppDelegate {
         );
         controller.set_mac_shortcuts_enabled(global_settings.mac_shortcuts);
 
-        let (width, height, scale) = controller.initial_size();
+        let (width, height, scale) = controller.current_size();
         let opts = &connection.rdp;
         let config = SessionConfig {
             host: connection.host.clone(),
@@ -670,76 +654,82 @@ impl AppDelegate {
                 }
             }
             SessionEvent::Disconnected { reason } => {
-                controller.end_entra_sign_in();
-                match terminal_session_presentation(TerminalSessionKind::Disconnected, &reason) {
-                    TerminalSessionPresentation::CloseSilently => controller.close(),
-                    TerminalSessionPresentation::SheetAndClose { title, message } => {
-                        controller.show_terminal_sheet(mtm, title, message);
-                    }
-                }
+                end_session(mtm, &controller, TerminalSessionKind::Disconnected, &reason);
             }
             SessionEvent::ReconnectFailed { reason } => {
-                controller.end_entra_sign_in();
-                match terminal_session_presentation(TerminalSessionKind::ReconnectFailed, &reason) {
-                    TerminalSessionPresentation::CloseSilently => controller.close(),
-                    TerminalSessionPresentation::SheetAndClose { title, message } => {
-                        controller.show_terminal_sheet(mtm, title, message);
-                    }
-                }
+                end_session(
+                    mtm,
+                    &controller,
+                    TerminalSessionKind::ReconnectFailed,
+                    &reason,
+                );
             }
             SessionEvent::Error(message) => {
-                controller.end_entra_sign_in();
-                match terminal_session_presentation(TerminalSessionKind::ConnectionError, &message)
-                {
-                    TerminalSessionPresentation::CloseSilently => controller.close(),
-                    TerminalSessionPresentation::SheetAndClose { title, message } => {
-                        controller.show_terminal_sheet(mtm, title, message);
-                    }
-                }
+                end_session(
+                    mtm,
+                    &controller,
+                    TerminalSessionKind::ConnectionError,
+                    &message,
+                );
             }
         }
+    }
+}
+
+fn end_session(
+    mtm: MainThreadMarker,
+    controller: &WindowController,
+    kind: TerminalSessionKind,
+    reason: &str,
+) {
+    controller.end_entra_sign_in();
+    match terminal_session_presentation(kind, reason) {
+        TerminalSessionPresentation::CloseSilently => controller.close(),
+        TerminalSessionPresentation::SheetAndClose { title, message } => {
+            controller.show_terminal_sheet(mtm, title, message);
+        }
+    }
+}
+
+fn menu_item(
+    mtm: MainThreadMarker,
+    title: &str,
+    action: objc2::runtime::Sel,
+    key: &str,
+) -> Retained<NSMenuItem> {
+    unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str(title),
+            Some(action),
+            &NSString::from_str(key),
+        )
     }
 }
 
 /// Install the (invisible) main menu so standard editing key equivalents
 /// reach text fields. Items target the first responder (nil target).
 fn install_main_menu(mtm: MainThreadMarker) {
-    fn item(
-        mtm: MainThreadMarker,
-        title: &str,
-        action: objc2::runtime::Sel,
-        key: &str,
-    ) -> Retained<NSMenuItem> {
-        unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str(title),
-                Some(action),
-                &NSString::from_str(key),
-            )
-        }
-    }
-
     let main_menu = NSMenu::new(mtm);
 
     // App menu (first slot): Quit with ⌘Q.
     let app_slot = NSMenuItem::new(mtm);
     let app_menu = NSMenu::new(mtm);
-    app_menu.addItem(&item(mtm, "Quit RDP123", sel!(terminate:), "q"));
+    app_menu.addItem(&menu_item(mtm, "Quit RDP123", sel!(terminate:), "q"));
     app_slot.setSubmenu(Some(&app_menu));
     main_menu.addItem(&app_slot);
 
     // Edit menu: the standard first-responder actions.
     let edit_slot = NSMenuItem::new(mtm);
     let edit_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Edit"));
-    edit_menu.addItem(&item(mtm, "Undo", sel!(undo:), "z"));
-    edit_menu.addItem(&item(mtm, "Redo", sel!(redo:), "Z"));
+    edit_menu.addItem(&menu_item(mtm, "Undo", sel!(undo:), "z"));
+    edit_menu.addItem(&menu_item(mtm, "Redo", sel!(redo:), "Z"));
     edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
-    edit_menu.addItem(&item(mtm, "Cut", sel!(cut:), "x"));
-    edit_menu.addItem(&item(mtm, "Copy", sel!(copy:), "c"));
-    edit_menu.addItem(&item(mtm, "Paste", sel!(paste:), "v"));
+    edit_menu.addItem(&menu_item(mtm, "Cut", sel!(cut:), "x"));
+    edit_menu.addItem(&menu_item(mtm, "Copy", sel!(copy:), "c"));
+    edit_menu.addItem(&menu_item(mtm, "Paste", sel!(paste:), "v"));
     edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
-    edit_menu.addItem(&item(mtm, "Select All", sel!(selectAll:), "a"));
+    edit_menu.addItem(&menu_item(mtm, "Select All", sel!(selectAll:), "a"));
     edit_slot.setSubmenu(Some(&edit_menu));
     main_menu.addItem(&edit_slot);
 

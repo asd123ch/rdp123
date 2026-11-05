@@ -120,12 +120,7 @@ impl WebAuthController {
     }
 
     pub fn cancel(&self) {
-        if let Some(reply) = self.ivars().reply.borrow_mut().take() {
-            let _ = reply.send(Err("Microsoft sign-in was cancelled".to_string()));
-        }
-        if let Some(window) = self.ivars().window.borrow().as_ref() {
-            window.close();
-        }
+        self.finish(Err("Microsoft sign-in was cancelled".to_string()));
     }
 
     fn finish(&self, result: Result<String, String>) {

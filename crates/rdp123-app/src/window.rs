@@ -267,7 +267,7 @@ impl WindowController {
         unsafe { msg_send![super(this), init] }
     }
 
-    /// Build and show the window. Call `initial_size` afterwards to learn the
+    /// Build and show the window. Call `current_size` afterwards to learn the
     /// framebuffer size to request, then `attach_session`.
     pub fn setup(
         &self,
@@ -418,11 +418,6 @@ impl WindowController {
         self.ivars().resolution_mode.get() == ResolutionMode::FitToWindow
     }
 
-    /// The framebuffer size (and optional scale) to request for this window.
-    pub fn initial_size(&self) -> (u16, u16, Option<u32>) {
-        self.current_size()
-    }
-
     pub fn attach_session(&self, handle: SessionHandle) {
         if let Some(view) = self.ivars().view.borrow().as_ref() {
             view.set_session(handle.clone());
@@ -467,7 +462,9 @@ impl WindowController {
     }
 
     pub fn end_entra_sign_in(&self) {
-        self.ivars().web_auth.borrow_mut().take();
+        if let Some(web_auth) = self.ivars().web_auth.borrow_mut().take() {
+            web_auth.cancel();
+        }
     }
 
     /// Raise the session after the app's activation policy has switched from
@@ -697,6 +694,11 @@ impl WindowController {
         *self.ivars().terminal_timer.borrow_mut() = Some(timer);
     }
 
+    /// The session is over and the window only shows why.
+    pub fn has_ended(&self) -> bool {
+        self.ivars().terminal_alert.borrow().is_some()
+    }
+
     pub fn close(&self) {
         if let Some(window) = self.ivars().window.borrow().as_ref() {
             window.close();
@@ -724,7 +726,7 @@ impl WindowController {
     }
 
     /// The remote framebuffer size (and optional server scale %) to request.
-    fn current_size(&self) -> (u16, u16, Option<u32>) {
+    pub fn current_size(&self) -> (u16, u16, Option<u32>) {
         let scaling = self.ivars().scaling.get();
         // Fixed resolution: request exactly the chosen size; the view scales it.
         if self.ivars().resolution_mode.get() == ResolutionMode::Fixed {
