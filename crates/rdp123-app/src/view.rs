@@ -221,16 +221,13 @@ define_class!(
             if !self.accepts_pointer_event(event) {
                 return;
             }
-            let precise = event.hasPreciseScrollingDeltas();
-            let factor = if precise { 4.0 } else { 120.0 };
-            let dy = event.scrollingDeltaY();
-            let dx = event.scrollingDeltaX();
+            let (vx, vy) = rdp_scroll_deltas(
+                event.scrollingDeltaX(), event.scrollingDeltaY(), event.hasPreciseScrollingDeltas(),
+            );
             let mut events = Vec::new();
-            let vy = (dy * factor) as i16;
             if vy != 0 {
                 events.push(InputEvent::Wheel { delta: vy, horizontal: false });
             }
-            let vx = (dx * factor) as i16;
             if vx != 0 {
                 events.push(InputEvent::Wheel { delta: vx, horizontal: true });
             }
@@ -822,6 +819,12 @@ fn modifier_masks(keycode: u16) -> Option<(usize, usize)> {
     })
 }
 
+fn rdp_scroll_deltas(dx: f64, dy: f64, precise: bool) -> (i16, i16) {
+    let factor = if precise { 4.0 } else { 120.0 };
+    // AppKit and RDP use opposite signs for horizontal wheel motion only.
+    ((-dx * factor) as i16, (dy * factor) as i16)
+}
+
 fn external_stt_paste_text(enabled: bool, text: Option<&str>) -> Option<String> {
     enabled
         .then_some(text)
@@ -840,6 +843,16 @@ mod tests {
     use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
     use objc2_foundation::{NSPoint, NSString};
     use rdp123_core::InputEvent;
+
+    #[test]
+    fn horizontal_scroll_matches_macos_without_reversing_vertical() {
+        use super::rdp_scroll_deltas;
+
+        assert_eq!(rdp_scroll_deltas(1.0, -1.0, false), (-120, -120));
+        assert_eq!(rdp_scroll_deltas(-1.0, 1.0, false), (120, 120));
+        assert_eq!(rdp_scroll_deltas(0.5, 0.0, true), (-2, 0));
+        assert_eq!(rdp_scroll_deltas(-0.5, 1.5, true), (2, 6));
+    }
 
     #[test]
     fn pointer_events_stay_in_the_active_session() {
